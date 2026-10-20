@@ -1,3 +1,6 @@
+[extend]
+useDefault = true
+
 [allowlist]
 description = "Allowlist of synthetic test fixtures used strictly to verify secret redaction"
 regexes = [
