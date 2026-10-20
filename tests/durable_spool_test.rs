@@ -194,3 +194,47 @@ async fn test_spool_capacity_ceiling_enforcement() {
 
     let _ = std::fs::remove_file(&spool_path);
 }
+
+#[tokio::test]
+async fn test_spool_duplicate_replay_idempotency_prevents_double_counting() {
+    let storage = Arc::new(UsageStorage::new(":memory:").unwrap());
+    let spool_path = unique_temp_spool_path("idempotent_replay");
+    let spool = UsageSpooler::new(&spool_path, 1024 * 1024);
+
+    let rec = sample_record("rec_duplicate_check");
+    // Append record to spool
+    spool.append_record(&rec, "transient error").await.unwrap();
+
+    // First replay into SQLite
+    let first_drain = spool.drain_to_storage(&storage, 10).await.unwrap();
+    assert_eq!(first_drain.succeeded, 1);
+
+    // Verify record in SQLite
+    let records = storage
+        .get_records(ai_backend::usage::UsageQueryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, "rec_duplicate_check");
+
+    // Simulate ambiguous crash scenario where spool was re-populated with same record before acknowledgement
+    spool.append_record(&rec, "retry attempt").await.unwrap();
+
+    // Second replay into SQLite: must be idempotent and NOT create a duplicate record
+    let second_drain = spool.drain_to_storage(&storage, 10).await.unwrap();
+    assert_eq!(second_drain.succeeded, 1);
+
+    // Verify exactly ONE record remains in SQLite (no duplicate row or token inflation)
+    let records_after = storage
+        .get_records(ai_backend::usage::UsageQueryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        records_after.len(),
+        1,
+        "Duplicate replay must not create duplicate SQLite rows"
+    );
+    assert_eq!(records_after[0].id, "rec_duplicate_check");
+
+    let _ = std::fs::remove_file(&spool_path);
+}

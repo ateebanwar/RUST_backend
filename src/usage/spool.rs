@@ -206,10 +206,16 @@ impl UsageSpooler {
             ))
         })?;
 
-        // Flush to ensure data is committed to operating system buffers
+        // Flush and physically sync to ensure data is committed to storage media
         file.flush().map_err(|e| {
             SpoolError::IoError(format!(
                 "Failed to flush spool file '{}': {e}",
+                self.spool_path.display()
+            ))
+        })?;
+        file.sync_data().map_err(|e| {
+            SpoolError::IoError(format!(
+                "Failed to sync spool file to disk '{}': {e}",
                 self.spool_path.display()
             ))
         })?;
@@ -355,6 +361,12 @@ impl UsageSpooler {
             temp_file.flush().map_err(|e| {
                 SpoolError::IoError(format!(
                     "Failed to flush temp spool '{}': {e}",
+                    temp_path.display()
+                ))
+            })?;
+            temp_file.sync_data().map_err(|e| {
+                SpoolError::IoError(format!(
+                    "Failed to sync temp spool '{}': {e}",
                     temp_path.display()
                 ))
             })?;

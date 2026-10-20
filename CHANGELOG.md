@@ -2,6 +2,37 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-21 — Independent Audit, Dependency Remediation, and Durability Verification
+
+### Remediated & Hardened
+- **Dependency Vulnerability Remediation (RUSTSEC-2026-0382 & RUSTSEC-2026-0381):**
+  - Upgraded `rustls-webpki` to `v0.103.16` resolving intermediate certificate verification vulnerability.
+  - Upgraded `webpki-roots` to `v1.0.10` resolving distrusted emSign intermediate authority vulnerability.
+  - Re-ran `cargo audit -n` across all 160 dependencies: 0 vulnerabilities found.
+- **Repeatable Gitleaks Secret Scanning Integration (`.gitleaks.toml`):**
+  - Installed and verified `gitleaks v8.24.0` across 8 Git commits and full repository history (~4.98 MB scanned).
+  - Added targeted allowlist rules in `.gitleaks.toml` for synthetic error sanitization test fixtures.
+  - Verified 0 secrets committed across working tree and historical commits.
+- **Durable Disk Spool Hardware Synchronization & Idempotency (`src/usage/spool.rs`):**
+  - Added `file.sync_data()` after buffer flushes in `append_record_sync` and temporary file rewriting, ensuring physical kernel-to-hardware disk synchronization (FlushFileBuffers / fsync).
+  - Explicitly closed file reader handles before atomic temp-file replacement, preventing Windows file-lock conflicts.
+  - Added dedicated test `test_spool_duplicate_replay_idempotency_prevents_double_counting` verifying `INSERT OR REPLACE` SQLite idempotency preventing duplicate usage records or double-counting.
+- **Token Estimation Reference Model Mapping (`src/inference/tokens.rs`):**
+  - Fixed tokenizer family resolution for registered reference models: mapped `fast-chat-v1` to `TokenizerFamily::Llama` and `balanced-assistant-v1` to `TokenizerFamily::Mistral`.
+  - Added regression test `test_registered_reference_model_family_aliases`.
+  - Added boundary tests for empty/whitespace prompts and mixed-script multi-language payloads (English + Urdu + Devanagari + Rust Code + Emojis).
+
+### Verification
+- `cargo fmt --check`: Passed with exit code 0.
+- `cargo check`: Passed with exit code 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
+- `cargo test`: **243 automated tests passing** across 15 test suites with 0 failures, 0 errors, 1 ignored (controlled benchmark).
+- `cargo build --release`: Passed with exit code 0 in 1m 22s.
+- `cargo audit -n`: Passed with exit code 0 (1,348 advisories checked, 160 dependencies scanned).
+- `gitleaks detect`: Passed with exit code 0 (8 commits scanned, 0 leaks found).
+
+---
+
 ## 2026-10-21 — Four-Gap Remediation, Adversarial Verification, and Production-Readiness Validation
 
 ### Added

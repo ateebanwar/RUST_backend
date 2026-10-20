@@ -1,0 +1,6 @@
+[allowlist]
+description = "Allowlist of synthetic test fixtures used strictly to verify secret redaction"
+regexes = [
+    '''sk-live-123456789''',
+    '''sk_live_very_secret_api_key_99999''',
+]

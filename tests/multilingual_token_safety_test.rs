@@ -149,3 +149,52 @@ fn test_context_window_safe_budget_applies_safety_margin() {
         raw_tokens + safe_estimate.safety_margin_applied
     );
 }
+
+#[test]
+fn test_registered_reference_model_family_aliases() {
+    assert_eq!(
+        TokenizerFamily::from_model_id("fast-chat-v1"),
+        TokenizerFamily::Llama
+    );
+    assert_eq!(
+        TokenizerFamily::from_model_id("deep-reasoner-v1"),
+        TokenizerFamily::DeepSeek
+    );
+    assert_eq!(
+        TokenizerFamily::from_model_id("balanced-assistant-v1"),
+        TokenizerFamily::Mistral
+    );
+    assert_eq!(
+        TokenizerFamily::from_model_id("unregistered-generic-v2"),
+        TokenizerFamily::Generic
+    );
+}
+
+#[test]
+fn test_corpus_empty_and_whitespace_inputs() {
+    assert_eq!(
+        TokenEstimator::estimate_text_for_family("", TokenizerFamily::Llama),
+        0
+    );
+    assert_eq!(
+        TokenEstimator::estimate_text_for_family("   \t\n  \r\n", TokenizerFamily::Llama),
+        0
+    );
+    assert_eq!(
+        TokenEstimator::estimate_chat_for_family(&[], TokenizerFamily::Llama),
+        0
+    );
+}
+
+#[test]
+fn test_corpus_mixed_script_boundary() {
+    let mixed = "Hello world! بھائی یہ چیک کرو: fn main() { println!(\"🚀\"); } नमस्ते";
+    let tokens = TokenEstimator::estimate_text_for_family(mixed, TokenizerFamily::Llama);
+    // Contains English, Urdu, Hindi/Devanagari, Rust code, and Emoji
+    assert!(tokens >= 20, "Got {tokens} tokens for mixed-script input");
+
+    let estimate = TokenEstimator::estimate_text_detailed(mixed, Some("fast-chat-v1"));
+    assert_eq!(estimate.family, TokenizerFamily::Llama);
+    assert_eq!(estimate.method, EstimationMethod::CalibratedFamilyHeuristic);
+    assert!(!estimate.is_exact);
+}

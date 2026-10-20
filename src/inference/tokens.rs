@@ -35,9 +35,12 @@ impl TokenizerFamily {
     /// Detect tokenizer family from model identifier string.
     pub fn from_model_id(model_id: &str) -> Self {
         let lower = model_id.to_ascii_lowercase();
-        if lower.contains("llama") {
+        if lower.contains("llama") || lower.contains("fast-chat") {
             Self::Llama
-        } else if lower.contains("mistral") || lower.contains("mixtral") {
+        } else if lower.contains("mistral")
+            || lower.contains("mixtral")
+            || lower.contains("balanced-assistant")
+        {
             Self::Mistral
         } else if lower.contains("gemma") {
             Self::Gemma
