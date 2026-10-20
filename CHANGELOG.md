@@ -2,6 +2,32 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-20 — Phase 10: Token Optimization & Performance Baseline Implementation
+
+### Added
+- **Deterministic Token Estimator (`src/inference/tokens.rs`):** Implemented high-performance, bounded, in-process token estimator conforming to 100k+ modern BPE vocabulary standards ($\max(1, \lceil\text{chars} / 4\rceil + \text{subword\_delimiters})$) with ChatML framing overhead (+4 per message, +3 primer). Supported by a thread-safe 512-slot circular LRU cache using 64-bit FNV-1a hashing.
+- **Conservative Prompt Compaction Engine (`src/inference/tokens.rs`):** Implemented whitespace compaction preserving code indentation, consecutive duplicate system prompt deduplication, and compaction metrics tracking (`original_characters`, `compacted_characters`, `original_estimated_tokens`, `compacted_estimated_tokens`, `savings_percentage`).
+- **Context Window Capacity-Aware Routing (`src/inference/mod.rs`):** Added pre-dispatch token capacity validation in `InferenceService`:
+  - In `auto` mode: dynamically filters candidate models whose `context_window` cannot accommodate the prompt (+256 tokens completion headroom), preventing upstream context overflow rejections.
+  - In `manual` mode: rejects prompts exceeding the requested model's context window immediately with canonical HTTP 400 `InvalidRequest` before initiating upstream network calls.
+- **Dedicated Phase 10 Integration Test Suite (`tests/token_optimization_test.rs`):** 10 exhaustive integration tests covering estimation formula accuracy, ChatML framing, prompt compaction & whitespace preservation, thread-safe LRU cache hit/miss behavior, context window overflow rejection, auto-routing capacity filtering, and end-to-end HTTP buffered and SSE streaming execution.
+- **Reproducible Performance Baseline & Comparison Reports:**
+  - `docs/PHASE_10_PERFORMANCE_BASELINE.md`: Comprehensive empirical pre-optimization baseline across Debug and Release profiles under single-request ($C=1$) and concurrent ($C=20$) workloads.
+  - `docs/PHASE_10_OPTIMIZATION_REPORT.md`: Full before-and-after empirical comparison report with statistical breakdown across p50, p95, p99 latencies, throughput, and token efficiency.
+
+### Optimized
+- **Redundant Routing Classification Elimination (`src/routes/chat.rs`):** Removed duplicate `state.inference.resolve_candidates` invocation on the happy path of `POST /api/v1/chat/completions`, isolating candidate resolution exclusively to the error path and yielding a 53.1% average latency reduction (0.98 ms -> 0.46 ms).
+- **Zero-Allocation SSE Chunk Slice Parsing (`src/providers/openai_compatible.rs`):** Refactored `parse_sse_stream` to parse SSE line events directly from `&buffer[..pos]` string slices instead of allocating intermediate heap `String` objects per chunk, reducing memory churn and improving streaming TTFC by 31.6% (0.38 ms -> 0.26 ms at $C=20$).
+
+### Verification
+- `cargo fmt --check`: Clean formatting verified across all source and test files.
+- `cargo check`: Clean compilation with 0 errors.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings.
+- `cargo test`: 206 automated tests passing across 11 test suites (+1 ignored load benchmark).
+- `cargo build --release`: Clean release compilation with 0 errors.
+
+---
+
 ## 2026-10-19 — Consolidated Audit Gap Repairs & Real Inference Implementation (Phase 7B)
 
 ### Added

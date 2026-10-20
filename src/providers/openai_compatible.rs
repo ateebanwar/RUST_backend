@@ -500,15 +500,17 @@ where
             loop {
                 // Check if buffer contains a complete newline
                 if let Some(pos) = buffer.find('\n') {
-                    let line: String = buffer.drain(..=pos).collect();
-                    let trimmed = line.trim();
+                    let line_slice = &buffer[..pos];
+                    let trimmed = line_slice.trim();
                     if trimmed.is_empty() || trimmed.starts_with(':') {
+                        buffer.drain(..=pos);
                         continue;
                     }
 
                     if let Some(data_str) = trimmed.strip_prefix("data:") {
                         let payload = data_str.trim();
                         if payload == "[DONE]" {
+                            buffer.drain(..=pos);
                             terminated = true;
                             return Some((
                                 Ok(StreamChunk {
@@ -537,12 +539,15 @@ where
                             });
 
                             if delta_content.is_empty() && usage.is_none() {
+                                buffer.drain(..=pos);
                                 continue;
                             }
 
+                            let delta = delta_content.to_string();
+                            buffer.drain(..=pos);
                             return Some((
                                 Ok(StreamChunk {
-                                    delta: delta_content.to_string(),
+                                    delta,
                                     is_done: false,
                                     usage,
                                 }),
@@ -550,6 +555,7 @@ where
                             ));
                         }
                     }
+                    buffer.drain(..=pos);
                     continue;
                 }
 

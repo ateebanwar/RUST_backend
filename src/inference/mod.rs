@@ -20,6 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+pub mod tokens;
+pub use tokens::{TokenCompactionMetrics, TokenEstimator};
+
 /// Inbound request payload for chat completion endpoints conforming to API_SPEC.md §5.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -149,6 +152,7 @@ pub struct RoutingResolution {
     pub estimated_complexity: String,
     pub selection_reason: String,
     pub ordered_candidates: Vec<CandidateExecutionTarget>,
+    pub estimated_prompt_tokens: usize,
 }
 
 /// Target candidate model and provider pair for execution.
@@ -227,6 +231,8 @@ impl InferenceService {
         let detected_task = classification.category.as_str().to_string();
         let estimated_complexity = classification.complexity.as_str().to_string();
 
+        let estimated_prompt_tokens = TokenEstimator::estimate_chat(&req.messages);
+
         if req.routing_mode.eq_ignore_ascii_case("manual") {
             let preferred_id = match req.requested_model_id.as_deref() {
                 Some(id) if !id.trim().is_empty() => id.trim(),
@@ -253,6 +259,13 @@ impl InferenceService {
                 )));
             }
 
+            if estimated_prompt_tokens > model.context_window {
+                return Err(AppError::InvalidRequest(format!(
+                    "Prompt estimated tokens ({estimated_prompt_tokens}) exceed model '{preferred_id}' context window ({})",
+                    model.context_window
+                )));
+            }
+
             let primary = CandidateExecutionTarget {
                 model_id: model.model_id.clone(),
                 provider_id: model.provider_id.clone(),
@@ -268,6 +281,7 @@ impl InferenceService {
                 estimated_complexity,
                 selection_reason: primary.reason.clone(),
                 ordered_candidates: vec![primary],
+                estimated_prompt_tokens,
             })
         } else {
             // Automatic routing: verify catalog has models supporting modality
@@ -288,8 +302,20 @@ impl InferenceService {
                 .registry
                 .query_models(&ModelFilter::new().with_available_only(true));
 
+            // Capacity-aware context window filtering: only evaluate candidates that can fit prompt tokens
+            let fitting_models: Vec<crate::models::ModelMetadata> = available_models
+                .into_iter()
+                .filter(|m| m.context_window >= estimated_prompt_tokens)
+                .collect();
+
+            if fitting_models.is_empty() {
+                return Err(AppError::InvalidRequest(format!(
+                    "Prompt estimated tokens ({estimated_prompt_tokens}) exceed context window of all available operational models"
+                )));
+            }
+
             let scored = RoutingPolicy::rank_candidates(
-                &available_models,
+                &fitting_models,
                 &classification.category,
                 &classification.complexity,
                 &parsed_modality,
@@ -334,6 +360,7 @@ impl InferenceService {
                 estimated_complexity,
                 selection_reason: primary.reason.clone(),
                 ordered_candidates,
+                estimated_prompt_tokens,
             })
         }
     }
@@ -344,6 +371,17 @@ impl InferenceService {
         req: &ChatCompletionRequest,
     ) -> Result<CompletionResponse, AppError> {
         req.validate()?;
+        let (optimized_messages, compaction) = TokenEstimator::optimize_messages(&req.messages);
+        if compaction.tokens_saved > 0 {
+            info!(
+                original_tokens = compaction.original_estimated_tokens,
+                optimized_tokens = compaction.optimized_estimated_tokens,
+                tokens_saved = compaction.tokens_saved,
+                duplicates_removed = compaction.duplicate_system_messages_removed,
+                "Optimized prompt tokens before provider dispatch"
+            );
+        }
+
         let resolution = self.resolve_candidates(req)?;
 
         let policy = self.config.retry_policy();
@@ -394,7 +432,7 @@ impl InferenceService {
 
                 let completion_req = CompletionRequest {
                     model_id: candidate.model_id.clone(),
-                    messages: req.messages.clone(),
+                    messages: optimized_messages.clone(),
                     temperature: req.temperature,
                     max_tokens: req.max_tokens,
                     timeout: attempt_timeout,
@@ -498,6 +536,17 @@ impl InferenceService {
         req: &ChatCompletionRequest,
     ) -> Result<StreamExecutionResult, AppError> {
         req.validate()?;
+        let (optimized_messages, compaction) = TokenEstimator::optimize_messages(&req.messages);
+        if compaction.tokens_saved > 0 {
+            info!(
+                original_tokens = compaction.original_estimated_tokens,
+                optimized_tokens = compaction.optimized_estimated_tokens,
+                tokens_saved = compaction.tokens_saved,
+                duplicates_removed = compaction.duplicate_system_messages_removed,
+                "Optimized stream prompt tokens before provider dispatch"
+            );
+        }
+
         let resolution = self.resolve_candidates(req)?;
 
         let policy = self.config.retry_policy();
@@ -548,7 +597,7 @@ impl InferenceService {
 
                 let completion_req = CompletionRequest {
                     model_id: candidate.model_id.clone(),
-                    messages: req.messages.clone(),
+                    messages: optimized_messages.clone(),
                     temperature: req.temperature,
                     max_tokens: req.max_tokens,
                     timeout: attempt_timeout,

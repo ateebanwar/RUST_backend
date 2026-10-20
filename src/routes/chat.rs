@@ -42,9 +42,6 @@ pub async fn chat_completions(
 
     payload.stream = false;
 
-    // Resolve candidates first to identify resolved provider/model even if execution fails
-    let resolution_candidate = state.inference.resolve_candidates(&payload).ok();
-
     match state.inference.execute_completion(&payload).await {
         Ok(response) => {
             state
@@ -75,6 +72,9 @@ pub async fn chat_completions(
                 | AppError::NotFound(_) => RequestOutcome::PreDispatchFailure,
                 _ => RequestOutcome::ProviderError,
             };
+
+            // Resolve candidates on demand only on the error path for telemetry recording
+            let resolution_candidate = state.inference.resolve_candidates(&payload).ok();
 
             let (prov, mdl) = match &resolution_candidate {
                 Some(r) => (r.provider_id.as_str(), r.selected_model_id.as_str()),
