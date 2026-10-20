@@ -168,6 +168,10 @@ fn test_valid_configuration_accepted() {
         overall_request_timeout_secs: 30,
         trusted_proxies: Vec::new(),
         allowed_hosts: Vec::new(),
+        usage_cleanup_interval_secs: 3600,
+        usage_cleanup_batch_size: 1000,
+        usage_spool_path: "data/usage_spool.log".to_string(),
+        usage_max_spool_bytes: 10 * 1024 * 1024,
     };
     assert!(config.validate().is_ok());
 }

@@ -75,7 +75,11 @@ impl AppState {
                 )
             }
         };
-        let usage = Arc::new(UsageService::new(usage_storage));
+        let usage_spool = Arc::new(crate::usage::UsageSpooler::new(
+            &config.usage_spool_path,
+            config.usage_max_spool_bytes,
+        ));
+        let usage = Arc::new(UsageService::with_spool(usage_storage, usage_spool));
 
         // Enforce usage retention cleanup on startup if explicitly configured
         if let Some(retention_days) = config.usage_retention_days.filter(|&d| d > 0) {
@@ -287,6 +291,23 @@ impl AppState {
     }
 }
 
+/// Spawns the autonomous background retention and retry maintenance task.
+/// Returns a Tokio JoinHandle that completes when graceful shutdown is signaled.
+pub fn start_retention_maintenance(
+    state: Arc<AppState>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let worker = crate::usage::RetentionMaintenanceWorker::new(
+        state.usage.clone(),
+        state.config.usage_cleanup_interval_secs,
+        state.config.usage_retention_days,
+        state.config.usage_cleanup_batch_size,
+    );
+    tokio::spawn(async move {
+        worker.run_loop(shutdown_rx).await;
+    })
+}
+
 /// Request ID resolution and API Authentication middleware.
 async fn request_id_and_auth_middleware(
     State(state): State<AppState>,
@@ -347,7 +368,7 @@ async fn request_id_and_auth_middleware(
 
     let is_trusted_peer = match peer_ip {
         Some(ip) => state.config.trusted_proxy_matcher().is_trusted(&ip),
-        None => state.config.is_loopback_host(),
+        None => false,
     };
 
     if !is_trusted_peer {

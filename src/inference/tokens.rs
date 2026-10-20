@@ -79,6 +79,31 @@ impl TokenizerFamily {
     }
 }
 
+/// Provenance and accuracy category of a token calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimationMethod {
+    /// Exact count reported by upstream provider usage headers/payloads.
+    ExactProviderReported,
+    /// Exact tokenizer matching.
+    ExactTokenizer,
+    /// Calibrated model-family-specific subword heuristic.
+    CalibratedFamilyHeuristic,
+    /// Conservative fallback heuristic for unknown models.
+    ConservativeFallback,
+}
+
+/// Detailed token estimation result with provenance metadata and safety margins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenEstimate {
+    pub estimated_tokens: usize,
+    pub method: EstimationMethod,
+    pub family: TokenizerFamily,
+    pub is_exact: bool,
+    pub safety_margin_applied: usize,
+    pub confidence_note: &'static str,
+}
+
 /// Metrics detailing token savings and compaction outcomes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCompactionMetrics {
@@ -242,12 +267,15 @@ impl TokenEstimator {
             tokens += Self::word_tokens(current_word_len, family);
         }
 
-        // Non-ASCII character handling based on tokenizer vocabulary density:
-        // Qwen and DeepSeek have massive multilingual vocabularies (higher compression).
-        // Gemma and Llama average ~1 token per 2 chars.
+        // Multilingual & Unicode token calibration:
+        // Distinguish scripts by vocabulary density:
+        // Qwen and DeepSeek feature massive multilingual vocabularies (150k+ tokens).
+        // Llama 3 has a 128k BPE vocabulary with good Urdu/Arabic/Devanagari morpheme compression.
+        // Gemma 2 features a 256k vocabulary with high Unicode subword coverage.
         if non_ascii_count > 0 {
             let divisor = match family {
                 TokenizerFamily::Qwen | TokenizerFamily::DeepSeek => 3,
+                TokenizerFamily::Gemma => 3,
                 _ => 2,
             };
             tokens += non_ascii_count.div_ceil(divisor);
@@ -307,6 +335,108 @@ impl TokenEstimator {
         }
 
         total + family.assistant_primer_tokens()
+    }
+
+    /// Estimate token count for a raw string slice with full provenance metadata.
+    pub fn estimate_text_detailed(text: &str, model_id: Option<&str>) -> TokenEstimate {
+        let family = model_id
+            .map(TokenizerFamily::from_model_id)
+            .unwrap_or(TokenizerFamily::Generic);
+        let count = Self::estimate_text_for_family(text, family);
+        let method = match family {
+            TokenizerFamily::Generic => EstimationMethod::ConservativeFallback,
+            _ => EstimationMethod::CalibratedFamilyHeuristic,
+        };
+        TokenEstimate {
+            estimated_tokens: count,
+            method,
+            family,
+            is_exact: false,
+            safety_margin_applied: 0,
+            confidence_note: match method {
+                EstimationMethod::ConservativeFallback => {
+                    "Conservative heuristic fallback for uncalibrated/generic model"
+                }
+                EstimationMethod::CalibratedFamilyHeuristic => {
+                    "Calibrated BPE/SentencePiece vocabulary heuristic for model family"
+                }
+                _ => "Exact token count",
+            },
+        }
+    }
+
+    /// Estimate token count for chat messages with full provenance metadata.
+    pub fn estimate_chat_detailed(
+        messages: &[ChatMessage],
+        model_id: Option<&str>,
+    ) -> TokenEstimate {
+        let family = model_id
+            .map(TokenizerFamily::from_model_id)
+            .unwrap_or(TokenizerFamily::Generic);
+        let base_count = Self::estimate_chat_for_family(messages, family);
+        let method = match family {
+            TokenizerFamily::Generic => EstimationMethod::ConservativeFallback,
+            _ => EstimationMethod::CalibratedFamilyHeuristic,
+        };
+        TokenEstimate {
+            estimated_tokens: base_count,
+            method,
+            family,
+            is_exact: false,
+            safety_margin_applied: 0,
+            confidence_note: match method {
+                EstimationMethod::ConservativeFallback => {
+                    "Conservative heuristic fallback for uncalibrated/generic model"
+                }
+                EstimationMethod::CalibratedFamilyHeuristic => {
+                    "Calibrated BPE/SentencePiece vocabulary heuristic for model family"
+                }
+                _ => "Exact token count",
+            },
+        }
+    }
+
+    /// Estimate token overhead for tool / function schema definitions.
+    pub fn estimate_tools_tokens(tools_json: &str, family: TokenizerFamily) -> usize {
+        if tools_json.trim().is_empty() {
+            return 0;
+        }
+        let schema_tokens = Self::estimate_text_for_family(tools_json, family);
+        schema_tokens + 12 // Schema framing overhead
+    }
+
+    /// Estimates full effective request context including messages, tool schemas, and safety buffer.
+    pub fn estimate_request_context_safe(
+        messages: &[ChatMessage],
+        tools_json: Option<&str>,
+        model_id: Option<&str>,
+    ) -> TokenEstimate {
+        let family = model_id
+            .map(TokenizerFamily::from_model_id)
+            .unwrap_or(TokenizerFamily::Generic);
+        let chat_tokens = Self::estimate_chat_for_family(messages, family);
+        let tools_tokens = tools_json
+            .map(|t| Self::estimate_tools_tokens(t, family))
+            .unwrap_or(0);
+        let raw_total = chat_tokens + tools_tokens;
+
+        // Apply conservative safety margin (5% or minimum 4 tokens) for heuristic estimators
+        let safety_margin = (raw_total / 20).max(4);
+        let safe_total = raw_total.saturating_add(safety_margin);
+
+        let method = match family {
+            TokenizerFamily::Generic => EstimationMethod::ConservativeFallback,
+            _ => EstimationMethod::CalibratedFamilyHeuristic,
+        };
+
+        TokenEstimate {
+            estimated_tokens: safe_total,
+            method,
+            family,
+            is_exact: false,
+            safety_margin_applied: safety_margin,
+            confidence_note: "Safe context budget estimate with conservative margin",
+        }
     }
 
     /// Compacts messages by deduplicating consecutive identical system messages

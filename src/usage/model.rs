@@ -209,6 +209,27 @@ pub struct UsageQueryFilter {
     pub limit: Option<usize>,
 }
 
+impl UsageQueryFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn with_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+        self.provider_id = Some(provider_id.into());
+        self
+    }
+
+    pub fn with_model_id(mut self, model_id: impl Into<String>) -> Self {
+        self.model_id = Some(model_id.into());
+        self
+    }
+}
+
 /// High-level aggregation summary across usage records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSummary {
@@ -261,7 +282,7 @@ pub struct RetryQueueMetrics {
 }
 
 /// Outcome of a retry queue drain execution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryDrainResult {
     pub succeeded: usize,
     pub retried: usize,

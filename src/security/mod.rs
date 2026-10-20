@@ -152,7 +152,14 @@ impl HostValidator {
         Self {
             allowed_hosts: hosts
                 .iter()
-                .map(|h| h.trim().to_ascii_lowercase())
+                .map(|h| {
+                    let s = h.trim().to_ascii_lowercase();
+                    if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+                        s[1..s.len() - 1].to_string()
+                    } else {
+                        s
+                    }
+                })
                 .filter(|h| !h.is_empty())
                 .collect(),
         }
@@ -165,6 +172,22 @@ impl HostValidator {
             return true;
         }
 
+        // Reject header values with forbidden characters on raw string before trimming
+        // Prevents CRLF injection, smuggling, path/query injection, and whitespace bypasses
+        if host_header.contains(',')
+            || host_header.contains(' ')
+            || host_header.contains('\t')
+            || host_header.contains('\r')
+            || host_header.contains('\n')
+            || host_header.contains('@')
+            || host_header.contains('/')
+            || host_header.contains('\\')
+            || host_header.contains('?')
+            || host_header.contains('#')
+        {
+            return false;
+        }
+
         let trimmed = host_header.trim();
         if trimmed.is_empty() {
             return false;
@@ -173,10 +196,13 @@ impl HostValidator {
         // Strip port if present: e.g. "api.example.com:8080" -> "api.example.com"
         // Also handle IPv6 brackets: "[::1]:8080" -> "::1"
         let host_part = if let Some(stripped) = trimmed.strip_prefix('[') {
-            if let Some((ip6, _)) = stripped.split_once(']') {
+            if let Some((ip6, rest)) = stripped.split_once(']') {
+                if !rest.is_empty() && !rest.starts_with(':') {
+                    return false; // Malformed IPv6 host like [::1]something
+                }
                 ip6
             } else {
-                trimmed
+                return false; // Unclosed bracket: malformed
             }
         } else if let Some((h, _port)) = trimmed.split_once(':') {
             h
@@ -184,11 +210,69 @@ impl HostValidator {
             trimmed
         };
 
+        if host_part.is_empty() {
+            return false;
+        }
+
         let lower = host_part.to_ascii_lowercase();
-        self.allowed_hosts
-            .iter()
-            .any(|allowed| allowed == &lower || allowed == trimmed)
+        let bracketed = format!("[{lower}]");
+        self.allowed_hosts.iter().any(|allowed| {
+            if let Some(wildcard_suffix) = allowed.strip_prefix("*.") {
+                // Wildcard subdomain matching: e.g. "*.example.com"
+                // Matches "sub.example.com" or "a.b.example.com"
+                // Rejects lookalikes like "evil-example.com" or "notexample.com"
+                lower == wildcard_suffix || lower.ends_with(&format!(".{wildcard_suffix}"))
+            } else {
+                allowed == &lower || allowed == &bracketed || allowed == trimmed
+            }
+        })
     }
+}
+
+/// Safely resolve the origin client IP address considering reverse proxy trust boundaries.
+///
+/// If `peer_ip` is not within `trusted_proxies`, all forwarded headers are rejected as untrusted,
+/// returning the direct `peer_ip`.
+///
+/// If `peer_ip` is trusted, parses `X-Forwarded-For` from right to left, returning the rightmost
+/// IP that is NOT a trusted proxy (the true external client).
+pub fn resolve_client_ip(
+    peer_ip: Option<IpAddr>,
+    headers: &axum::http::HeaderMap,
+    trusted_proxies: &TrustedProxyMatcher,
+) -> Option<IpAddr> {
+    let peer = peer_ip?;
+
+    if !trusted_proxies.is_trusted(&peer) {
+        return Some(peer);
+    }
+
+    // Peer is a verified trusted proxy: inspect X-Forwarded-For
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
+        let ips: Vec<IpAddr> = xff
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .collect();
+
+        if ips.is_empty() {
+            return Some(peer);
+        }
+
+        // Walk backwards from rightmost (closest to our proxy) to leftmost
+        // Find the first untrusted IP
+        for ip in ips.iter().rev() {
+            if !trusted_proxies.is_trusted(ip) {
+                return Some(*ip);
+            }
+        }
+
+        // If all IPs in chain are trusted proxies, the origin is the leftmost proxy
+        return Some(ips[0]);
+    }
+
+    Some(peer)
 }
 
 #[cfg(test)]

@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub mod tokens;
-pub use tokens::{TokenCompactionMetrics, TokenEstimator};
+pub use tokens::{
+    EstimationMethod, TokenCompactionMetrics, TokenEstimate, TokenEstimator, TokenizerFamily,
+};
 
 /// Inbound request payload for chat completion endpoints conforming to API_SPEC.md §5.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]

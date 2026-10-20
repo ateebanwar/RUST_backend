@@ -8,21 +8,52 @@ use crate::usage::model::{
     ModelUsageSummary, ProviderUsageSummary, RecordStatus, RequestMode, RequestOutcome,
     RetryDrainResult, RetryQueueMetrics, RoutingMode, UsageQueryFilter, UsageRecord, UsageSummary,
 };
+use crate::usage::spool::{SpoolDrainResult, UsageSpooler};
 use crate::usage::storage::{StorageError, UsageStorage};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{error, warn};
+
+/// Combined drain results from both independent disk spool and SQLite retry queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CombinedDrainResult {
+    pub spool: SpoolDrainResult,
+    pub sqlite: RetryDrainResult,
+}
+
+impl CombinedDrainResult {
+    pub fn total_succeeded(&self) -> usize {
+        self.spool.succeeded + self.sqlite.succeeded
+    }
+}
 
 /// Thread-safe service for usage recording and analytics.
 #[derive(Clone)]
 pub struct UsageService {
     storage: Arc<UsageStorage>,
+    spool: Arc<UsageSpooler>,
 }
 
 impl UsageService {
-    /// Initialize with an existing storage handle.
+    /// Initialize with an existing storage handle and default independent disk spool.
     pub fn new(storage: Arc<UsageStorage>) -> Self {
-        Self { storage }
+        let spool = Arc::new(UsageSpooler::new("data/usage_spool.log", 10 * 1024 * 1024));
+        Self { storage, spool }
+    }
+
+    /// Initialize with explicit storage and independent disk spool handles.
+    pub fn with_spool(storage: Arc<UsageStorage>, spool: Arc<UsageSpooler>) -> Self {
+        Self { storage, spool }
+    }
+
+    /// Access reference to the independent disk spooler.
+    pub fn spool(&self) -> &Arc<UsageSpooler> {
+        &self.spool
+    }
+
+    /// Access reference to underlying storage engine.
+    pub fn storage(&self) -> &Arc<UsageStorage> {
+        &self.storage
     }
 
     /// Record a buffered completion attempt.
@@ -85,8 +116,19 @@ impl UsageService {
                 warn!(
                     request_id = %request_id,
                     error = %enq_err,
-                    "UsageService: Failed to enqueue record to durable retry queue"
+                    "UsageService: Primary SQLite retry enqueue failed; falling back to independent disk spool"
                 );
+                if let Err(spool_err) = self
+                    .spool
+                    .append_record(&record, &format!("sqlite_enqueue_failed: {enq_err}"))
+                    .await
+                {
+                    error!(
+                        request_id = %request_id,
+                        error = %spool_err,
+                        "UsageService: CRITICAL: Both SQLite storage/retry and independent disk spool failed to persist usage record"
+                    );
+                }
             }
         }
     }
@@ -148,8 +190,19 @@ impl UsageService {
                 warn!(
                     request_id = %request_id,
                     error = %enq_err,
-                    "UsageService: Failed to enqueue record to durable retry queue"
+                    "UsageService: Primary SQLite retry enqueue failed; falling back to independent disk spool"
                 );
+                if let Err(spool_err) = self
+                    .spool
+                    .append_record(&record, &format!("sqlite_enqueue_failed: {enq_err}"))
+                    .await
+                {
+                    error!(
+                        request_id = %request_id,
+                        error = %spool_err,
+                        "UsageService: CRITICAL: Both SQLite storage/retry and independent disk spool failed to persist usage record"
+                    );
+                }
             }
         }
     }
@@ -242,5 +295,35 @@ impl UsageService {
     /// Run non-blocking WAL maintenance checkpoint.
     pub async fn maintenance_wal_checkpoint(&self) -> Result<(), StorageError> {
         self.storage.maintenance_wal_checkpoint().await
+    }
+
+    /// Drain pending retries from both the independent disk spool and SQLite retry queue.
+    pub async fn drain_all_retries(
+        &self,
+        batch_limit: usize,
+    ) -> Result<CombinedDrainResult, StorageError> {
+        let spool_res = self
+            .spool
+            .drain_to_storage(&self.storage, batch_limit)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    error = %err,
+                    "UsageService: Error draining independent disk spool into SQLite"
+                );
+                SpoolDrainResult {
+                    processed: 0,
+                    succeeded: 0,
+                    failed: 0,
+                    corrupted: 0,
+                }
+            });
+
+        let sqlite_res = self.storage.drain_retry_queue(batch_limit).await?;
+
+        Ok(CombinedDrainResult {
+            spool: spool_res,
+            sqlite: sqlite_res,
+        })
     }
 }

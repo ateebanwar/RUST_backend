@@ -2,6 +2,45 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-21 — Four-Gap Remediation, Adversarial Verification, and Production-Readiness Validation
+
+### Added
+- **Workstream A: Autonomous Retention & Retry Maintenance Worker (`src/usage/maintenance.rs`):**
+  - Application-owned periodic Tokio maintenance loop executing at configured intervals (`USAGE_CLEANUP_INTERVAL_SECS`, default 3600s).
+  - Progressive bounded batch deletion (up to 5 consecutive batches per tick, default 1000 records/batch) clearing large historical backlogs without locking SQLite.
+  - Zero-noise execution (trace level on empty runs) and non-blocking passive WAL checkpoints.
+  - Graceful cancellation handling via `tokio::sync::watch` channel integrated with Axum server termination.
+- **Workstream B: Independent Local Disk Spooler (`src/usage/spool.rs`):**
+  - Independent append-only disk spool (`data/usage_spool.log`) decoupled from SQLite.
+  - Failsafe fallback: when SQLite storage and retry queues encounter write failures, records flush to the independent disk spool with sync flushing and atomic rewriting.
+  - Strict capacity ceiling bounds (`USAGE_MAX_SPOOL_BYTES`, default 10MB) to prevent unbounded disk growth.
+  - Automatic isolation of corrupted spool entries to `.dead_letter` file, preserving uncorrupted records.
+  - Idempotent drain and restart recovery into SQLite upon database availability.
+- **Workstream C: Multilingual Token Calibration & Context Safety (`src/inference/tokens.rs`):**
+  - Extended tokenization heuristics for Roman Hinglish, Urdu/Arabic script, Devanagari, emojis, code indentation, and JSON tool schemas.
+  - Introduced `EstimationMethod` and `TokenEstimate` with transparent approximation labeling (`is_exact: false`).
+  - Added `estimate_request_context_safe` applying a conservative safety margin (+5% or at least +4 tokens) to strictly prevent context window overflow.
+- **Workstream D: Security Hardening & Regression Testing (`src/security/mod.rs`):**
+  - Hardened `HostValidator` rejecting malformed headers with control characters, CRLF, userinfo delimiters (`@`), commas, spaces, and path/query injections.
+  - IPv6 normalization (`[::1]` -> `::1`) and wildcard subdomain matching (`*.example.com`) with lookalike domain rejection (`evil-example.com`, `notexample.com`).
+  - Strict forward header stripping on direct requests without peer IP, preventing header spoofing.
+  - Implemented `resolve_client_ip` parsing multi-hop `X-Forwarded-For` right-to-left to halt at the trusted proxy boundary.
+- **Dedicated Regression Test Suites:**
+  - `tests/retention_worker_test.rs`: 6 tests verifying progressive bounded pruning, boundary retention, empty databases, and shutdown.
+  - `tests/durable_spool_test.rs`: 4 tests verifying independent spooling, restart recovery, dead-letter isolation, and capacity limits.
+  - `tests/multilingual_token_safety_test.rs`: 7 tests verifying English, Hinglish, Urdu, emojis, code, tools JSON, and context budgets.
+  - `tests/security_regression_test.rs`: 5 tests verifying Host validation, lookalike rejection, untrusted peer header rejection, and multi-hop XFF parsing.
+
+### Verification
+- `cargo fmt --check`: Passed with exit code 0.
+- `cargo check`: Passed with exit code 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
+- `cargo test`: 242 automated tests passing across 15 test suites with 0 failures and 0 errors.
+- `cargo build --release`: Passed with exit code 0.
+- Secret scan: 0 credentials or secrets committed across tracked files and git history.
+
+---
+
 ## 2026-10-20 — Phase 10: Final Hardening, Correctness, Security, Token Validation, Production Readiness, and GitHub Release
 
 ### Added

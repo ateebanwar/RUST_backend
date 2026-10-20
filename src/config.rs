@@ -123,6 +123,14 @@ pub struct AppConfig {
     pub trusted_proxies: Vec<String>,
     /// Allowed HTTP Host header values (loaded from ALLOWED_HOSTS).
     pub allowed_hosts: Vec<String>,
+    /// Autonomous usage retention cleanup cycle interval in seconds (loaded from USAGE_CLEANUP_INTERVAL_SECS, default 3600).
+    pub usage_cleanup_interval_secs: u64,
+    /// Bounded batch deletion limit for autonomous usage retention cleanup (loaded from USAGE_CLEANUP_BATCH_SIZE, default 1000).
+    pub usage_cleanup_batch_size: usize,
+    /// Path to independent local disk spool for durable usage fallback (loaded from USAGE_SPOOL_PATH, default "data/usage_spool.log").
+    pub usage_spool_path: String,
+    /// Maximum capacity ceiling in bytes for independent usage spool (loaded from USAGE_MAX_SPOOL_BYTES, default 10MB).
+    pub usage_max_spool_bytes: u64,
 }
 
 impl AppConfig {
@@ -151,6 +159,10 @@ impl AppConfig {
             overall_request_timeout_secs: 30,
             trusted_proxies: vec!["127.0.0.1".to_string(), "::1".to_string()],
             allowed_hosts: Vec::new(),
+            usage_cleanup_interval_secs: 3600,
+            usage_cleanup_batch_size: 1000,
+            usage_spool_path: "data/usage_spool.log".to_string(),
+            usage_max_spool_bytes: 10 * 1024 * 1024, // 10 MB default ceiling
         }
     }
 
@@ -354,6 +366,28 @@ impl AppConfig {
                 .collect();
         }
 
+        if let Some(secs) =
+            get_var("USAGE_CLEANUP_INTERVAL_SECS").and_then(|r| r.trim().parse::<u64>().ok())
+        {
+            config.usage_cleanup_interval_secs = secs;
+        }
+
+        if let Some(batch) =
+            get_var("USAGE_CLEANUP_BATCH_SIZE").and_then(|r| r.trim().parse::<usize>().ok())
+        {
+            config.usage_cleanup_batch_size = batch;
+        }
+
+        if let Some(spool) = get_var("USAGE_SPOOL_PATH") {
+            config.usage_spool_path = spool;
+        }
+
+        if let Some(bytes) =
+            get_var("USAGE_MAX_SPOOL_BYTES").and_then(|r| r.trim().parse::<u64>().ok())
+        {
+            config.usage_max_spool_bytes = bytes;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -526,6 +560,38 @@ impl AppConfig {
             }
         }
 
+        if self.usage_cleanup_interval_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "USAGE_CLEANUP_INTERVAL_SECS",
+                value: "0".to_string(),
+                reason: "USAGE_CLEANUP_INTERVAL_SECS must be at least 1 second to avoid busy-loops",
+            });
+        }
+
+        if self.usage_cleanup_batch_size == 0 || self.usage_cleanup_batch_size > 100_000 {
+            return Err(ConfigError::InvalidValue {
+                key: "USAGE_CLEANUP_BATCH_SIZE",
+                value: self.usage_cleanup_batch_size.to_string(),
+                reason: "USAGE_CLEANUP_BATCH_SIZE must be between 1 and 100,000",
+            });
+        }
+
+        if self.usage_spool_path.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "USAGE_SPOOL_PATH",
+                value: self.usage_spool_path.clone(),
+                reason: "USAGE_SPOOL_PATH cannot be empty",
+            });
+        }
+
+        if self.usage_max_spool_bytes < 1024 || self.usage_max_spool_bytes > 1_000_000_000 {
+            return Err(ConfigError::InvalidValue {
+                key: "USAGE_MAX_SPOOL_BYTES",
+                value: self.usage_max_spool_bytes.to_string(),
+                reason: "USAGE_MAX_SPOOL_BYTES must be between 1 KB (1024) and 1 GB (1,000,000,000)",
+            });
+        }
+
         Ok(())
     }
 }
@@ -568,6 +634,13 @@ impl fmt::Debug for AppConfig {
             )
             .field("trusted_proxies", &self.trusted_proxies)
             .field("allowed_hosts", &self.allowed_hosts)
+            .field(
+                "usage_cleanup_interval_secs",
+                &self.usage_cleanup_interval_secs,
+            )
+            .field("usage_cleanup_batch_size", &self.usage_cleanup_batch_size)
+            .field("usage_spool_path", &self.usage_spool_path)
+            .field("usage_max_spool_bytes", &self.usage_max_spool_bytes)
             .finish()
     }
 }

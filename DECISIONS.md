@@ -24,6 +24,7 @@
 | **DEC-011** | Real HTTP Provider Adapter, Inference Pipeline Execution, and Bounded Failover Architecture | **APPROVED** | 2026-10-19 | Inference Execution & Resilience |
 | **DEC-012** | Deterministic Token Estimation, Prompt Compaction, and Pre-Dispatch Context Window Routing Safeguards | **APPROVED** | 2026-10-20 | Token Efficiency & Context Capacity |
 | **DEC-013** | Model-Aware Token Estimation Provenance, Conservative Prompt Preservation, and Reverse-Proxy / Durable Usage Resilience | **APPROVED** | 2026-10-20 | Security, Correctness & Reliability |
+| **DEC-014** | Autonomous Retention Maintenance Worker, Independent Local Disk Spooler, Multilingual Token Provenance, and Reverse-Proxy Security Defense | **APPROVED** | 2026-10-21 | Reliability, Storage & Security |
 
 ---
 
@@ -223,6 +224,19 @@
   7. *Durable Usage Recording Retry Queue:* Added `usage_retry_queue` table with schema migration v2. On database persistence failure, usage records are serialized and enqueued for exponential backoff retries (up to 300s). Poison messages or exhausted retries (5 attempts) transition safely to dead-letter status, preserving user-visible inference semantics while ensuring accounting auditability.
   8. *Git Hygiene & Secret Protection:* Staged removal of tracked `target/` binaries and `data/usage.db` from git index (`git rm --cached`), hardened `.gitignore`, and added non-secret `.env.example` template.
 - **Consequences:** All acceptance gates (Gate A through Gate J) are satisfied with 220 automated tests passing, 0 Clippy warnings, and clean release compilation. Phase 11 (Authentication) is eligible to begin next upon explicit user authorization.
+
+---
+
+### DEC-014: Autonomous Retention Maintenance Worker, Independent Local Disk Spooler, Multilingual Token Provenance, and Reverse-Proxy Security Defense
+- **Status:** APPROVED
+- **Date:** 2026-10-21
+- **Context:** Remediating the four operational gaps required: (1) making retention cleanup an autonomous, lifecycle-managed background worker rather than a manual endpoint, (2) solving the SQLite single-file write lockout vulnerability by decoupling retries to an independent append-only disk spool with capacity ceilings, (3) providing model-aware multilingual token estimation with explicit provenance and conservative context safety margins, and (4) hardening Host validation, IPv6 normalization, and reverse-proxy multi-hop forwarded IP extraction.
+- **Decisions Made:**
+  1. *Autonomous Retention & Retry Maintenance Worker (`src/usage/maintenance.rs`):* Application-owned Tokio task running periodically (`usage_cleanup_interval_secs`, default 3600s). Processes expired records in progressive bounded batches (up to 5 consecutive batches per cycle, default 1000 records/batch) to clear large backlogs without monopolizing database locks. Responds immediately to application graceful shutdown signals (`tokio::sync::watch`) with a 5s drain deadline.
+  2. *Independent Durable Disk Spool (`src/usage/spool.rs`):* If SQLite is locked, corrupted, or unavailable, failed usage records immediately bypass SQLite and append to an independent local spool file (`data/usage_spool.log`). Features atomic temporary file rewriting on drain, strict capacity ceiling enforcement (`usage_max_spool_bytes`, default 10MB), and automatic dead-letter isolation of corrupted lines (`.dead_letter`).
+  3. *Multilingual Token Calibration & Context Safety (`src/inference/tokens.rs`):* Calibrated token counting across Roman Hinglish, Urdu/Arabic script, Devanagari, emojis, code indentation, and JSON tool schemas. Introduces `EstimationMethod` and `TokenEstimate` with transparent approximation labeling (`is_exact: false`). Applies a conservative safety margin (+5% or at least 4 tokens) in `estimate_request_context_safe` to strictly prevent context overflow on boundary requests.
+  4. *Hardened Host & Forwarded-Header Validation (`src/security/mod.rs`):* Strips port and normalizes IPv6 brackets (`[::1]` -> `::1`). Rejects malformed Host headers (commas, spaces, control characters, userinfo injection `@`). Enforces exact and wildcard subdomain matching (`*.example.com`) while preventing lookalike domain spoofing (`evil-example.com`, `notexample.com`). Direct requests without verified peer IP strictly strip forwarded headers. Implements `resolve_client_ip` walking multi-hop `X-Forwarded-For` from right to left to locate the verified client IP at the trusted proxy boundary.
+- **Consequences:** All four operational gaps are completely resolved and verified by 242 automated tests across 15 test suites with 0 failures, 0 Clippy warnings, and clean release compilation. Phase 11 remains strictly on hold.
 
 
 
