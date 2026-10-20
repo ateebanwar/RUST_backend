@@ -238,3 +238,53 @@ async fn test_spool_duplicate_replay_idempotency_prevents_double_counting() {
 
     let _ = std::fs::remove_file(&spool_path);
 }
+
+#[tokio::test]
+async fn test_windows_spool_partial_drain_and_atomic_replacement() {
+    let storage = Arc::new(UsageStorage::new(":memory:").unwrap());
+    let spool_path = unique_temp_spool_path("win_atomic_replace");
+    let spool = UsageSpooler::new(&spool_path, 1024 * 1024);
+
+    let rec1 = sample_record("rec_part_1");
+    let rec2 = sample_record("rec_part_2");
+    let rec3 = sample_record("rec_part_3");
+
+    spool.append_record(&rec1, "err1").await.unwrap();
+    spool.append_record(&rec2, "err2").await.unwrap();
+    spool.append_record(&rec3, "err3").await.unwrap();
+
+    let initial_metrics = spool.metrics().await.unwrap();
+    assert_eq!(initial_metrics.pending_entries, 3);
+
+    // Partial drain: batch_limit = 1
+    // Replays 1 record, rewrites temp file with 2 remaining records, and replaces spool_path
+    let drain_part = spool.drain_to_storage(&storage, 1).await.unwrap();
+    assert_eq!(drain_part.processed, 1);
+    assert_eq!(drain_part.succeeded, 1);
+
+    // Verify spool still exists and contains exactly 2 records
+    assert!(
+        spool_path.exists(),
+        "Spool file must exist after partial drain"
+    );
+    let mid_metrics = spool.metrics().await.unwrap();
+    assert_eq!(mid_metrics.pending_entries, 2);
+
+    // Drain remaining 2 records
+    let drain_rest = spool.drain_to_storage(&storage, 10).await.unwrap();
+    assert_eq!(drain_rest.processed, 2);
+    assert_eq!(drain_rest.succeeded, 2);
+
+    // Verify spool file was deleted when empty
+    assert!(
+        !spool_path.exists(),
+        "Spool file must be removed when all entries drained"
+    );
+
+    // Verify all 3 records committed to SQLite
+    let all_records = storage
+        .get_records(ai_backend::usage::UsageQueryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(all_records.len(), 3);
+}

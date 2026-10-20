@@ -198,3 +198,22 @@ fn test_corpus_mixed_script_boundary() {
     assert_eq!(estimate.method, EstimationMethod::CalibratedFamilyHeuristic);
     assert!(!estimate.is_exact);
 }
+
+#[test]
+fn test_reproduce_code_underestimation_and_safety_margin_compensation() {
+    let snippet = "fn compute(x: i32) -> i32 { x * 2 + 1 }";
+    let raw_tokens = TokenEstimator::estimate_text_for_family(snippet, TokenizerFamily::Llama);
+
+    // Let's test request context safe estimation:
+    let msg = vec![ChatMessage {
+        role: "user".to_string(),
+        content: snippet.to_string(),
+    }];
+    let safe_estimate =
+        TokenEstimator::estimate_request_context_safe(&msg, None, Some("fast-chat-v1"));
+
+    // Verify raw tokens vs safe estimate
+    assert!(safe_estimate.estimated_tokens > raw_tokens);
+    assert!(safe_estimate.safety_margin_applied >= 4);
+    assert!(!safe_estimate.is_exact);
+}

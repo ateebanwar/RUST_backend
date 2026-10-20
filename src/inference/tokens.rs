@@ -423,8 +423,10 @@ impl TokenEstimator {
             .unwrap_or(0);
         let raw_total = chat_tokens + tools_tokens;
 
-        // Apply conservative safety margin (5% or minimum 4 tokens) for heuristic estimators
-        let safety_margin = (raw_total / 20).max(4);
+        // Apply conservative safety margin (15% or minimum 8 tokens) for heuristic estimators
+        // Note: Heuristic estimation cannot provide a universal overflow guarantee for arbitrary high-entropy inputs.
+        // This margin provides headroom against subword underestimation while avoiding premature context exhaustion.
+        let safety_margin = (raw_total * 15 / 100).max(8);
         let safe_total = raw_total.saturating_add(safety_margin);
 
         let method = match family {
@@ -438,7 +440,7 @@ impl TokenEstimator {
             family,
             is_exact: false,
             safety_margin_applied: safety_margin,
-            confidence_note: "Safe context budget estimate with conservative margin",
+            confidence_note: "Conservative context budget estimate with 15% safety headroom (approximate)",
         }
     }
 
