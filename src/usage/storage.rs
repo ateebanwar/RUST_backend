@@ -5,7 +5,8 @@
 
 use crate::usage::model::{
     ModelUsageSummary, ProviderUsageSummary, RecordStatus, RequestMode, RequestOutcome,
-    RoutingMode, UsageQueryFilter, UsageRecord, UsageSource, UsageSummary,
+    RetryDrainResult, RetryQueueMetrics, RoutingMode, UsageQueryFilter, UsageRecord, UsageSource,
+    UsageSummary,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::HashMap;
@@ -154,6 +155,28 @@ impl UsageStorage {
         )
         .map_err(|e| StorageError::MigrationError(format!("Migration log failed: {e}")))?;
 
+        // Migration version 2: durable usage retry queue
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage_retry_queue (
+                record_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 5,
+                last_error TEXT,
+                next_retry_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS idx_retry_queue_status_retry ON usage_retry_queue(status, next_retry_at);",
+        )
+        .map_err(|e| StorageError::MigrationError(format!("Schema migration v2 failed: {e}")))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
+            params![now],
+        )
+        .map_err(|e| StorageError::MigrationError(format!("Migration v2 log failed: {e}")))?;
+
         Ok(())
     }
 
@@ -230,6 +253,324 @@ impl UsageStorage {
     pub async fn prune_older_than(&self, cutoff_epoch_ms: u64) -> Result<usize, StorageError> {
         let storage = self.clone();
         tokio::task::spawn_blocking(move || storage.prune_older_than_sync(cutoff_epoch_ms))
+            .await
+            .map_err(|e| StorageError::ConnectionError(format!("Blocking task join failed: {e}")))?
+    }
+
+    /// Prune records older than cutoff_epoch_ms in bounded batches to avoid locking SQLite.
+    pub fn prune_older_than_bounded_sync(
+        &self,
+        cutoff_epoch_ms: u64,
+        batch_limit: usize,
+    ) -> Result<usize, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let deleted = conn
+            .execute(
+                "DELETE FROM usage_records WHERE id IN (
+                    SELECT id FROM usage_records WHERE start_time < ?1 LIMIT ?2
+                )",
+                params![cutoff_epoch_ms as i64, batch_limit as i64],
+            )
+            .map_err(|e| StorageError::QueryError(format!("Bounded prune failed: {e}")))?;
+
+        Ok(deleted)
+    }
+
+    /// Asynchronously prune records older than cutoff_epoch_ms in bounded batches.
+    pub async fn prune_older_than_bounded(
+        &self,
+        cutoff_epoch_ms: u64,
+        batch_limit: usize,
+    ) -> Result<usize, StorageError> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.prune_older_than_bounded_sync(cutoff_epoch_ms, batch_limit)
+        })
+        .await
+        .map_err(|e| StorageError::ConnectionError(format!("Blocking task join failed: {e}")))?
+    }
+
+    /// Run non-blocking passive WAL checkpoint maintenance.
+    pub fn maintenance_wal_checkpoint_sync(&self) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        Ok(())
+    }
+
+    /// Asynchronously run passive WAL checkpoint maintenance.
+    pub async fn maintenance_wal_checkpoint(&self) -> Result<(), StorageError> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.maintenance_wal_checkpoint_sync())
+            .await
+            .map_err(|e| StorageError::ConnectionError(format!("Blocking task join failed: {e}")))?
+    }
+
+    /// Enqueue a failed usage record for durable retrying.
+    pub fn enqueue_retry_sync(
+        &self,
+        record: &UsageRecord,
+        error_msg: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let payload_json = serde_json::to_string(record)
+            .map_err(|e| StorageError::QueryError(format!("Serialization failed: {e}")))?;
+
+        let depth: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_retry_queue WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if depth >= 5000 {
+            conn.execute(
+                "INSERT OR REPLACE INTO usage_retry_queue (
+                    record_id, payload_json, attempts, max_attempts, last_error, next_retry_at, created_at, status
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'dead_letter')",
+                params![
+                    record.id,
+                    payload_json,
+                    1,
+                    5,
+                    format!("Queue saturated (>5000): {error_msg}"),
+                    now,
+                    now,
+                ],
+            )
+            .map_err(|e| StorageError::QueryError(format!("Failed to enqueue dead letter: {e}")))?;
+            return Ok(());
+        }
+
+        let next_retry_at = now + 5;
+
+        conn.execute(
+            "INSERT INTO usage_retry_queue (
+                record_id, payload_json, attempts, max_attempts, last_error, next_retry_at, created_at, status
+            ) VALUES (?1, ?2, 1, 5, ?3, ?4, ?5, 'pending')
+            ON CONFLICT(record_id) DO UPDATE SET
+                attempts = attempts + 1,
+                last_error = excluded.last_error,
+                next_retry_at = excluded.next_retry_at",
+            params![
+                record.id,
+                payload_json,
+                error_msg,
+                next_retry_at,
+                now,
+            ],
+        )
+        .map_err(|e| StorageError::QueryError(format!("Failed to enqueue retry record: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Asynchronously enqueue a failed usage record for durable retrying.
+    pub async fn enqueue_retry(
+        &self,
+        record: &UsageRecord,
+        error_msg: &str,
+    ) -> Result<(), StorageError> {
+        let storage = self.clone();
+        let record = record.clone();
+        let error_msg = error_msg.to_string();
+        tokio::task::spawn_blocking(move || storage.enqueue_retry_sync(&record, &error_msg))
+            .await
+            .map_err(|e| StorageError::ConnectionError(format!("Blocking task join failed: {e}")))?
+    }
+
+    /// Process and retry pending records in bounded batches.
+    pub fn drain_retry_queue_sync(
+        &self,
+        batch_limit: usize,
+    ) -> Result<RetryDrainResult, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        struct RetryEntry {
+            record_id: String,
+            payload_json: String,
+            attempts: i64,
+            max_attempts: i64,
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT record_id, payload_json, attempts, max_attempts
+                 FROM usage_retry_queue
+                 WHERE status = 'pending' AND next_retry_at <= ?1
+                 ORDER BY next_retry_at ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| StorageError::QueryError(format!("Prepare retry query failed: {e}")))?;
+
+        let entries: Vec<RetryEntry> = stmt
+            .query_map(params![now, batch_limit as i64], |row| {
+                Ok(RetryEntry {
+                    record_id: row.get(0)?,
+                    payload_json: row.get(1)?,
+                    attempts: row.get(2)?,
+                    max_attempts: row.get(3)?,
+                })
+            })
+            .map_err(|e| StorageError::QueryError(format!("Query retry queue failed: {e}")))?
+            .filter_map(Result::ok)
+            .collect();
+
+        drop(stmt);
+
+        let mut succeeded = 0;
+        let mut retried = 0;
+        let mut dead_lettered = 0;
+
+        for entry in entries {
+            let record: Result<UsageRecord, _> = serde_json::from_str(&entry.payload_json);
+            match record {
+                Ok(rec) => {
+                    let prompt_tokens = rec.prompt_tokens.map(|v| v as i64);
+                    let completion_tokens = rec.completion_tokens.map(|v| v as i64);
+                    let total_tokens = rec.total_tokens.map(|v| v as i64);
+
+                    let insert_res = conn.execute(
+                        "INSERT OR REPLACE INTO usage_records (
+                            id, provider_id, model_id, request_mode, routing_mode,
+                            start_time, completion_time, latency_ms, outcome, failure_category,
+                            prompt_tokens, completion_tokens, total_tokens, usage_source, record_status
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        params![
+                            rec.id,
+                            rec.provider_id,
+                            rec.model_id,
+                            rec.request_mode.as_str(),
+                            rec.routing_mode.as_str(),
+                            rec.start_time as i64,
+                            rec.completion_time as i64,
+                            rec.latency_ms as i64,
+                            rec.outcome.as_str(),
+                            rec.failure_category,
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                            rec.usage_source.as_str(),
+                            rec.record_status.as_str(),
+                        ],
+                    );
+
+                    match insert_res {
+                        Ok(_) => {
+                            let _ = conn.execute(
+                                "DELETE FROM usage_retry_queue WHERE record_id = ?1",
+                                params![entry.record_id],
+                            );
+                            succeeded += 1;
+                        }
+                        Err(e) => {
+                            let next_attempts = entry.attempts + 1;
+                            if next_attempts >= entry.max_attempts {
+                                let _ = conn.execute(
+                                    "UPDATE usage_retry_queue SET status = 'dead_letter', attempts = ?1, last_error = ?2 WHERE record_id = ?3",
+                                    params![next_attempts, format!("Insert failed: {e}"), entry.record_id],
+                                );
+                                dead_lettered += 1;
+                            } else {
+                                let backoff_secs = (5 * (1i64 << next_attempts.min(6))).min(300);
+                                let next_retry = now + backoff_secs;
+                                let _ = conn.execute(
+                                    "UPDATE usage_retry_queue SET attempts = ?1, next_retry_at = ?2, last_error = ?3 WHERE record_id = ?4",
+                                    params![next_attempts, next_retry, format!("Insert failed: {e}"), entry.record_id],
+                                );
+                                retried += 1;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = conn.execute(
+                        "UPDATE usage_retry_queue SET status = 'dead_letter', last_error = ?1 WHERE record_id = ?2",
+                        params![format!("Corrupted payload JSON: {e}"), entry.record_id],
+                    );
+                    dead_lettered += 1;
+                }
+            }
+        }
+
+        Ok(RetryDrainResult {
+            succeeded,
+            retried,
+            dead_lettered,
+        })
+    }
+
+    /// Asynchronously drain retry queue.
+    pub async fn drain_retry_queue(
+        &self,
+        batch_limit: usize,
+    ) -> Result<RetryDrainResult, StorageError> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.drain_retry_queue_sync(batch_limit))
+            .await
+            .map_err(|e| StorageError::ConnectionError(format!("Blocking task join failed: {e}")))?
+    }
+
+    /// Retrieve queue depth and dead letter counts.
+    pub fn get_retry_queue_metrics_sync(&self) -> Result<RetryQueueMetrics, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let pending_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_retry_queue WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::QueryError(format!("Query pending count failed: {e}")))?;
+
+        let dead_letter_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_retry_queue WHERE status = 'dead_letter'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                StorageError::QueryError(format!("Query dead letter count failed: {e}"))
+            })?;
+
+        Ok(RetryQueueMetrics {
+            pending_count,
+            dead_letter_count,
+        })
+    }
+
+    /// Asynchronously retrieve retry queue metrics.
+    pub async fn get_retry_queue_metrics(&self) -> Result<RetryQueueMetrics, StorageError> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || storage.get_retry_queue_metrics_sync())
             .await
             .map_err(|e| StorageError::ConnectionError(format!("Blocking task join failed: {e}")))?
     }

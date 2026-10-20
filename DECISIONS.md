@@ -23,6 +23,7 @@
 | **DEC-010** | Multi-Criteria Intelligent Model Routing Policy & Scoring Matrix | **APPROVED** | 2026-10-19 | Model Selection & Fallback Ordering |
 | **DEC-011** | Real HTTP Provider Adapter, Inference Pipeline Execution, and Bounded Failover Architecture | **APPROVED** | 2026-10-19 | Inference Execution & Resilience |
 | **DEC-012** | Deterministic Token Estimation, Prompt Compaction, and Pre-Dispatch Context Window Routing Safeguards | **APPROVED** | 2026-10-20 | Token Efficiency & Context Capacity |
+| **DEC-013** | Model-Aware Token Estimation Provenance, Conservative Prompt Preservation, and Reverse-Proxy / Durable Usage Resilience | **APPROVED** | 2026-10-20 | Security, Correctness & Reliability |
 
 ---
 
@@ -205,6 +206,23 @@
 - **Selected Option:** Option 2 (Heuristic Estimator with Thread-Safe LRU Caching and Semantic Guardrails).
 - **Rationale:** Zero external dependencies or binary bloat, negligible CPU overhead (<1 µs), prevents costly upstream 400 context overflow rejections, eliminates redundant routing classification, and delivers proven latency/throughput improvements (+112% RPS on completion, 53% latency reduction).
 - **Consequences:** All chat completion and streaming pipelines automatically validate and filter by context capacity. Usage reporting preserves provider-reported token figures while internal routing relies on deterministic estimates for pre-dispatch gating.
+
+---
+
+### DEC-013: Model-Aware Token Estimation Provenance, Conservative Prompt Preservation, and Reverse-Proxy / Durable Usage Resilience
+- **Status:** APPROVED
+- **Date:** 2026-10-20
+- **Context:** Following the initial Phase 10 optimization baseline, final hardening required resolving token estimator accuracy across model families without cache collisions, preventing Python/YAML formatting corruption during prompt compaction, securing the service against untrusted reverse-proxy forwarded headers and Host-header injection, avoiding long-lived database table locks during retention pruning, and establishing durable recovery for transient usage recording failures.
+- **Decisions Made:**
+  1. *Model-Aware Tokenizer Family & Provenance:* Introduced `TokenizerFamily` enum (`Llama`, `Mistral`, `Gemma`, `Qwen`, `DeepSeek`, `Gpt`, `Generic`) with model ID pattern matching. Replaced raw hash indexing with collision-safe `CacheKey { text, family }`. Token usage provenance explicitly separates estimated heuristics from provider-reported numbers; missing usage is never coerced to zero.
+  2. *Strict Semantic-Preserving Prompt Compaction:* Compaction strictly preserves Python code indentation, Markdown code fences (` ``` `, `~~~`), YAML/JSON blocks, shell commands, and SQL queries. Restricts whitespace cleanup to collapsing 3+ blank lines to 2 and stripping trailing line spaces. Consecutive identical system instructions are deduplicated with granular metrics (`original_characters`, `compacted_characters`, `bytes_saved`, `compaction_applied`, `compaction_skipped_reason`).
+  3. *Context Window Completion Allowance:* Factored in client requested `max_tokens` (`req.max_tokens.unwrap_or(256).min(model.max_output_tokens)`) into pre-dispatch gating, rejecting requests whose prompt + completion allowance exceeds model context window.
+  4. *SSE Byte Buffer Chunking:* Switched `OpenAiCompatibleAdapter::parse_sse_stream` from string-based slicing to byte-level `Vec<u8>` chunk processing, splitting on `b'\n'` and stripping `b'\r'`. This guarantees that multi-byte UTF-8 code points split across TCP packet boundaries are never corrupted or malformed.
+  5. *Network Security & Reverse-Proxy Hardening:* Implemented `IpCidr` bitmask parsing for IPv4 & IPv6 with shift-overflow protection for prefix 0. Added `TrustedProxyMatcher` and `HostValidator`. Strips spoofed `X-Forwarded-*` / `Forwarded` headers from untrusted clients, trusting headers only from explicitly configured trusted proxy CIDRs.
+  6. *Bounded Retention Maintenance & WAL Checkpoints:* Added bounded subquery deletion (`prune_older_than_bounded`) to delete records in chunks (e.g. 1000 records) to prevent SQLite database write lock contention, coupled with passive WAL maintenance checkpoints (`maintenance_wal_checkpoint`).
+  7. *Durable Usage Recording Retry Queue:* Added `usage_retry_queue` table with schema migration v2. On database persistence failure, usage records are serialized and enqueued for exponential backoff retries (up to 300s). Poison messages or exhausted retries (5 attempts) transition safely to dead-letter status, preserving user-visible inference semantics while ensuring accounting auditability.
+  8. *Git Hygiene & Secret Protection:* Staged removal of tracked `target/` binaries and `data/usage.db` from git index (`git rm --cached`), hardened `.gitignore`, and added non-secret `.env.example` template.
+- **Consequences:** All acceptance gates (Gate A through Gate J) are satisfied with 220 automated tests passing, 0 Clippy warnings, and clean release compilation. Phase 11 (Authentication) is eligible to begin next upon explicit user authorization.
 
 
 

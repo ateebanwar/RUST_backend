@@ -119,6 +119,10 @@ pub struct AppConfig {
     pub max_retry_after_secs: u64,
     /// Overall request processing deadline in seconds (loaded from OVERALL_REQUEST_TIMEOUT_SECS).
     pub overall_request_timeout_secs: u64,
+    /// Trusted reverse proxy IP/CIDR addresses (loaded from TRUSTED_PROXIES).
+    pub trusted_proxies: Vec<String>,
+    /// Allowed HTTP Host header values (loaded from ALLOWED_HOSTS).
+    pub allowed_hosts: Vec<String>,
 }
 
 impl AppConfig {
@@ -145,6 +149,8 @@ impl AppConfig {
             max_backoff_ms: 1000,
             max_retry_after_secs: 5,
             overall_request_timeout_secs: 30,
+            trusted_proxies: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            allowed_hosts: Vec::new(),
         }
     }
 
@@ -332,8 +338,34 @@ impl AppConfig {
             config.overall_request_timeout_secs = secs;
         }
 
+        if let Some(proxies) = get_var("TRUSTED_PROXIES") {
+            config.trusted_proxies = proxies
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Some(hosts) = get_var("ALLOWED_HOSTS") {
+            config.allowed_hosts = hosts
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
         config.validate()?;
         Ok(config)
+    }
+
+    /// Create a TrustedProxyMatcher from configured trusted proxies.
+    pub fn trusted_proxy_matcher(&self) -> crate::security::TrustedProxyMatcher {
+        crate::security::TrustedProxyMatcher::new(&self.trusted_proxies).unwrap_or_default()
+    }
+
+    /// Create a HostValidator from configured allowed hosts.
+    pub fn host_validator(&self) -> crate::security::HostValidator {
+        crate::security::HostValidator::new(&self.allowed_hosts)
     }
 
     /// Create RetryPolicy from current application configuration.
@@ -484,6 +516,16 @@ impl AppConfig {
             });
         }
 
+        for proxy_cidr in &self.trusted_proxies {
+            if crate::security::IpCidr::parse(proxy_cidr).is_err() {
+                return Err(ConfigError::InvalidValue {
+                    key: "TRUSTED_PROXIES",
+                    value: proxy_cidr.clone(),
+                    reason: "Invalid CIDR or IP format in TRUSTED_PROXIES",
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -524,6 +566,8 @@ impl fmt::Debug for AppConfig {
                 "overall_request_timeout_secs",
                 &self.overall_request_timeout_secs,
             )
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("allowed_hosts", &self.allowed_hosts)
             .finish()
     }
 }

@@ -231,7 +231,10 @@ impl InferenceService {
         let detected_task = classification.category.as_str().to_string();
         let estimated_complexity = classification.complexity.as_str().to_string();
 
-        let estimated_prompt_tokens = TokenEstimator::estimate_chat(&req.messages);
+        let estimated_prompt_tokens = TokenEstimator::estimate_chat_for_model(
+            &req.messages,
+            req.requested_model_id.as_deref(),
+        );
 
         if req.routing_mode.eq_ignore_ascii_case("manual") {
             let preferred_id = match req.requested_model_id.as_deref() {
@@ -259,9 +262,10 @@ impl InferenceService {
                 )));
             }
 
-            if estimated_prompt_tokens > model.context_window {
+            let completion_allowance = req.max_tokens.unwrap_or(256).min(model.max_output_tokens);
+            if estimated_prompt_tokens + completion_allowance > model.context_window {
                 return Err(AppError::InvalidRequest(format!(
-                    "Prompt estimated tokens ({estimated_prompt_tokens}) exceed model '{preferred_id}' context window ({})",
+                    "Prompt estimated tokens ({estimated_prompt_tokens}) plus completion allowance ({completion_allowance}) exceed model '{preferred_id}' context window ({})",
                     model.context_window
                 )));
             }
@@ -302,15 +306,19 @@ impl InferenceService {
                 .registry
                 .query_models(&ModelFilter::new().with_available_only(true));
 
-            // Capacity-aware context window filtering: only evaluate candidates that can fit prompt tokens
+            // Capacity-aware context window filtering: only evaluate candidates that can fit prompt tokens + completion allowance
+            let min_completion_allowance = req.max_tokens.unwrap_or(256);
             let fitting_models: Vec<crate::models::ModelMetadata> = available_models
                 .into_iter()
-                .filter(|m| m.context_window >= estimated_prompt_tokens)
+                .filter(|m| {
+                    let allowance = min_completion_allowance.min(m.max_output_tokens);
+                    m.context_window >= estimated_prompt_tokens + allowance
+                })
                 .collect();
 
             if fitting_models.is_empty() {
                 return Err(AppError::InvalidRequest(format!(
-                    "Prompt estimated tokens ({estimated_prompt_tokens}) exceed context window of all available operational models"
+                    "Prompt estimated tokens ({estimated_prompt_tokens}) plus completion allowance ({min_completion_allowance}) exceed context window of all available operational models"
                 )));
             }
 

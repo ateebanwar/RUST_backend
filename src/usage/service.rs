@@ -6,7 +6,7 @@
 use crate::models::UsageMetadata;
 use crate::usage::model::{
     ModelUsageSummary, ProviderUsageSummary, RecordStatus, RequestMode, RequestOutcome,
-    RoutingMode, UsageQueryFilter, UsageRecord, UsageSummary,
+    RetryDrainResult, RetryQueueMetrics, RoutingMode, UsageQueryFilter, UsageRecord, UsageSummary,
 };
 use crate::usage::storage::{StorageError, UsageStorage};
 use std::sync::Arc;
@@ -75,12 +75,19 @@ impl UsageService {
             record_status: RecordStatus::Final,
         };
 
-        if let Err(err) = self.storage.record(record).await {
+        if let Err(err) = self.storage.record(record.clone()).await {
             warn!(
                 request_id = %request_id,
                 error = %err,
-                "UsageService: Failed to record buffered usage record (non-fatal)"
+                "UsageService: Failed to record buffered usage record (non-fatal), enqueuing to durable retry queue"
             );
+            if let Err(enq_err) = self.storage.enqueue_retry(&record, &err.to_string()).await {
+                warn!(
+                    request_id = %request_id,
+                    error = %enq_err,
+                    "UsageService: Failed to enqueue record to durable retry queue"
+                );
+            }
         }
     }
 
@@ -131,12 +138,19 @@ impl UsageService {
             record_status: RecordStatus::Final,
         };
 
-        if let Err(err) = self.storage.record(record).await {
+        if let Err(err) = self.storage.record(record.clone()).await {
             warn!(
                 request_id = %request_id,
                 error = %err,
-                "UsageService: Failed to record streaming usage record (non-fatal)"
+                "UsageService: Failed to record streaming usage record (non-fatal), enqueuing to durable retry queue"
             );
+            if let Err(enq_err) = self.storage.enqueue_retry(&record, &err.to_string()).await {
+                warn!(
+                    request_id = %request_id,
+                    error = %enq_err,
+                    "UsageService: Failed to enqueue record to durable retry queue"
+                );
+            }
         }
     }
 
@@ -193,5 +207,40 @@ impl UsageService {
         let retention_ms = days.saturating_mul(86_400_000);
         let cutoff_ms = now_ms.saturating_sub(retention_ms);
         self.storage.prune_older_than_sync(cutoff_ms)
+    }
+
+    /// Prune records older than the specified retention days using bounded batches.
+    pub async fn prune_retention_bounded(
+        &self,
+        days: u64,
+        batch_limit: usize,
+    ) -> Result<usize, StorageError> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let retention_ms = days.saturating_mul(86_400_000);
+        let cutoff_ms = now_ms.saturating_sub(retention_ms);
+        self.storage
+            .prune_older_than_bounded(cutoff_ms, batch_limit)
+            .await
+    }
+
+    /// Drain pending retries from the durable retry queue.
+    pub async fn drain_retries(
+        &self,
+        batch_limit: usize,
+    ) -> Result<RetryDrainResult, StorageError> {
+        self.storage.drain_retry_queue(batch_limit).await
+    }
+
+    /// Query operational metrics for the durable retry queue.
+    pub async fn get_retry_queue_metrics(&self) -> Result<RetryQueueMetrics, StorageError> {
+        self.storage.get_retry_queue_metrics().await
+    }
+
+    /// Run non-blocking WAL maintenance checkpoint.
+    pub async fn maintenance_wal_checkpoint(&self) -> Result<(), StorageError> {
+        self.storage.maintenance_wal_checkpoint().await
     }
 }

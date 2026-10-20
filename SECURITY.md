@@ -94,3 +94,24 @@ If an upstream provider key or signing secret is suspected of being compromised:
 2. **Environment Update:** Update the secret in the Vercel project settings (or server environment) and trigger a redeployment.
 3. **Audit Log Inspection:** Review provider usage dashboards for abnormal token spikes or unauthorized completions.
 4. **Security Advisory:** Document the event, root cause, and remediation in [`CHANGELOG.md`](file:///d:/Rust%20Backend/ai-backend/CHANGELOG.md).
+
+---
+
+## 9. Network Host & Reverse-Proxy Security Hardening
+
+1. **Loopback Bind Default:** Local daemon development binds strictly to `127.0.0.1` by default. Binding to external interfaces (`0.0.0.0`) requires deliberate configuration via the `HOST` environment variable.
+2. **Trusted Reverse-Proxy Allowlisting:**
+   - Inbound `X-Forwarded-For`, `Forwarded`, `X-Forwarded-Host`, and `X-Forwarded-Proto` headers are untrusted and discarded by default.
+   - Forwarded headers are trusted only when the immediate peer connection originates from an explicitly configured CIDR or IP address defined in `TRUSTED_PROXIES` (e.g. `127.0.0.1/32`, `10.0.0.0/8`, `2001:db8::/32`).
+3. **HTTP Host-Header Poisoning Defense:**
+   - When `ALLOWED_HOSTS` is configured, incoming `Host` headers must strictly match the allowlist. Unmatched host headers are rejected with HTTP 403 Forbidden.
+4. **Ingress mTLS Protocol Boundary:**
+   - Mutual TLS (mTLS) client certificate verification terminates at the reverse-proxy or API ingress layer (e.g. Cloudflare, Nginx, Envoy). The Rust application does not process raw TLS client certificates directly.
+
+---
+
+## 10. Confidential Files & Version Control Hygiene
+
+1. **Strict Git Exclusion:** `.env`, `.env.local`, `data/*.db*`, `target/`, and private keys are strictly excluded from version control via `.gitignore`.
+2. **Tracked Secret Prevention:** Local SQLite databases and compiled binaries must never be added to git index.
+3. **Safe Example Templates:** Only sanitized configuration templates containing non-secret placeholder variables (such as `.env.example`) are maintained in version control. Real credentials must never be committed.

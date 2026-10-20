@@ -12,6 +12,7 @@ pub mod registry;
 pub mod reliability;
 pub mod router;
 pub mod routes;
+pub mod security;
 pub mod usage;
 
 use axum::extract::{Request, State};
@@ -324,6 +325,37 @@ async fn request_id_and_auth_middleware(
 
     req.extensions_mut()
         .insert(RequestId(request_id_str.clone()));
+
+    // 1b. Host Header Validation
+    if !state.config.allowed_hosts.is_empty() {
+        let host_val = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        if !state.config.host_validator().validate_host(host_val) {
+            let err = AppError::InvalidRequest("Invalid or untrusted Host header".to_string());
+            return err.to_response_with_id(&request_id_str);
+        }
+    }
+
+    // 1c. Forwarded Header Protection against spoofing from untrusted peers
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    let is_trusted_peer = match peer_ip {
+        Some(ip) => state.config.trusted_proxy_matcher().is_trusted(&ip),
+        None => state.config.is_loopback_host(),
+    };
+
+    if !is_trusted_peer {
+        req.headers_mut().remove("x-forwarded-for");
+        req.headers_mut().remove("forwarded");
+        req.headers_mut().remove("x-forwarded-proto");
+        req.headers_mut().remove("x-forwarded-host");
+    }
 
     // 2. Authentication enforcement (API_SPEC.md §1.1)
     let path = req.uri().path();

@@ -166,6 +166,8 @@ fn test_valid_configuration_accepted() {
         max_backoff_ms: 1000,
         max_retry_after_secs: 5,
         overall_request_timeout_secs: 30,
+        trusted_proxies: Vec::new(),
+        allowed_hosts: Vec::new(),
     };
     assert!(config.validate().is_ok());
 }

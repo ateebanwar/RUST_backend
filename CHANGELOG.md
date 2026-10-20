@@ -2,6 +2,36 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-20 — Phase 10: Final Hardening, Correctness, Security, Token Validation, Production Readiness, and GitHub Release
+
+### Added
+- **Model-Aware Tokenizer Family Heuristics (`src/inference/tokens.rs`):** Added `TokenizerFamily` enum (`Llama`, `Mistral`, `Gemma`, `Qwen`, `DeepSeek`, `Gpt`, `Generic`) with model ID pattern matching and calibrated ratio scaling.
+- **Collision-Safe Multi-Family Token Cache (`src/inference/tokens.rs`):** Replaced raw hash indexing with structured `CacheKey { text: String, family: TokenizerFamily }`, completely preventing false cache collisions across differing model families.
+- **Strict Semantic-Preserving Prompt Compaction Engine (`src/inference/tokens.rs`):** Implemented conservative compaction that strictly protects leading Python code indentation, Markdown code fences (` ``` `, `~~~`), YAML/JSON configurations, shell commands, and SQL queries.
+- **Granular Compaction Metrics:** Enhanced `TokenCompactionMetrics` with `original_characters`, `compacted_characters`, `bytes_saved`, `compaction_applied`, and `compaction_skipped_reason`.
+- **Completion Allowance in Context Window Gating (`src/inference/mod.rs`):** Enforced pre-dispatch bounds checking incorporating requested `max_tokens` (`req.max_tokens.unwrap_or(256).min(model.max_output_tokens)`), preventing context truncation.
+- **Network Security & Reverse-Proxy Subsystem (`src/security/mod.rs`):**
+  - Bitmask `IpCidr` parsing supporting both IPv4 (0-32) and IPv6 (0-128) CIDR notations without arithmetic overflow panics.
+  - `TrustedProxyMatcher` allowlisting proxy CIDRs.
+  - `HostValidator` preventing HTTP Host-header poisoning.
+  - Reverse-proxy middleware in `src/lib.rs` stripping spoofed `X-Forwarded-*` / `Forwarded` headers from untrusted network peers.
+- **Durable Retention Pruning & WAL Checkpoint Maintenance (`src/usage/storage.rs`, `src/usage/service.rs`):** Bounded batch deletions (`prune_older_than_bounded`) avoiding SQLite database table locks, and passive WAL maintenance checkpoints (`maintenance_wal_checkpoint`).
+- **Durable Usage Retry Queue (`src/usage/storage.rs`, `src/usage/service.rs`):** Added SQLite table `usage_retry_queue` with schema migration v2, exponential backoff (up to 300s), poison message isolation, and dead-letter queue metrics.
+- **Git Hygiene & Secret Protection:** Hardened `.gitignore`, removed tracked `target/` binaries and `data/usage.db` from git index (`git rm --cached`), and added documented non-secret `.env.example` template.
+
+### Hardened
+- **SSE Stream Parser Chunking (`src/providers/openai_compatible.rs`):** Re-architected stream parser using raw byte buffers (`Vec<u8>`), completely eliminating multi-byte UTF-8 split boundary decoding errors across fragmented TCP packets.
+
+### Verification
+- `cargo fmt --check`: Clean formatting verified across all source and test files.
+- `cargo check`: Clean compilation with 0 errors.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings.
+- `cargo test`: 220 automated tests passing (66 unit tests, 154 integration tests across 11 test suites) with 0 failures and 1 ignored load test.
+- `cargo build --release`: Clean release compilation with 0 errors.
+- `cargo test --release --test load_benchmark -- --ignored --nocapture`: Completed with 100% success rate across all 16 concurrency tiers.
+
+---
+
 ## 2026-10-20 — Phase 10: Token Optimization & Performance Baseline Implementation
 
 ### Added

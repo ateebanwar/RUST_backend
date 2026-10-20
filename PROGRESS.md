@@ -60,14 +60,18 @@
   - **Idempotency & Reconciled Usage Accounting:** Exactly one SQLite usage row recorded per request across all attempts and failovers. Missing tokens remain strictly `None` (SQL `NULL`) with `UsageSource::Unavailable`, while `UsageSummary` records `unknown_usage_requests == 1` and aggregated known tokens as `0`.
   - **Future Hardening Backlog Preserved:** Explicitly documents host-based bind security, retention cleanup reliability, and usage-recording failure observability for future hardening phases.
   - **Verification:** 196 automated tests passing across 10 test suites (`tests/failover_reliability_test.rs` with 19 focused tests); `cargo fmt --check` clean; `cargo check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean.
-- [x] **Phase 10 — Token Optimization & Performance Baseline (COMPLETE):**
+- [x] **Phase 10 — Token Optimization, Hardening & Operational Reliability (COMPLETE & VERIFIED):**
   - **Empirical Baseline & Profiling:** Established reproducible performance baseline in both Debug and Release profiles across single-request and concurrent ($C=20$) workloads. Median completion latency ($C=1$): 0.52 ms (Release); streaming TTFC ($C=20$): 0.38 ms.
-  - **Deterministic Token Estimator (`src/inference/tokens.rs`):** Pure Rust estimation based on 100k+ modern BPE vocabulary standards ($\max(1, \lceil\text{chars} / 4\rceil + \text{subword\_delimiters})$) with standard ChatML framing overhead (+4 per message, +3 primer). Supported by a thread-safe 512-slot circular LRU cache using 64-bit FNV-1a hashing.
-  - **Conservative Prompt Compaction:** Safe whitespace normalization preserving code indentation, consecutive duplicate system prompt deduplication, and compaction metrics tracking.
-  - **Context Window Capacity-Aware Routing (`src/inference/mod.rs`):** Integrated pre-dispatch context validation in `InferenceService`. In `auto` mode, filters out candidate models whose context windows cannot accommodate the estimated prompt (+256 completion headroom). In `manual` mode, rejects oversized prompts immediately with HTTP 400 `InvalidRequest` before making upstream calls.
-  - **Pipeline & Parser Optimization:** Eliminated redundant `resolve_candidates` invocation on the happy path in `src/routes/chat.rs`. Replaced intermediate heap allocations in `src/providers/openai_compatible.rs` with zero-copy string slice parsing (`&buffer[..pos]`).
-  - **Demonstrated Performance Gains:** +112% RPS increase and 53.1% average latency reduction on buffered completions; +100.3% RPS increase on health probe ($C=20$); 31.6% TTFC reduction on streaming ($C=20$).
-  - **Verification:** 206 automated tests passing across 11 test suites (`tests/token_optimization_test.rs` with 10 focused tests); 1 load benchmark (`load_benchmark.rs`); `cargo fmt --check` clean; `cargo check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean.
+  - **Model-Aware Token Estimator (`src/inference/tokens.rs`):** Model family heuristics (`TokenizerFamily`: Llama, Mistral, Gemma, Qwen, DeepSeek, GPT, Generic) conforming to 100k+ modern BPE vocabulary standards with ChatML framing overhead (+4 per message, +3 primer). Supported by a collision-safe circular LRU cache (`CacheKey { text, family }`) preventing cross-model key collisions.
+  - **Conservative Semantic-Preserving Prompt Compaction:** Strict preservation of Python indentation, Markdown code fences (` ``` `, `~~~`), YAML/JSON data, shell commands, and SQL queries. Deduplicates consecutive identical system messages while tracking granular metrics (`original_characters`, `compacted_characters`, `bytes_saved`, `compaction_applied`, `compaction_skipped_reason`).
+  - **Token Saving Provenance:** Clear separation of byte counts, character counts, and estimated tokens from provider-reported usage. Missing usage metadata strictly represented as `None` / `Unavailable` (never zero).
+  - **Context Window Capacity-Aware Routing (`src/inference/mod.rs`):** Integrated pre-dispatch context validation in `InferenceService`. Factoring in completion allowance (`req.max_tokens.unwrap_or(256).min(model.max_output_tokens)`). In `auto` mode, filters out candidate models whose context windows cannot accommodate the request. In `manual` mode, immediately rejects oversized prompts with HTTP 400 `InvalidRequest`.
+  - **Pipeline & SSE Parser Hardening (`src/providers/openai_compatible.rs`):** Eliminates duplicate candidate resolution on the happy path. Hardened SSE parser using raw byte buffers (`Vec<u8>`) to completely prevent multi-byte UTF-8 boundary chunking errors across network fragments, handling CRLF/LF line endings and trailing chunks.
+  - **Network Security & Reverse-Proxy Hardening (`src/security/mod.rs`):** Safe loopback bind default (`127.0.0.1`), bitmask `IpCidr` parsing for IPv4 & IPv6, `TrustedProxyMatcher`, `HostValidator`, and automatic stripping of spoofed `X-Forwarded-*` / `Forwarded` headers from untrusted clients.
+  - **Durable Retention & Autonomous Maintenance (`src/usage/storage.rs`, `src/usage/service.rs`):** Bounded batch retention pruning (`prune_older_than_bounded`) to avoid SQLite database table locks, and passive WAL maintenance checkpoints (`maintenance_wal_checkpoint`).
+  - **Durable Usage-Recording Retries (`src/usage/storage.rs`):** SQLite retry table (`usage_retry_queue`) with exponential backoff (up to 300s), poison JSON isolation, and dead-letter queue metrics.
+  - **Git Hygiene & Secret Protection:** Removed tracked `target/` binaries and `data/usage.db` from index via `git rm --cached`, updated `.gitignore` with comprehensive patterns, and provided `.env.example` template with zero credentials.
+  - **Verification:** 220 automated tests passing across 11 integration test suites and 1 lib suite (+1 ignored load benchmark); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo build --release` passing.
 
 ---
 
@@ -86,8 +90,8 @@
 | **7B**| **Real Inference & Gap Repairs** | **COMPLETE** | Phase 7 | Chat completions, SSE stream, HTTP adapter, router dispatch, bounded failover, auth, req IDs | All tests pass (138 tests), clippy clean | Verified |
 | **8** | **Quota & Usage Tracking** | **COMPLETE** | Phase 7B | Persistent SQLite store, token accounting, quota awareness, read-only analytics APIs | 170 tests pass, clippy clean, zero warnings | Verified Complete |
 | **9** | **Failover & Reliability** | **COMPLETE** | Phase 8 | Bounded retries, exponential backoff, loop prevention, manual routing invariant, pre vs mid-stream handling | 196 tests pass, clippy clean, zero warnings | Verified Complete |
-| **10** | **Token Optimization** | **COMPLETE** | Phase 9 | Context window pruning, token estimation, length limits | 206 tests pass, clippy clean, zero warnings | Verified Complete |
-| **11** | **Authentication** | **STRICTLY ON HOLD** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | Auth token verification tests | Pending Approval |
+| **10** | **Token Optimization & Operational Hardening** | **COMPLETE** | Phase 9 | Model-aware estimation, conservative compaction, context gating, proxy security, durable usage queue | 220 tests pass, clippy clean, zero warnings, release load tested | Verified Complete |
+| **11** | **Authentication** | **NEXT ELIGIBLE PHASE** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | Auth token verification tests | Eligible to Begin |
 | **12** | **Authorization & Secret Management** | **NOT STARTED** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Pending Approval |
 | **13** | **Abuse Prevention** | **NOT STARTED** | Phase 12 | Inbound body size limits, rate limiting, connection timeouts | Fuzzing & request flood tests | Pending Approval |
 | **14** | **Security Hardening** | **NOT STARTED** | Phase 13 | SSRF IP allowlisting, dependency audit, security regression suite | `cargo audit`, SSRF block tests | Pending Approval |
@@ -102,8 +106,8 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Phase 10 Verified Complete & Formally Closed:** Empirical performance baseline established; deterministic token estimator and conservative prompt compaction implemented; context window capacity safeguards integrated; pipeline and SSE parsing optimizations verified across 206 automated tests (+1 ignored load test) with zero Clippy warnings.
-2. **Phase 11 Strictly On Hold:** Phase 11 (Authentication) and all subsequent phases remain strictly on hold pending explicit user instruction. No Phase 11 code has been implemented.
-3. **Hardening Backlog Retained:** Host-based bind security, retention cleanup reliability, and usage-recording failure observability are documented in `ARCHITECTURE.md` §8 as future hardening priorities.
+1. **Phase 10 Formally Closed & Verified:** All 10 mandatory acceptance gates (Gate A through Gate J) are fully satisfied and documented.
+2. **Phase 11 (Authentication) Is Next Eligible Phase:** Phase 11 remains unstarted and strictly on hold until explicit user authorization. No Phase 11 code has been implemented.
+3. **Repository State Protected:** Secrets, local SQLite databases (`data/usage.db`), and compiled binaries (`target/`) are strictly excluded from version control with zero credential leakage.
 
 

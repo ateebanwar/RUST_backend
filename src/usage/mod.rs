@@ -9,7 +9,8 @@ pub mod storage;
 
 pub use model::{
     ModelUsageSummary, ProviderUsageSummary, RecordStatus, RequestMode, RequestOutcome,
-    RoutingMode, UsageQueryFilter, UsageRecord, UsageSource, UsageSummary,
+    RetryDrainResult, RetryQueueMetrics, RoutingMode, UsageQueryFilter, UsageRecord, UsageSource,
+    UsageSummary,
 };
 pub use service::UsageService;
 pub use storage::{StorageError, UsageStorage};

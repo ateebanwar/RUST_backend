@@ -112,10 +112,33 @@ In `src/inference/tokens.rs` and `src/inference/mod.rs`:
 - Exterior message whitespace is trimmed while preserving internal code indentation and markdown formatting.
 - `TokenCompactionMetrics` tracks `original_estimated_tokens`, `optimized_estimated_tokens`, `tokens_saved`, and `duplicate_system_messages_removed`.
 
-### 3.5 Zero-Allocation SSE Line Slice Parsing
+### 3.5 Byte-Buffer Chunking in SSE Line Parsing
 In `src/providers/openai_compatible.rs::parse_sse_stream`:
-- Replaced `let line: String = buffer.drain(..=pos).collect();` with slice-based parsing `&buffer[..pos]`.
-- JSON payloads are parsed directly from string slices without intermediate heap allocations. Buffer draining occurs only after payload extraction, drastically reducing memory churn during high-concurrency streaming.
+- Replaced string-based slicing with raw byte-level `Vec<u8>` stream processing, splitting on `b'\n'` and stripping `b'\r'`.
+- Guaranteed that multi-byte UTF-8 characters split across TCP chunk boundaries are never truncated or corrupted, with clean EOF handling for trailing payloads and `[DONE]` markers.
+
+### 3.6 Model-Aware Tokenizer Family & Collision-Safe Caching
+In `src/inference/tokens.rs`:
+- Added `TokenizerFamily` enum (`Llama`, `Mistral`, `Gemma`, `Qwen`, `DeepSeek`, `Gpt`, `Generic`) with model ID pattern matching.
+- Replaced 64-bit hash LRU with structured `CacheKey { text: String, family: TokenizerFamily }`, completely preventing false cache collisions across differing tokenizers.
+
+### 3.7 Strict Semantic-Preserving Prompt Compaction
+In `src/inference/tokens.rs`:
+- Implemented conservative whitespace normalization that strictly preserves leading Python code indentation, Markdown code fences (` ``` `, `~~~`), YAML/JSON blocks, shell commands, and SQL queries.
+- Added granular metrics to `TokenCompactionMetrics`: `original_characters`, `compacted_characters`, `bytes_saved`, `compaction_applied`, and `compaction_skipped_reason`.
+
+### 3.8 Network Security & Reverse-Proxy Subsystem
+In `src/security/mod.rs` & `src/lib.rs`:
+- Bitmask `IpCidr` parsing for IPv4 & IPv6 with shift-overflow protection for prefix 0.
+- `TrustedProxyMatcher` allowlisting proxy CIDRs.
+- `HostValidator` defending against HTTP Host-header poisoning.
+- Reverse-proxy middleware automatically stripping spoofed `X-Forwarded-*` / `Forwarded` headers from untrusted network peers.
+
+### 3.9 Durable Retention Pruning & Usage-Recording Retry Queue
+In `src/usage/storage.rs` & `src/usage/service.rs`:
+- Bounded batch retention pruning (`prune_older_than_bounded`) avoiding SQLite database table locks.
+- Passive WAL maintenance checkpoints (`maintenance_wal_checkpoint`).
+- Persistent retry queue (`usage_retry_queue`) with exponential backoff (up to 300s), poison message isolation, and dead-letter queue metrics.
 
 ---
 
@@ -123,7 +146,7 @@ In `src/providers/openai_compatible.rs::parse_sse_stream`:
 
 | Suite Name | Test File | Test Count | Status | Description |
 | :--- | :--- | :---: | :---: | :--- |
-| **Token Optimization** | `tests/token_optimization_test.rs` | 10 | **PASS** | BPE estimation, ChatML framing, compaction, cache, context window, e2e buffered/SSE |
+| **Token Optimization & Hardening** | `tests/token_optimization_test.rs` | 17 | **PASS** | BPE estimation, families, compaction, cache, context window, CIDR, Host, retry queue, e2e buffered/SSE |
 | **Chat Inference** | `tests/chat_inference_test.rs` | 11 | **PASS** | Completion, streaming, failover, auth, error taxonomy, security |
 | **Failover & Reliability** | `tests/failover_reliability_test.rs` | 19 | **PASS** | Bounded retries, jitter, Retry-After, loop prevention |
 | **Usage Tracking** | `tests/usage_tracking_test.rs` | 25 | **PASS** | SQLite persistence, token accounting, quota awareness |
@@ -133,6 +156,12 @@ In `src/providers/openai_compatible.rs::parse_sse_stream`:
 | **Readiness Regression** | `tests/readiness_regression_test.rs` | 7 | **PASS** | Lifecycle transitions, discovery, liveness independence |
 | **Health & Readiness** | `tests/health_test.rs` | 9 | **PASS** | Liveness, readiness, routing preview |
 | **Adapter Contracts** | `tests/adapter_contracts.rs` | 16 | **PASS** | Provider adapter contracts, mock provider behavior |
-| **Unit Tests** | `src/lib.rs` (inline modules) | 62 | **PASS** | Config, errors, tokens, router, registry, providers |
+| **Unit Tests** | `src/lib.rs` (inline modules) | 66 | **PASS** | Config, errors, tokens, router, registry, providers, security |
 | **Load Benchmark** | `tests/load_benchmark.rs` | 1 | **PASS** | Controlled 4-tier load test across 4 endpoints (270 requests) |
-| **Total Automated Tests** | - | **206** | **PASS** | 206 passing tests, 0 failed, 1 ignored load harness |
+| **Total Automated Tests** | - | **220** | **PASS** | 220 passing tests, 0 failed, 1 ignored load harness |
+
+---
+
+## 5. Phase 10 Closure & Gate Review
+
+All 10 Phase 10 Acceptance Gates (Gates A through J) are fully verified and satisfied. Phase 11 (Authentication) is formally eligible as the next phase upon explicit user authorization.

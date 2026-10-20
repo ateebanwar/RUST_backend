@@ -486,12 +486,13 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
 }
 
 /// Helper function to parse raw byte stream into SSE StreamChunks using `futures_util::stream::unfold`.
+/// Uses a raw byte buffer to guarantee safe UTF-8 decoding across arbitrary chunk boundaries and CRLF.
 fn parse_sse_stream<S>(byte_stream: S) -> ProviderStream
 where
     S: Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
     let stream = futures_util::stream::unfold(
-        (byte_stream, String::new(), false),
+        (byte_stream, Vec::<u8>::new(), false),
         |(mut bytes_stream, mut buffer, mut terminated)| async move {
             if terminated {
                 return None;
@@ -499,9 +500,21 @@ where
 
             loop {
                 // Check if buffer contains a complete newline
-                if let Some(pos) = buffer.find('\n') {
-                    let line_slice = &buffer[..pos];
-                    let trimmed = line_slice.trim();
+                if let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                    let mut line_bytes = &buffer[..pos];
+                    if line_bytes.ends_with(b"\r") {
+                        line_bytes = &line_bytes[..line_bytes.len() - 1];
+                    }
+
+                    let line_str = match std::str::from_utf8(line_bytes) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            buffer.drain(..=pos);
+                            continue;
+                        }
+                    };
+
+                    let trimmed = line_str.trim();
                     if trimmed.is_empty() || trimmed.starts_with(':') {
                         buffer.drain(..=pos);
                         continue;
@@ -562,9 +575,7 @@ where
                 // Buffer does not have a newline; read more bytes from upstream
                 match bytes_stream.next().await {
                     Some(Ok(bytes)) => {
-                        if let Ok(text) = std::str::from_utf8(&bytes) {
-                            buffer.push_str(text);
-                        }
+                        buffer.extend_from_slice(&bytes);
                     }
                     Some(Err(_)) => {
                         terminated = true;
@@ -577,7 +588,60 @@ where
                         ));
                     }
                     None => {
-                        // End of stream from upstream
+                        // End of stream from upstream: check for any trailing line without newline
+                        if !buffer.is_empty() {
+                            let mut line_bytes = buffer.as_slice();
+                            if line_bytes.ends_with(b"\r") {
+                                line_bytes = &line_bytes[..line_bytes.len() - 1];
+                            }
+                            if let Ok(line_str) = std::str::from_utf8(line_bytes) {
+                                let trimmed = line_str.trim();
+                                if let Some(data_str) = trimmed.strip_prefix("data:") {
+                                    let payload = data_str.trim();
+                                    if payload == "[DONE]" {
+                                        buffer.clear();
+                                        terminated = true;
+                                        return Some((
+                                            Ok(StreamChunk {
+                                                delta: String::new(),
+                                                is_done: true,
+                                                usage: None,
+                                            }),
+                                            (bytes_stream, buffer, terminated),
+                                        ));
+                                    }
+
+                                    if let Ok(chunk_resp) =
+                                        serde_json::from_str::<OpenAiChatResponse>(payload)
+                                    {
+                                        let delta_content = chunk_resp
+                                            .choices
+                                            .first()
+                                            .and_then(|c| c.delta.as_ref())
+                                            .and_then(|d| d.content.as_deref())
+                                            .unwrap_or("");
+                                        let usage = chunk_resp.usage.map(|u| UsageMetadata {
+                                            prompt_tokens: u.prompt_tokens,
+                                            completion_tokens: u.completion_tokens,
+                                            total_tokens: u.total_tokens,
+                                            is_estimated: false,
+                                        });
+                                        if !delta_content.is_empty() || usage.is_some() {
+                                            buffer.clear();
+                                            return Some((
+                                                Ok(StreamChunk {
+                                                    delta: delta_content.to_string(),
+                                                    is_done: false,
+                                                    usage,
+                                                }),
+                                                (bytes_stream, buffer, terminated),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         terminated = true;
                         return Some((
                             Ok(StreamChunk {

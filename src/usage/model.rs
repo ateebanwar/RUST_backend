@@ -252,3 +252,18 @@ pub struct ModelUsageSummary {
     pub total_tokens: u64,
     pub avg_latency_ms: f64,
 }
+
+/// Operational metrics for the durable usage retry queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryQueueMetrics {
+    pub pending_count: usize,
+    pub dead_letter_count: usize,
+}
+
+/// Outcome of a retry queue drain execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryDrainResult {
+    pub succeeded: usize,
+    pub retried: usize,
+    pub dead_lettered: usize,
+}

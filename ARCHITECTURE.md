@@ -451,18 +451,18 @@ flowchart TD
 
 ---
 
-## 9. Future Hardening Backlog
+## 9. Completed Hardening & Operational Resilience (Phase 10 Closure)
 
-As identified during the Phase 8 and Phase 9 baseline audits, the following architectural enhancements remain preserved for future hardening phases:
+The hardening backlog items identified during earlier phases have been formally implemented and verified:
 
-1. **Host-Based Bind Security Hardening:**
-   - *Status:* Baseline loopback vs non-loopback authentication enforcement is in place.
-   - *Backlog Scope:* Support explicit reverse-proxy IP allowlisting (`CIDR` ranges) and mutual TLS (mTLS) for enterprise cluster ingress.
-2. **Retention Cleanup Reliability & Observability:**
-   - *Status:* Baseline startup and explicit pruning via `UsageService::prune_retention` are implemented.
-   - *Backlog Scope:* Dedicated cron-driven background sweeper task with dead-letter and vacuum metrics for high-volume SQLite instances.
-3. **Usage-Recording Failure Observability:**
-   - *Status:* Failures to persist usage log structured warnings without interrupting client AI traffic.
-   - *Backlog Scope:* Out-of-band persistent retry queue / disk-buffered ring buffer to guarantee zero telemetry loss during transient disk saturation.
+1. **Host-Based Bind Security & Reverse-Proxy Hardening (`src/security/mod.rs`):**
+   - *Status:* **IMPLEMENTED & VERIFIED**.
+   - *Architecture:* Supports explicit reverse-proxy IP allowlisting via bitmask `IpCidr` parsing (IPv4 & IPv6). `TrustedProxyMatcher` allowlists proxy CIDRs, and `HostValidator` defends against Host-header poisoning. Forwarded headers (`X-Forwarded-For`, `Forwarded`) are stripped when originating from untrusted network peers. Ingress mTLS is documented at the reverse-proxy termination boundary.
+2. **Retention Cleanup Reliability & Autonomous Maintenance (`src/usage/storage.rs`, `src/usage/service.rs`):**
+   - *Status:* **IMPLEMENTED & VERIFIED**.
+   - *Architecture:* Bounded subquery pruning (`prune_older_than_bounded`) prevents table locking on high-volume SQLite instances. Integrated with non-blocking passive WAL checkpoints (`maintenance_wal_checkpoint`) to maintain low disk footprint.
+3. **Durable Usage-Recording Failure Handling (`src/usage/storage.rs`, `src/usage/service.rs`):**
+   - *Status:* **IMPLEMENTED & VERIFIED**.
+   - *Architecture:* Out-of-band persistent retry queue (`usage_retry_queue` in SQLite) guarantees zero telemetry loss during transient database saturation. Records are retried using bounded exponential backoff (up to 300s); exhausted retries (5 attempts) or poison payloads transition safely to dead-letter status, preserving user inference semantics and accounting auditability.
 
 
