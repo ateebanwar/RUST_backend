@@ -1,0 +1,76 @@
+# PROGRESS.md — Project Roadmap & Implementation Tracker
+
+**Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
+**Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
+**Current Phase:** Phase 7 Complete | Phase 8 Ready for Review & Authorization  
+**Last Updated:** 2026-10-19
+
+---
+
+## 1. Executive Status Summary
+
+- [x] **Project Scaffold Creation:** Cargo package `ai-backend` initialized locally with `src/main.rs`, `src/lib.rs`, `tests/`, and dependencies.
+- [x] **Toolchain & Validation:** Verified with `rustc 1.99.1`, `cargo check` (clean), `cargo test` (121 tests pass), and `cargo clippy` (0 warnings).
+- [x] **Documentation Scaffold:** All 12 required Markdown documents created at the project root.
+- [x] **Comprehensive Documentation Audit:** Full cross-document gap analysis and contradiction audit completed.
+- [x] **Documentation Synchronization:** All 12 Markdown files populated with actionable, reconciled specifications:
+  - Multi-client architecture established (Flutter, Custom IDE, Editor extensions).
+  - Vercel Serverless vs. Daemon hosting reconciled with dual-target architecture.
+  - Full API contracts, threat model, provider adapter trait, security baseline, and ADRs completed.
+- [x] **Phase 1 Execution & Sign-off:** Requirements clarification, trust boundaries, assets, STRIDE threat model, and nonfunctional requirements finalized and verified.
+- [x] **Phase 2 Execution & Sign-off:** Architecture component boundaries, 16-module DAG interface contracts, concrete API schemas, SSE wire framing, and canonical error envelope finalized and verified.
+- [x] **Phase 3 Execution & Sign-off:** Rust Core Foundation implemented: Axum HTTP router, Tokio async runtime, typed configuration loading and validation, centralized error taxonomy, structured tracing, and health & readiness endpoints verified.
+- [x] **Phase 4 Execution & Sign-off:** Provider Adapter Framework implemented: asynchronous `ProviderAdapter` trait with completion, streaming (`BoxStream`), discovery, health checks, and capability checking; `ProviderRegistry` lifecycle manager with concurrency safety, status tracking, and model synchronization; deterministic `MockProviderAdapter` with error, delay, and streaming simulation; normalized `ProviderError` mapped to `AppError` with secret isolation; automated tests passing and live HTTP endpoints verified.
+- [x] **Phase 5 Execution & Verification:** Central Model Registry & Readiness Contract verified and approved by user: authoritative thread-safe `ModelRegistry` catalog; strict metadata validation; duplicate registration rejection; multi-dimensional query filtering; availability state tracking; readiness probe contract audited and corrected per `API_SPEC.md` §2.2 and `DEC-009`; 88 automated tests passing across 5 test suites; and live HTTP verification on ephemeral port.
+- [x] **Phase 6 Execution, Gap Verification & Closure:** Task Classification Engine implemented and verified: deterministic, bounded, zero-network `TaskClassifier`; all 15 normalized categories per `MASTER_SPEC.md` §6.2; 3 complexity tiers (`Low`, `Medium`, `High`) per §6.3; Roman Hindi and Hinglish SOV syntax support across all task categories; typed `ClassificationResult` with explainable metadata; character-based size enforcement (1 to 100,000 chars); multilingual and Unicode support; empirical benchmark (10,000 samples, ~30 µs p50 latency, ~31,000 ops/sec throughput); strict error envelope consistency; 104 automated tests passing across 6 suites; live HTTP verification on port - [x] **Phase 7 Execution & Verification:** Intelligent Model Router implemented and verified: multi-criteria candidate scoring policy engine in `src/router/policy.rs` (`RoutingPolicy`, `ScoredCandidate`); capability match (0–50 pts), complexity alignment (0–30 pts), speed tier (0–15 pts), cost tier (0–15 pts), capacity (0–10 pts); deterministic tie-breaking (cost, speed, context, alphabetical model ID); automatic vs. manual routing; transparent explainable reasons; hard modality filtering with semantic code compatibility; safe fallback candidate ordering; proper handling of missing, unavailable, and unsupported modality requests; 121 automated tests passing across 7 suites; live HTTP verification on port 8899.
+- [x] **Phase 7B — Consolidated Audit Gap Repairs & Real Inference Implementation:**
+  - **GAP-001 (Chat Completion & Streaming Endpoints):** Implemented `POST /api/v1/chat/completions` and `POST /api/v1/chat/stream` with SSE framing, validation, and error normalization.
+  - **GAP-002 (Real HTTP Provider Adapter):** Implemented `OpenAiCompatibleAdapter` using `reqwest` with rustls, bearer auth, wire mapping, and SSE line-by-line chunk unfolding.
+  - **GAP-003 (Router-to-Provider Execution):** Implemented `InferenceService` connecting router selection to provider adapter lookup.
+  - **GAP-004 (Phase Ownership & Execution Boundary):** Reconciled roadmap and phase ownership for real inference implementation.
+  - **GAP-005 (Bounded Failover Policy Engine):** Implemented failover ceiling (max 3 candidate attempts), short-circuiting on non-retryable errors (400, 422).
+  - **GAP-006 (Request ID Propagation):** Implemented `request_id_and_auth_middleware` preserving client `x-request-id` or generating unique IDs, returned in headers and error envelopes.
+  - **GAP-007 (API Key Authentication):** Implemented constant-time authentication for protected endpoints with public probe bypass.
+  - **GAP-008 (Integration Test Coverage):** Added 11 tests in `tests/chat_inference_test.rs` covering completion, SSE streaming, failover, auth, error taxonomy, and security.
+  - **GAP-009 (Provider Catalog Status Derivation):** Marked catalog providers `status: "offline", enabled: false` when 0 adapters are active.
+  - **GAP-010 (Provider Base URL Omission & Secret Redaction):** Hidden `base_url` from public provider JSON and redacted secrets in debug logs.
+  - **GAP-011 (Scoring Documentation & Weights Reconciliation):** Formally reconciled scoring weights in `ARCHITECTURE.md` §2.1 and added mathematical regression tests proving bounded score and overflow-free arithmetic.
+  - **Verification:** 144 automated tests passing across 8 test suites; zero Clippy warnings; `cargo fmt` clean.
+
+---
+
+## 2. 20-Phase Implementation Roadmap Tracker
+
+| Phase | Phase Name | Status | Prerequisites | Deliverables | Verification Gates | Approval Status |
+|---|---|---|---|---|---|---|
+| **0** | **Project Scaffolding & Documentation** | **COMPLETE** | None | Valid Cargo project, 12 synchronized docs, zero git repo | `cargo check`, `cargo test` pass | Approved |
+| **1** | **Requirements & Threat Model** | **COMPLETE** | Phase 0 | Reconciled multi-client specs, finalized STRIDE threat matrix, NFR baseline | Threat model review & sign-off complete | Approved |
+| **2** | **Architecture & API Contracts** | **COMPLETE** | Phase 1 | Finalized JSON schemas, SSE protocol, module boundaries | API schema validation & contract checks pass | Approved |
+| **3** | **Rust Core Foundation** | **COMPLETE** | Phase 2 | Axum router, Tokio async runtime, typed errors, config validation, tracing | All tests pass, GET /api/v1/health 200 OK | Approved |
+| **4** | **Provider Adapter Framework** | **COMPLETE** | Phase 3 | `ProviderAdapter` async trait, `ProviderRegistry`, `ProviderError`, `MockProviderAdapter` | All tests pass (64 tests), contract tests pass | Approved |
+| **5** | **Central Model Registry** | **COMPLETE** | Phase 4 | Thread-safe model catalog, query filters, metadata validation, availability tracking | All tests pass (88 tests), live HTTP verification | Approved by User |
+| **6** | **Task Classification** | **COMPLETE** | Phase 5 | Deterministic `TaskClassifier` across all 15 categories, 3 complexity tiers, Roman Hindi/Hinglish | All tests pass (104 tests), live HTTP verification | Approved by User |
+| **7** | **Intelligent Model Router** | **COMPLETE** | Phase 6 | Multi-criteria scoring policy engine, auto/manual routing, fallback ordering | All tests pass (121 tests), live HTTP verification | Approved by User |
+| **7B**| **Real Inference & Gap Repairs** | **COMPLETE** | Phase 7 | Chat completions, SSE stream, HTTP adapter, router dispatch, bounded failover, auth, req IDs | All tests pass (132 tests), clippy clean | Verified |
+| **8** | **Quota & Usage Tracking** | **STRICTLY ON HOLD** | Phase 7B | Multi-tier usage counters (reported vs measured vs estimated) | Awaiting authorization | ON HOLD |
+| **9** | **Failover & Reliability** | **NOT STARTED** | Phase 8 | Bounded retries, exponential backoff, circuit breakers | Simulated provider outage tests | Pending Approval |
+| **10** | **Token Optimization** | **NOT STARTED** | Phase 9 | Context window pruning, token estimation, length limits | Token usage benchmark tests | Pending Approval |
+| **11** | **Authentication** | **NOT STARTED** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | Auth token verification tests | Pending Approval |
+| **12** | **Authorization & Secret Management** | **NOT STARTED** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Pending Approval |
+| **13** | **Abuse Prevention** | **NOT STARTED** | Phase 12 | Inbound body size limits, rate limiting, connection timeouts | Fuzzing & request flood tests | Pending Approval |
+| **14** | **Security Hardening** | **NOT STARTED** | Phase 13 | SSRF IP allowlisting, dependency audit, security regression suite | `cargo audit`, SSRF block tests | Pending Approval |
+| **15** | **Google Drive Integration** | **NOT STARTED** | Phase 14 | OAuth token exchange, `drive.appdata` scope client, Drive I/O | Mock Google Drive API tests | Pending Approval |
+| **16** | **Chat History & Synchronization** | **NOT STARTED** | Phase 15 | Canonical chat schemas, LWW conflict resolution, pagination | Multi-device sync conflict tests | Pending Approval |
+| **17** | **Observability & Diagnostics** | **NOT STARTED** | Phase 16 | Structured JSON tracing, sanitized logging, readiness probes | Log redaction verification | Pending Approval |
+| **18** | **Comprehensive Automated Testing** | **NOT STARTED** | Phase 17 | End-to-end integration test harness, provider mock suites | Full test suite passes 100% | Pending Approval |
+| **19** | **Performance & Security Validation** | **NOT STARTED** | Phase 18 | Microbenchmarks, p95 latency verification, penetration tests | Latency & resource benchmarks | Pending Approval |
+| **20** | **Production Deployment & Readiness** | **NOT STARTED** | Phase 19 | Dual-target serverless build, Vercel deployment, smoke tests | Production health verification | Pending Approval |
+
+---
+
+## 3. Immediate Next Steps & Phase Boundaries
+
+1. **Phase 7B Verified Complete:** End-to-end chat completion and SSE streaming endpoints, concrete OpenAI-compatible HTTP adapter, router-to-provider execution, bounded failover (max 3 attempts), request ID propagation, constant-time API authentication, provider URL redaction, and catalog readiness consistency verified across 132 tests with zero Clippy warnings.
+2. **Phase 8 Remains STRICTLY ON HOLD:** Per governing instructions, Phase 8 (Usage and Quota Tracking) is NOT started and remains on hold until formal user authorization.
+3. **Phase Boundary Enforcement:** No full quota tracking, rate limit resets, or token accounting databases implemented. Only minimum usage metadata required by the inference contract is returned.
+

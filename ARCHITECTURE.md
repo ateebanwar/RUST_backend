@@ -1,0 +1,246 @@
+# ARCHITECTURE.md — System Architecture & Component Specification
+
+**Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
+**Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
+**Status:** Finalized Phase 2 Architecture & Module Interface Contract  
+**Last Updated:** 2026-10-19
+
+---
+
+## 1. Architectural Mission & Principles
+
+The `ai-backend` platform is a lightweight, asynchronous, security-first Rust service designed to decouple AI client applications from diverse, independent AI providers and APIs.
+
+```mermaid
+graph TD
+    subgraph Client Layer
+        Mobile[Flutter Android App]
+        IDE[Custom AI IDE]
+        Ext[VS Code / Editor Extensions]
+        APIClient[Authorized API Consumers]
+    end
+
+    subgraph API Gateway & Security Boundary
+        GW[Axum HTTP Router & Tower Middleware]
+        Auth[Auth & Token Validator]
+        Limit[Rate Limiter & Request Guard]
+    end
+
+    subgraph Core Routing Engine
+        Classifier[Task & Complexity Classifier]
+        Router[Intelligent Model Router]
+        Registry[Central Model Registry]
+        Resilience[Failover & Circuit Breaker]
+    end
+
+    subgraph Provider Subsystem
+        AdapterMgr[Provider Adapter Manager]
+        AdapterA[Provider Adapter: OpenAI-compatible]
+        AdapterB[Provider Adapter: Anthropic-compatible]
+        AdapterC[Provider Adapter: Local / OSS / Repo]
+    end
+
+    subgraph Persistence & History
+        DriveSync[Google Drive Sync Service]
+    end
+
+    subgraph External Dependencies
+        GoogleDrive[(User Google Drive / appDataFolder)]
+        UpstreamA[Upstream AI Provider A]
+        UpstreamB[Upstream AI Provider B]
+    end
+
+    Mobile -->|Bearer Google ID Token| GW
+    IDE -->|X-API-Key / PAT| GW
+    Ext -->|X-API-Key / PAT| GW
+    APIClient -->|X-API-Key| GW
+
+    GW --> Auth
+    Auth --> Limit
+    Limit --> Classifier
+    Classifier --> Router
+    Router --> Registry
+    Router --> Resilience
+    Resilience --> AdapterMgr
+    AdapterMgr --> AdapterA
+    AdapterMgr --> AdapterB
+    AdapterMgr --> AdapterC
+
+    AdapterA --> UpstreamA
+    AdapterB --> UpstreamB
+
+    GW --> DriveSync
+    DriveSync --> GoogleDrive
+```
+
+### Core Architectural Principles
+1. **Multi-Client Agnosticism:** Core business logic, routing, and provider adapters are strictly frontend-independent.
+2. **Stateless Core / Zero-Database Constraint:** No permanent server-side database is required. Chat history is stored in user-controlled Google Drive, and usage tracking operates gracefully in ephemeral serverless runtimes.
+3. **Dual-Target Portability:** Core routing compiles cleanly as both a long-running Axum HTTP daemon (local development, Docker) and an AWS Lambda / Vercel Serverless Function (via `lambda_http`).
+4. **Strict Isolation & Fault Containment:** A failure, timeout, or rate-limit event in one AI provider never crashes the backend or impairs unrelated integrations.
+5. **Zero-Trust Security:** Client assertions are never trusted; provider secrets are never leaked; all input payloads are bounded and validated.
+
+---
+
+## 2. Comprehensive Module Boundaries & Interface Contracts
+
+The backend is decomposed into 16 cohesive, loosely coupled logical modules. Inter-module dependencies strictly adhere to a **Directed Acyclic Graph (DAG)** to eliminate circular references.
+
+```mermaid
+graph TD
+    api[api: HTTP Routes & Handlers] --> auth[auth: Token Validation]
+    api --> security[security: SSRF & Request Limits]
+    api --> router[router: Task & Model Routing]
+    api --> drive[drive: Google Drive Sync]
+    api --> usage[usage: Token Accounting]
+    api --> registry[registry: Model Catalog]
+
+    router --> registry
+    router --> models[models: Core Types]
+    router --> failover[failover: Resilience & Retries]
+    
+    failover --> providers[providers: Registry & Lifecycle]
+    providers --> adapters[adapters: Provider Trait Impls]
+    adapters --> security
+    adapters --> models
+    adapters --> errors[errors: Error Taxonomy]
+
+    drive --> auth
+    drive --> security
+    drive --> chat[chat: Conversation Models]
+
+    api --> observability[observability: Tracing & Metrics]
+    api --> config[config: Typed Environment Config]
+    api --> errors
+```
+
+### Detailed Module Contract Matrix
+
+| Module | Core Responsibility | Primary Inputs | Primary Outputs | Associated Error Types | Allowed Direct Dependencies | Security Boundary |
+|---|---|---|---|---|---|---|
+| **`api`** | Axum HTTP routing, request parsing, response formatting, SSE streams. | Axum `Request<Body>` | HTTP `Response<Body>`, SSE stream | Maps all domain errors to HTTP JSON envelope. | `auth`, `router`, `registry`, `drive`, `usage`, `config`, `security`, `errors` | **Boundary 1:** Untrusted public ingress. Enforces 4.5 MB body limit. |
+| **`auth`** | Token verification (Google OIDC JWKS, PAT constant-time hash check). | `Authorization` header, `X-API-Key` | `UserContext` (User ID, ClientType, Scopes) | `AuthError::InvalidToken`, `AuthError::ExpiredToken`, `AuthError::MissingHeader` | `config`, `security`, `errors` | Cryptographic verification of client identity. Zero trust for client claims. |
+| **`config`** | Startup configuration parsing, validation, and secret wrapping. | Environment variables, `.env` file | `AppConfig`, `ProviderConfig` | `ConfigError::MissingKey`, `ConfigError::InvalidFormat` | `security`, `errors` | Encapsulates API keys in `SecretString` to prevent memory/log leaks. |
+| **`security`** | SSRF prevention, outbound URL validation, request body limits, CORS. | Outbound URLs, IP addresses | Validated `Url`, sanitized strings | `SecurityError::SsrfBlocked`, `SecurityError::PayloadTooLarge` | `errors` | **Boundary 2 & 4:** Blocks loopback, RFC 1918, link-local metadata. Redacts secrets. |
+| **`providers`** | Provider lifecycle, health check execution, adapter catalog. | Provider ID, configuration | `Arc<dyn ProviderAdapter>` | `ProviderError::NotFound`, `ProviderError::Disabled` | `adapters`, `models`, `errors` | Isolates provider instances; failure of one does not crash others. |
+| **`adapters`** | Vendor API payload translation, HTTP calls, response/chunk normalization. | `CompletionRequest`, upstream SSE | `CompletionResponse`, `StreamChunk` | `ProviderError::RateLimited`, `ProviderError::Timeout`, `ProviderError::UpstreamError` | `models`, `security`, `errors` | **Boundary 2:** Outbound HTTPS calls with provider API keys. Strict 10s timeout. |
+| **`models`** | Canonical domain types for models, capabilities, modalities, usage. | Raw config definitions | `ModelMetadata`, `ProviderMetadata` | None (pure domain data structures) | None (Leaf module) | Shared immutable type definitions. |
+| **`registry`** | In-memory model catalog, capability filtering, availability tracking. | Filter criteria (modality, tier) | `Vec<ModelMetadata>`, `ModelMetadata` | `RegistryError::ModelNotFound` | `models`, `errors` | Thread-safe read-heavy catalog without unvetted dynamic code loading. |
+| **`router`** | Heuristic task categorization, complexity scoring, model selection. | User prompt text, requested modality | `RoutingDecision`, `ModelCandidate` | `RouterError::NoCompatibleModel` | `registry`, `models`, `failover`, `errors` | Ensures requests route strictly to models matching verified capabilities. |
+| **`quota`** | Quota header normalization, rate-limit state tracking. | Upstream HTTP headers | `QuotaStatus`, `RateLimitInfo` | None | `models`, `errors` | Never fabricates quotas; distinguishes reported from estimated values. |
+| **`usage`** | Token consumption accounting, request counters, local usage caching. | `NormalizedUsage`, provider ID | `UsageSummary`, aggregated metrics | None | `models`, `errors` | Ephemeral in-memory accounting; client-reflected stats for persistence. |
+| **`failover`** | Circuit breaker state machine, exponential backoff, fallback execution. | Failed model, candidate list | Fallback `ModelCandidate`, retry decision | `FailoverError::AllCandidatesFailed` | `providers`, `models`, `errors` | Prevents retry storms and duplicate charges on non-idempotent operations. |
+| **`chat`** | Conversation and message data structures, context window pruning. | `Vec<CanonicalMessage>`, context limit | Truncated `Vec<CanonicalMessage>` | `ChatError::ContextExceeded` | `models`, `errors` | Protects privacy; sends only context necessary for active task. |
+| **`drive`** | Google Drive REST client (`drive.appdata`), file sync, LWW conflict resolver. | `X-Drive-Token`, chat payload | Synchronized chat envelope, conflict log | `DriveError::Unauthorized`, `DriveError::RemoteFailure` | `auth`, `chat`, `security`, `errors` | **Boundary 3:** Restricted strictly to private `drive.appdata` scope. |
+| **`observability`**| Structured tracing setup, correlation IDs, sanitized log layer. | Tracing events, span context | Formatted JSON logs, metrics | None | `errors` | Redacts auth headers, query tokens, and prompt text at INFO/WARN. |
+| **`errors`** | Centralized application error taxonomy and HTTP status conversion. | Internal domain error variants | `AppError`, API JSON error envelope | None (Root error module) | None (Leaf module) | Strips internal stack traces and secrets before returning errors to clients. |
+
+---
+
+### 2.1 Intelligent Router Scoring Policy & Multi-Criteria Weights
+
+The model selection policy (`src/router/policy.rs`) evaluates candidate models through a multi-stage scoring algorithm. Arithmetic uses signed 32-bit integers (`i32`) to guarantee determinism and eliminate arithmetic overflow.
+
+#### A. Hard Prerequisites (Eligibility Gate)
+1. **Modality Filtering:** Candidates must declare support for the requested `TaskModality` (e.g. `text`, `code`, `image`, `document`). Incompatible models receive zero score and are immediately discarded.
+2. **Operational Availability:** Models marked unavailable (`available == false`) in the registry or without active registered adapters are bypassed during execution.
+
+#### B. Multi-Criteria Scoring Formula
+```text
+Total Score = Capability Score (0..50) + Complexity Alignment Score (0..30)
+            + Speed Suitability Score (0..15) + Cost Tier Score (0..15)
+            + Capacity Score (0..10)
+```
+- **Theoretical Maximum Standard Score:** 120 points (up to 125 in edge combinations).
+- **Minimum Positive Score:** 13 points.
+
+#### C. Component Breakdown
+1. **Capability Alignment (0–50 points):**
+   - Matches classified `TaskCategory` against model `capabilities`. Primary category match adds +50 points. Secondary coding/reasoning matches on coding tasks add up to +20 points.
+2. **Complexity Alignment (0–30 points):**
+   - **High Complexity:** `advanced` = +30, `balanced` = +10, `fast` = +5.
+   - **Medium Complexity:** `balanced` = +25, `advanced` = +20, `fast` = +15.
+   - **Low Complexity:** `fast` = +30, `balanced` = +15, others = 0 (penalizes wasteful models on simple queries).
+3. **Speed & Latency Suitability (0–15 points):**
+   - **Low Complexity:** `fast` = +15, `balanced` = +8, others = 0.
+   - **Medium Complexity:** `balanced` = +15, `fast` = +10, others = +10.
+   - **High Complexity:** `advanced` = +15, `balanced` = +8, others = +5.
+   *(Note: Combined on Low Complexity, a `fast` model receives 30 + 15 = 45 points from complexity and speed dimensions).*
+4. **Cost Tier Preference (0–15 points):**
+   - `free-tier` = +15, `low-cost` = +10, `premium` = +2 (protects user quota/tokens per `MASTER_SPEC.md` §2.9).
+5. **Context & Token Capacity (0–10 points):**
+   - For Medium/High complexity tasks, models with context window $\ge 64\text{k}$ receive +5 points; max output tokens $\ge 8\text{k}$ receive +5 points.
+
+#### D. Deterministic Multi-Stage Tie-Breaking
+When candidate total scores are identical, ties are resolved deterministically in order:
+1. Prefer lower `cost_tier` (`free-tier` > `low-cost` > `premium`).
+2. Prefer faster `speed_tier` (`fast` > `balanced` > `advanced`).
+3. Prefer larger `context_window`.
+4. Lexicographical / alphabetical ordering by `model_id`.
+
+---
+
+## 3. Data Flow & Request Lifecycles
+
+### 3.1 Synchronous & Streaming Chat Completion Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Client (Flutter / IDE / Extension)
+    participant GW as Axum Router / Gateway
+    participant Auth as Auth Validator
+    participant Router as Model Router
+    participant Adapter as Provider Adapter
+    participant Upstream as Upstream AI Provider
+
+    Client->>GW: POST /api/v1/chat/stream (Payload + Bearer/PAT)
+    GW->>Auth: Validate Auth Token
+    Auth-->>GW: OK (UserContext)
+    GW->>Router: Classify Task & Select Model
+    Router-->>GW: ModelCandidate (Provider A, Model X)
+    GW->>Adapter: Execute Stream (Timeout: 10s)
+    Adapter->>Upstream: HTTP POST (Vendor Payload + Provider API Key)
+    
+    alt Upstream Responds Successfully
+        Upstream-->>Adapter: SSE Chunks (Vendor format)
+        Adapter-->>GW: Canonical StreamChunk
+        GW-->>Client: SSE Event: data: {"chunk": "..."}
+        Upstream-->>Adapter: Final Chunk [DONE]
+        Adapter-->>GW: StreamComplete (Usage metadata)
+        GW-->>Client: SSE Event: data: {"done": true, "usage": {...}}
+    else Upstream Fails (429 Rate Limit / Timeout)
+        Upstream-->>Adapter: Error 429 / Timeout
+        Adapter-->>GW: ProviderError::RateLimited
+        GW->>Router: Request Fallback Model
+        Router-->>GW: FallbackCandidate (Provider B, Model Y)
+        GW->>Adapter: Execute Fallback Stream
+        Adapter->>Upstream: HTTP POST to Provider B
+        Upstream-->>Client: Normal stream output from Provider B
+    end
+```
+
+---
+
+## 4. State Management: Ephemeral vs. Durable State
+
+Under the **Zero-Cost Infrastructure Constraint**, no dedicated Redis or PostgreSQL cluster is provisioned. State is cleanly categorized:
+
+| State Domain | Storage Tier | Lifetime | Failure / Cold-Start Handling |
+|---|---|---|---|
+| **Chat History & Messages** | User Google Drive (`drive.appdata`) | Indefinite | Restored on demand; persistent across app uninstalls |
+| **Model Registry Metadata** | In-Memory Static + Background Refresh | Lifetime of container / microVM | Re-initialized from config in <1ms on cold start |
+| **Circuit Breaker State** | In-Memory Ephemeral per Instance | Lifetime of microVM instance | Resets on cold start; rapidly re-trips upon encountering upstream 5xx/429 |
+| **Usage Tracking** | In-Memory counters + Client-reflected stats | Ephemeral per instance | Reported in response metadata for client-side local caching |
+| **Active Connections / SSE** | Ephemeral TCP stream | Request lifetime | Strict 10s upstream timeouts prevent hanging microVMs |
+
+---
+
+## 5. Multi-Client Adaptation Matrix
+
+| Client Type | Transport / Protocol | Authentication Method | Context Features Supported |
+|---|---|---|---|
+| **Flutter Android App** | REST + SSE | Google Sign-In (OIDC ID Token) | Chat, Multimodal (Image/Doc), Drive Sync |
+| **Custom AI IDE** | REST + SSE | Personal Access Token / API Key | Multi-file Codebase Context, Inline Diff, Terminal |
+| **VS Code Extension** | REST + SSE | API Key / Local Loopback OAuth | Code Selection Context, Chat Assistant, Refactoring |
+| **CLI / External API** | REST JSON | API Key (`X-API-Key`) | Scripted Execution, Automated Testing |

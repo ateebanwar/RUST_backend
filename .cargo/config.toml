@@ -1,0 +1,6 @@
+# Project-local Cargo configuration for Windows build reliability
+
+[build]
+# Disable incremental compilation in dev/test to avoid .rcgu.o intermediate object
+# file churn that causes Windows Defender (MsMpEng.exe) file-lock contention (os error 32).
+incremental = false
