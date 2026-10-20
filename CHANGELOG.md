@@ -2,6 +2,41 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-21 — End-to-End Model-Aware Tokenization & Context-Window Admission Safety
+
+### Added & Hardened
+- **Native Offline BPE Tokenizer Integration (`tiktoken-rs`):**
+  - Integrated `tiktoken-rs = { version = "0.12", default-features = false }` providing pure Rust, zero-network, offline Byte Pair Encoding for OpenAI models.
+  - Implemented thread-safe, lazily initialized static singletons (`CL100K_BPE` and `O200K_BPE`) via `std::sync::LazyLock<Option<CoreBPE>>`. Tokenizer tables are compiled and loaded exactly once on first access, eliminating per-request loading overhead.
+  - Exact tokenization for GPT-4 (`cl100k_base`) and GPT-4o / o1 / o3 (`o200k_base`), matching official OpenAI reference tokenizers with verified counts (e.g. `fn compute(x: i32) -> i32 { x * 2 + 1 }` = exactly 19 tokens).
+- **Explicit Model Capability Hierarchy (`src/inference/tokens.rs`):**
+  - Added `TokenizerCapability` enum with `Exact`, `Approximate`, and `ProviderReported` tiers.
+  - Model family mapping: `TokenizerFamily::Gpt` operates with `TokenizerCapability::Exact`, reporting `is_exact: true`, `method: EstimationMethod::ExactTokenizer`, and `safety_margin_applied: 0`.
+  - Non-GPT models (`Llama`, `Mistral`, `Gemma`, `Qwen`, `DeepSeek`, `Generic`) operate with `TokenizerCapability::Approximate`, reporting `is_exact: false`, `method: EstimationMethod::CalibratedFamilyHeuristic` or `ConservativeFallback`, and a conservative +15% safety headroom (minimum 8 tokens) in `estimate_request_context_safe`.
+  - Collision-safe LRU caching (`CacheKey { text, family, bpe_variant }`) preventing cross-model or cross-vocabulary cache collisions.
+- **Accurate ChatML Message Framing & Tool Overhead Calculation:**
+  - Implemented exact per-message framing (3 tokens per message for `<|im_start|>{role}\n{content}<|im_end|>\n` + role tokens + content tokens) and 3 tokens assistant primer (`<|im_start|>assistant\n`).
+  - Added `estimate_tools_tokens_for_model` correctly encoding tool JSON schemas with framing overhead.
+- **Strict Context-Window Admission Safety (`src/inference/mod.rs`):**
+  - Prohibited silent clamping of `req.max_tokens`: if requested `max_tokens > model.max_output_tokens`, the request is immediately rejected with HTTP 400 `InvalidRequest`.
+  - Enforced overflow-safe checked arithmetic (`estimated_prompt_tokens.checked_add(completion_allowance)`) preventing integer overflow.
+  - Rejection before provider dispatch: if `prompt + completion_allowance > model.context_window`, returns detailed rejection error.
+  - Model-aware candidate filtering in automatic routing: evaluates candidate models against their specific output limit and model-aware context requirement, rather than using a single generic estimate.
+  - Replaced un-modeled prompt optimization in `execute_completion` and `execute_stream` with `optimize_messages_for_model`.
+- **Comprehensive Test Coverage (`tests/model_aware_tokenization_and_admission_test.rs` & `tests/multilingual_token_safety_test.rs`):**
+  - Added 15 comprehensive automated test categories covering short English, long paragraphs, Urdu/multilingual scripts, mixed-language dialogues, code (Rust, JS, Python), nested JSON, long unbroken strings/hashes/UUIDs/Base64, emojis, ChatML multi-turn framing, tool schemas, empty/large inputs, boundary fits, 1-token-over-limit rejection, output token limit validation, unsupported model fallback, and overflow-safe arithmetic.
+  - Test suite count increased from 242 to 258 passing tests with 0 failures, 0 warnings.
+
+### Verification
+- `cargo fmt --check`: Passed with exit code 0.
+- `cargo check`: Passed with exit code 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
+- `cargo test`: **258 automated tests passing** across 16 test suites with 0 failures, 0 errors, 1 ignored (controlled benchmark).
+- `cargo audit -n`: Passed with exit code 0 (1,348 advisories checked, 170 dependencies scanned).
+- `gitleaks detect`: Passed with exit code 0 (11 commits scanned, 0 leaks found).
+
+---
+
 ## 2026-10-21 — Independent Audit, Dependency Remediation, and Durability Verification
 
 ### Remediated & Hardened

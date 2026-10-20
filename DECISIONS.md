@@ -238,6 +238,20 @@
   4. *Hardened Host & Forwarded-Header Validation (`src/security/mod.rs`):* Strips port and normalizes IPv6 brackets (`[::1]` -> `::1`). Rejects malformed Host headers (commas, spaces, control characters, userinfo injection `@`). Enforces exact and wildcard subdomain matching (`*.example.com`) while preventing lookalike domain spoofing (`evil-example.com`, `notexample.com`). Direct requests without verified peer IP strictly strip forwarded headers. Implements `resolve_client_ip` walking multi-hop `X-Forwarded-For` from right to left to locate the verified client IP at the trusted proxy boundary.
 - **Consequences:** All four operational gaps are completely resolved and verified by 242 automated tests across 15 test suites with 0 failures, 0 Clippy warnings, and clean release compilation. Phase 11 remains strictly on hold.
 
+---
+
+### DEC-015: Model-Aware Tokenizer Integration, Explicit Capability Classification, and Strict Context Admission Safety
+- **Status:** APPROVED
+- **Date:** 2026-10-21
+- **Context:** Heuristic token estimation alone was insufficient for context-window safety near capacity boundaries, as shown by reference tokenizers counting code snippets and multilingual content with significant divergence from simple character/word heuristics. A percentage safety margin (+15%) mitigated underestimation for approximate models, but did not establish exact model-aware tokenization or prevent silent truncation/misallocation of requested output tokens.
+- **Decisions Made:**
+  1. *Native Offline BPE Tokenization (`tiktoken-rs`):* Integrated `tiktoken-rs` (version 0.12, no default features) for exact, local, pure-Rust BPE tokenization. Instantiated `CL100K_BPE` (GPT-4 / GPT-3.5-Turbo) and `O200K_BPE` (GPT-4o / o1 / o3) as thread-safe, lazily initialized static singletons using `std::sync::LazyLock<Option<CoreBPE>>`. Tokenizer rank tables are compiled once into memory and reused across all requests with zero network overhead.
+  2. *Explicit Capability Hierarchy (`TokenizerCapability`):* Established a 3-tier capability contract: `Exact` (verified tokenizer and request framing available), `Approximate` (calibrated subword heuristic or conservative fallback with 15% safety headroom), and `ProviderReported` (authoritative post-execution provider usage). Heuristic estimates are strictly prohibited from reporting `is_exact = true`.
+  3. *Accurate Message Framing & Schema Accounting:* Modeled exact ChatML message delimiters (3 tokens per message for `<|im_start|>{role}\n{content}<|im_end|>\n` + encoded role + encoded content) and 3 tokens for assistant response primer (`<|im_start|>assistant\n`). Added schema-level tool token counting with framing overhead.
+  4. *Strict Output Limit and Context Admission Gating:* Eliminated silent clamping of `req.max_tokens`. If a client requests more tokens than a model's `max_output_tokens`, the request is rejected with HTTP 400 `InvalidRequest`. Enforced checked addition (`estimated_prompt_tokens.checked_add(completion_allowance)`) to guard against integer overflow. Requests exceeding `model.context_window` are rejected prior to provider dispatch. Automatic routing evaluates candidate models against model-aware context requirements and output limits.
+- **Consequences:** Provides exact tokenization for supported OpenAI models, transparent approximation for other model families, and strict context safety across all routes. Verified by 258 automated tests across 16 test suites. Phase 11 remains strictly on hold.
+
+
 
 
 

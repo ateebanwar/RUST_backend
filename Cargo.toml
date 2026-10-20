@@ -12,6 +12,7 @@ tracing = "0.1.44"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.33", features = ["bundled"] }
+tiktoken-rs = { version = "0.12", default-features = false }
 
 [profile.dev]
 codegen-units = 1

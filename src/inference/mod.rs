@@ -22,7 +22,8 @@ use tracing::{info, warn};
 
 pub mod tokens;
 pub use tokens::{
-    EstimationMethod, TokenCompactionMetrics, TokenEstimate, TokenEstimator, TokenizerFamily,
+    EstimationMethod, TokenCompactionMetrics, TokenEstimate, TokenEstimator, TokenizerCapability,
+    TokenizerFamily,
 };
 
 /// Inbound request payload for chat completion endpoints conforming to API_SPEC.md §5.1.
@@ -233,11 +234,6 @@ impl InferenceService {
         let detected_task = classification.category.as_str().to_string();
         let estimated_complexity = classification.complexity.as_str().to_string();
 
-        let estimated_prompt_tokens = TokenEstimator::estimate_chat_for_model(
-            &req.messages,
-            req.requested_model_id.as_deref(),
-        );
-
         if req.routing_mode.eq_ignore_ascii_case("manual") {
             let preferred_id = match req.requested_model_id.as_deref() {
                 Some(id) if !id.trim().is_empty() => id.trim(),
@@ -264,8 +260,34 @@ impl InferenceService {
                 )));
             }
 
-            let completion_allowance = req.max_tokens.unwrap_or(256).min(model.max_output_tokens);
-            if estimated_prompt_tokens + completion_allowance > model.context_window {
+            // Output token capacity validation: do not silently reduce requested max_tokens
+            let completion_allowance = match req.max_tokens {
+                Some(tokens) => {
+                    if tokens > model.max_output_tokens {
+                        return Err(AppError::InvalidRequest(format!(
+                            "Requested max_tokens ({tokens}) exceeds model '{preferred_id}' maximum output token limit of {}",
+                            model.max_output_tokens
+                        )));
+                    }
+                    tokens
+                }
+                None => 256.min(model.max_output_tokens),
+            };
+
+            let context_estimate = TokenEstimator::estimate_request_context_safe(
+                &req.messages,
+                None,
+                Some(&model.model_id),
+            );
+            let estimated_prompt_tokens = context_estimate.estimated_tokens;
+
+            let total_budget = estimated_prompt_tokens
+                .checked_add(completion_allowance)
+                .ok_or_else(|| {
+                    AppError::InvalidRequest("Token budget arithmetic overflow".to_string())
+                })?;
+
+            if total_budget > model.context_window {
                 return Err(AppError::InvalidRequest(format!(
                     "Prompt estimated tokens ({estimated_prompt_tokens}) plus completion allowance ({completion_allowance}) exceed model '{preferred_id}' context window ({})",
                     model.context_window
@@ -313,14 +335,33 @@ impl InferenceService {
             let fitting_models: Vec<crate::models::ModelMetadata> = available_models
                 .into_iter()
                 .filter(|m| {
-                    let allowance = min_completion_allowance.min(m.max_output_tokens);
-                    m.context_window >= estimated_prompt_tokens + allowance
+                    let allowance = match req.max_tokens {
+                        Some(requested) => {
+                            if requested > m.max_output_tokens {
+                                return false;
+                            }
+                            requested
+                        }
+                        None => 256.min(m.max_output_tokens),
+                    };
+
+                    let est = TokenEstimator::estimate_request_context_safe(
+                        &req.messages,
+                        None,
+                        Some(&m.model_id),
+                    );
+
+                    match est.estimated_tokens.checked_add(allowance) {
+                        Some(total) => total <= m.context_window,
+                        None => false,
+                    }
                 })
                 .collect();
 
             if fitting_models.is_empty() {
+                let fallback_prompt_tokens = TokenEstimator::estimate_chat(&req.messages);
                 return Err(AppError::InvalidRequest(format!(
-                    "Prompt estimated tokens ({estimated_prompt_tokens}) plus completion allowance ({min_completion_allowance}) exceed context window of all available operational models"
+                    "Prompt estimated tokens ({fallback_prompt_tokens}) plus completion allowance ({min_completion_allowance}) exceed context window of all available operational models"
                 )));
             }
 
@@ -362,6 +403,12 @@ impl InferenceService {
             }
 
             let primary = &ordered_candidates[0];
+            let estimated_prompt_tokens = TokenEstimator::estimate_request_context_safe(
+                &req.messages,
+                None,
+                Some(&primary.model_id),
+            )
+            .estimated_tokens;
 
             Ok(RoutingResolution {
                 selected_model_id: primary.model_id.clone(),
@@ -381,7 +428,10 @@ impl InferenceService {
         req: &ChatCompletionRequest,
     ) -> Result<CompletionResponse, AppError> {
         req.validate()?;
-        let (optimized_messages, compaction) = TokenEstimator::optimize_messages(&req.messages);
+        let (optimized_messages, compaction) = TokenEstimator::optimize_messages_for_model(
+            &req.messages,
+            req.requested_model_id.as_deref(),
+        );
         if compaction.tokens_saved > 0 {
             info!(
                 original_tokens = compaction.original_estimated_tokens,
@@ -546,7 +596,10 @@ impl InferenceService {
         req: &ChatCompletionRequest,
     ) -> Result<StreamExecutionResult, AppError> {
         req.validate()?;
-        let (optimized_messages, compaction) = TokenEstimator::optimize_messages(&req.messages);
+        let (optimized_messages, compaction) = TokenEstimator::optimize_messages_for_model(
+            &req.messages,
+            req.requested_model_id.as_deref(),
+        );
         if compaction.tokens_saved > 0 {
             info!(
                 original_tokens = compaction.original_estimated_tokens,

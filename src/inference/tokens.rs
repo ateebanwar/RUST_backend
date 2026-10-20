@@ -10,6 +10,29 @@ use crate::models::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use tiktoken_rs::CoreBPE;
+
+/// Lazily initialized static instance of OpenAI's `cl100k_base` BPE tokenizer.
+/// Used for GPT-4, GPT-3.5-Turbo, and compatible models.
+static CL100K_BPE: std::sync::LazyLock<Option<CoreBPE>> =
+    std::sync::LazyLock::new(|| tiktoken_rs::cl100k_base().ok());
+
+/// Lazily initialized static instance of OpenAI's `o200k_base` BPE tokenizer.
+/// Used for GPT-4o, GPT-4o-mini, o1, o3, and next-generation OpenAI models.
+static O200K_BPE: std::sync::LazyLock<Option<CoreBPE>> =
+    std::sync::LazyLock::new(|| tiktoken_rs::o200k_base().ok());
+
+/// Tokenizer capability level reflecting whether exact native tokenization is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenizerCapability {
+    /// Verified native tokenizer with request framing is available (exact BPE encoding).
+    Exact,
+    /// Only calibrated or conservative heuristic estimation is available.
+    Approximate,
+    /// Authoritative post-execution usage count returned directly by the provider.
+    ProviderReported,
+}
 
 /// Identified tokenizer family for model-specific tokenization heuristics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,13 +48,21 @@ pub enum TokenizerFamily {
     Qwen,
     /// DeepSeek-V2 / V3 / R1 family (128k BPE vocabulary).
     DeepSeek,
-    /// OpenAI GPT-4 / GPT-4o / o1 family (100k-200k tiktoken vocabulary).
+    /// OpenAI GPT-4 / GPT-4o / o1 / o3 family (100k-200k tiktoken BPE vocabulary).
     Gpt,
     /// Fallback conservative generic tokenizer heuristic.
     Generic,
 }
 
 impl TokenizerFamily {
+    /// Returns the capability tier of this tokenizer family.
+    pub fn capability(&self) -> TokenizerCapability {
+        match self {
+            Self::Gpt => TokenizerCapability::Exact,
+            _ => TokenizerCapability::Approximate,
+        }
+    }
+
     /// Detect tokenizer family from model identifier string.
     pub fn from_model_id(model_id: &str) -> Self {
         let lower = model_id.to_ascii_lowercase();
@@ -48,7 +79,11 @@ impl TokenizerFamily {
             Self::Qwen
         } else if lower.contains("deepseek") || lower.contains("deep-reasoner") {
             Self::DeepSeek
-        } else if lower.contains("gpt") || lower.contains("o1") || lower.contains("o3") {
+        } else if lower.contains("gpt")
+            || lower.contains("o1")
+            || lower.contains("o3")
+            || lower.contains("chatgpt")
+        {
             Self::Gpt
         } else {
             Self::Generic
@@ -126,6 +161,7 @@ pub struct TokenCompactionMetrics {
 struct CacheKey {
     text: String,
     family: TokenizerFamily,
+    bpe_variant: Option<&'static str>,
 }
 
 /// Thread-safe bounded LRU cache for prompt token estimates.
@@ -170,6 +206,56 @@ static TOKEN_CACHE: std::sync::LazyLock<Mutex<TokenCache>> =
 pub struct TokenEstimator;
 
 impl TokenEstimator {
+    /// Resolves the exact CoreBPE instance and variant name if available for the given model ID.
+    pub fn select_exact_bpe(model_id: Option<&str>) -> Option<(&'static str, &'static CoreBPE)> {
+        if let Some(id) = model_id {
+            let lower = id.to_ascii_lowercase();
+            if lower.contains("gpt-4o")
+                || lower.contains("o1")
+                || lower.contains("o3")
+                || lower.contains("chatgpt")
+            {
+                return O200K_BPE.as_ref().map(|b| ("o200k", b));
+            } else if lower.contains("gpt") {
+                return CL100K_BPE.as_ref().map(|b| ("cl100k", b));
+            }
+        }
+        None
+    }
+
+    /// Resolves CoreBPE for a tokenizer family if available.
+    pub fn bpe_for_family(family: TokenizerFamily) -> Option<(&'static str, &'static CoreBPE)> {
+        match family {
+            TokenizerFamily::Gpt => CL100K_BPE.as_ref().map(|b| ("cl100k", b)),
+            _ => None,
+        }
+    }
+
+    /// Exact token calculation via CoreBPE with thread-safe LRU caching.
+    pub fn estimate_text_with_bpe(text: &str, variant: &'static str, bpe: &CoreBPE) -> usize {
+        if text.trim().is_empty() {
+            return 0;
+        }
+
+        let key = CacheKey {
+            text: text.to_string(),
+            family: TokenizerFamily::Gpt,
+            bpe_variant: Some(variant),
+        };
+
+        if let Some(cached) = TOKEN_CACHE.lock().ok().and_then(|mut c| c.get(&key)) {
+            return cached;
+        }
+
+        let tokens = bpe.encode_ordinary(text).len();
+
+        if let Ok(mut cache) = TOKEN_CACHE.lock() {
+            cache.put(key, tokens);
+        }
+
+        tokens
+    }
+
     /// Estimate token count for a raw string slice using generic heuristic with LRU caching.
     pub fn estimate_text(text: &str) -> usize {
         Self::estimate_text_for_family(text, TokenizerFamily::Generic)
@@ -177,6 +263,9 @@ impl TokenEstimator {
 
     /// Estimate token count for a raw string slice targeting a specific model identifier.
     pub fn estimate_text_for_model(text: &str, model_id: Option<&str>) -> usize {
+        if let Some((variant, bpe)) = Self::select_exact_bpe(model_id) {
+            return Self::estimate_text_with_bpe(text, variant, bpe);
+        }
         let family = model_id
             .map(TokenizerFamily::from_model_id)
             .unwrap_or(TokenizerFamily::Generic);
@@ -189,9 +278,14 @@ impl TokenEstimator {
             return 0;
         }
 
+        if let Some((variant, bpe)) = Self::bpe_for_family(family) {
+            return Self::estimate_text_with_bpe(text, variant, bpe);
+        }
+
         let key = CacheKey {
             text: text.to_string(),
             family,
+            bpe_variant: None,
         };
 
         if let Some(cached) = TOKEN_CACHE.lock().ok().and_then(|mut c| c.get(&key)) {
@@ -308,9 +402,29 @@ impl TokenEstimator {
 
     /// Estimate token overhead for an individual ChatMessage with a specific tokenizer family.
     pub fn estimate_message_for_family(msg: &ChatMessage, family: TokenizerFamily) -> usize {
-        let content_tokens = Self::estimate_text_for_family(&msg.content, family);
-        let role_tokens = Self::estimate_text_for_family(&msg.role, family);
-        content_tokens + role_tokens + family.per_message_framing_tokens()
+        if let Some((variant, bpe)) = Self::bpe_for_family(family) {
+            let role_tokens = Self::estimate_text_with_bpe(&msg.role, variant, bpe);
+            let content_tokens = Self::estimate_text_with_bpe(&msg.content, variant, bpe);
+            3 + role_tokens + content_tokens
+        } else {
+            let content_tokens = Self::estimate_text_for_family(&msg.content, family);
+            let role_tokens = Self::estimate_text_for_family(&msg.role, family);
+            content_tokens + role_tokens + family.per_message_framing_tokens()
+        }
+    }
+
+    /// Estimate token overhead for an individual ChatMessage targeting a specific model ID.
+    pub fn estimate_message_for_model(msg: &ChatMessage, model_id: Option<&str>) -> usize {
+        if let Some((variant, bpe)) = Self::select_exact_bpe(model_id) {
+            let role_tokens = Self::estimate_text_with_bpe(&msg.role, variant, bpe);
+            let content_tokens = Self::estimate_text_with_bpe(&msg.content, variant, bpe);
+            3 + role_tokens + content_tokens
+        } else {
+            let family = model_id
+                .map(TokenizerFamily::from_model_id)
+                .unwrap_or(TokenizerFamily::Generic);
+            Self::estimate_message_for_family(msg, family)
+        }
     }
 
     /// Estimate token count for a full chat conversation history including assistant response primer.
@@ -320,16 +434,40 @@ impl TokenEstimator {
 
     /// Estimate token count for a full chat conversation history for a specific model ID.
     pub fn estimate_chat_for_model(messages: &[ChatMessage], model_id: Option<&str>) -> usize {
-        let family = model_id
-            .map(TokenizerFamily::from_model_id)
-            .unwrap_or(TokenizerFamily::Generic);
-        Self::estimate_chat_for_family(messages, family)
+        if messages.is_empty() {
+            return 0;
+        }
+
+        if let Some((variant, bpe)) = Self::select_exact_bpe(model_id) {
+            let mut total = 0;
+            for msg in messages {
+                let role_tokens = Self::estimate_text_with_bpe(&msg.role, variant, bpe);
+                let content_tokens = Self::estimate_text_with_bpe(&msg.content, variant, bpe);
+                total += 3 + role_tokens + content_tokens;
+            }
+            total + 3 // OpenAI assistant response primer
+        } else {
+            let family = model_id
+                .map(TokenizerFamily::from_model_id)
+                .unwrap_or(TokenizerFamily::Generic);
+            Self::estimate_chat_for_family(messages, family)
+        }
     }
 
     /// Estimate token count for a full chat conversation history targeting a specific tokenizer family.
     pub fn estimate_chat_for_family(messages: &[ChatMessage], family: TokenizerFamily) -> usize {
         if messages.is_empty() {
             return 0;
+        }
+
+        if let Some((variant, bpe)) = Self::bpe_for_family(family) {
+            let mut total = 0;
+            for msg in messages {
+                let role_tokens = Self::estimate_text_with_bpe(&msg.role, variant, bpe);
+                let content_tokens = Self::estimate_text_with_bpe(&msg.content, variant, bpe);
+                total += 3 + role_tokens + content_tokens;
+            }
+            return total + 3;
         }
 
         let mut total = 0;
@@ -342,6 +480,18 @@ impl TokenEstimator {
 
     /// Estimate token count for a raw string slice with full provenance metadata.
     pub fn estimate_text_detailed(text: &str, model_id: Option<&str>) -> TokenEstimate {
+        if let Some((variant, bpe)) = Self::select_exact_bpe(model_id) {
+            let count = Self::estimate_text_with_bpe(text, variant, bpe);
+            return TokenEstimate {
+                estimated_tokens: count,
+                method: EstimationMethod::ExactTokenizer,
+                family: TokenizerFamily::Gpt,
+                is_exact: true,
+                safety_margin_applied: 0,
+                confidence_note: "Exact BPE tokenizer count using verified model vocabulary",
+            };
+        }
+
         let family = model_id
             .map(TokenizerFamily::from_model_id)
             .unwrap_or(TokenizerFamily::Generic);
@@ -373,6 +523,28 @@ impl TokenEstimator {
         messages: &[ChatMessage],
         model_id: Option<&str>,
     ) -> TokenEstimate {
+        if let Some((variant, bpe)) = Self::select_exact_bpe(model_id) {
+            let count = if messages.is_empty() {
+                0
+            } else {
+                let mut total = 0;
+                for msg in messages {
+                    let role_tokens = Self::estimate_text_with_bpe(&msg.role, variant, bpe);
+                    let content_tokens = Self::estimate_text_with_bpe(&msg.content, variant, bpe);
+                    total += 3 + role_tokens + content_tokens;
+                }
+                total + 3
+            };
+            return TokenEstimate {
+                estimated_tokens: count,
+                method: EstimationMethod::ExactTokenizer,
+                family: TokenizerFamily::Gpt,
+                is_exact: true,
+                safety_margin_applied: 0,
+                confidence_note: "Exact BPE tokenizer count using verified model vocabulary and message framing",
+            };
+        }
+
         let family = model_id
             .map(TokenizerFamily::from_model_id)
             .unwrap_or(TokenizerFamily::Generic);
@@ -399,12 +571,21 @@ impl TokenEstimator {
         }
     }
 
-    /// Estimate token overhead for tool / function schema definitions.
+    /// Estimate token overhead for tool / function schema definitions targeting a specific family.
     pub fn estimate_tools_tokens(tools_json: &str, family: TokenizerFamily) -> usize {
         if tools_json.trim().is_empty() {
             return 0;
         }
         let schema_tokens = Self::estimate_text_for_family(tools_json, family);
+        schema_tokens + 12 // Schema framing overhead
+    }
+
+    /// Estimate token overhead for tool / function schema definitions targeting a specific model.
+    pub fn estimate_tools_tokens_for_model(tools_json: &str, model_id: Option<&str>) -> usize {
+        if tools_json.trim().is_empty() {
+            return 0;
+        }
+        let schema_tokens = Self::estimate_text_for_model(tools_json, model_id);
         schema_tokens + 12 // Schema framing overhead
     }
 
@@ -414,6 +595,33 @@ impl TokenEstimator {
         tools_json: Option<&str>,
         model_id: Option<&str>,
     ) -> TokenEstimate {
+        if let Some((variant, bpe)) = Self::select_exact_bpe(model_id) {
+            let chat_tokens = if messages.is_empty() {
+                0
+            } else {
+                let mut total = 0;
+                for msg in messages {
+                    let role_tokens = Self::estimate_text_with_bpe(&msg.role, variant, bpe);
+                    let content_tokens = Self::estimate_text_with_bpe(&msg.content, variant, bpe);
+                    total += 3 + role_tokens + content_tokens;
+                }
+                total + 3
+            };
+            let tools_tokens = tools_json
+                .map(|t| Self::estimate_text_with_bpe(t, variant, bpe) + 12)
+                .unwrap_or(0);
+            let exact_total = chat_tokens + tools_tokens;
+
+            return TokenEstimate {
+                estimated_tokens: exact_total,
+                method: EstimationMethod::ExactTokenizer,
+                family: TokenizerFamily::Gpt,
+                is_exact: true,
+                safety_margin_applied: 0,
+                confidence_note: "Exact BPE tokenizer count using verified model vocabulary and message framing",
+            };
+        }
+
         let family = model_id
             .map(TokenizerFamily::from_model_id)
             .unwrap_or(TokenizerFamily::Generic);
@@ -426,7 +634,7 @@ impl TokenEstimator {
         // Apply conservative safety margin (15% or minimum 8 tokens) for heuristic estimators
         // Note: Heuristic estimation cannot provide a universal overflow guarantee for arbitrary high-entropy inputs.
         // This margin provides headroom against subword underestimation while avoiding premature context exhaustion.
-        let safety_margin = (raw_total * 15 / 100).max(8);
+        let safety_margin = (raw_total.saturating_mul(15) / 100).max(8);
         let safe_total = raw_total.saturating_add(safety_margin);
 
         let method = match family {
@@ -450,7 +658,7 @@ impl TokenEstimator {
     pub fn optimize_messages(
         messages: &[ChatMessage],
     ) -> (Vec<ChatMessage>, TokenCompactionMetrics) {
-        Self::optimize_messages_for_family(messages, TokenizerFamily::Generic)
+        Self::optimize_messages_for_model(messages, None)
     }
 
     /// Compacts messages targeting a specific model identifier.
@@ -458,18 +666,7 @@ impl TokenEstimator {
         messages: &[ChatMessage],
         model_id: Option<&str>,
     ) -> (Vec<ChatMessage>, TokenCompactionMetrics) {
-        let family = model_id
-            .map(TokenizerFamily::from_model_id)
-            .unwrap_or(TokenizerFamily::Generic);
-        Self::optimize_messages_for_family(messages, family)
-    }
-
-    /// Compacts messages targeting a specific tokenizer family.
-    pub fn optimize_messages_for_family(
-        messages: &[ChatMessage],
-        family: TokenizerFamily,
-    ) -> (Vec<ChatMessage>, TokenCompactionMetrics) {
-        let original_tokens = Self::estimate_chat_for_family(messages, family);
+        let original_tokens = Self::estimate_chat_for_model(messages, model_id);
         let original_characters: usize = messages.iter().map(|m| m.content.chars().count()).sum();
         let original_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
 
@@ -516,7 +713,7 @@ impl TokenEstimator {
             });
         }
 
-        let optimized_tokens = Self::estimate_chat_for_family(&optimized, family);
+        let optimized_tokens = Self::estimate_chat_for_model(&optimized, model_id);
         let compacted_characters: usize = optimized.iter().map(|m| m.content.chars().count()).sum();
         let compacted_bytes: usize = optimized.iter().map(|m| m.content.len()).sum();
 
@@ -544,6 +741,23 @@ impl TokenEstimator {
                 compaction_skipped_reason,
             },
         )
+    }
+
+    /// Compacts messages targeting a specific tokenizer family.
+    pub fn optimize_messages_for_family(
+        messages: &[ChatMessage],
+        family: TokenizerFamily,
+    ) -> (Vec<ChatMessage>, TokenCompactionMetrics) {
+        let model_id = match family {
+            TokenizerFamily::Gpt => Some("gpt-4"),
+            TokenizerFamily::Llama => Some("llama-3"),
+            TokenizerFamily::Mistral => Some("mistral"),
+            TokenizerFamily::Gemma => Some("gemma"),
+            TokenizerFamily::Qwen => Some("qwen"),
+            TokenizerFamily::DeepSeek => Some("deepseek"),
+            TokenizerFamily::Generic => None,
+        };
+        Self::optimize_messages_for_model(messages, model_id)
     }
 
     /// Conservatively compacts text content while preserving code indentation,
@@ -692,5 +906,21 @@ mod tests {
         assert!(compacted.contains("```python\n    def foo():\n        return True\n```"));
         // 4 blank lines collapsed to at most one blank line (\n\n)
         assert!(compacted.contains("```\n\nEnd text."));
+    }
+
+    #[test]
+    fn test_tiktoken_availability() {
+        let text = "fn compute(x: i32) -> i32 { x * 2 + 1 }";
+        let cl100k = tiktoken_rs::cl100k_base().expect("cl100k_base should load");
+        assert_eq!(cl100k.encode_ordinary(text).len(), 19);
+
+        let o200k = tiktoken_rs::o200k_base().expect("o200k_base should load");
+        assert_eq!(o200k.encode_ordinary(text).len(), 19);
+
+        // Verify select_exact_bpe
+        let (v1, _) = TokenEstimator::select_exact_bpe(Some("gpt-4")).unwrap();
+        assert_eq!(v1, "cl100k");
+        let (v2, _) = TokenEstimator::select_exact_bpe(Some("gpt-4o")).unwrap();
+        assert_eq!(v2, "o200k");
     }
 }

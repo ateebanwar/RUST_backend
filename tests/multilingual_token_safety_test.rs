@@ -217,3 +217,41 @@ fn test_reproduce_code_underestimation_and_safety_margin_compensation() {
     assert!(safe_estimate.safety_margin_applied >= 4);
     assert!(!safe_estimate.is_exact);
 }
+
+#[test]
+fn test_exact_bpe_reference_vs_approximate_comparison() {
+    let snippet = "fn compute(x: i32) -> i32 { x * 2 + 1 }";
+
+    // Exact BPE tokenization (GPT-4 / GPT-4o)
+    let gpt_estimate = TokenEstimator::estimate_text_detailed(snippet, Some("gpt-4o"));
+    assert!(gpt_estimate.is_exact);
+    assert_eq!(gpt_estimate.method, EstimationMethod::ExactTokenizer);
+    assert_eq!(gpt_estimate.estimated_tokens, 19);
+    assert_eq!(gpt_estimate.safety_margin_applied, 0);
+
+    // Approximate calibrated tokenization (Llama 3 / Fast-Chat)
+    let llama_estimate = TokenEstimator::estimate_text_detailed(snippet, Some("fast-chat-v1"));
+    assert!(!llama_estimate.is_exact);
+    assert_eq!(
+        llama_estimate.method,
+        EstimationMethod::CalibratedFamilyHeuristic
+    );
+    assert_eq!(llama_estimate.estimated_tokens, 17);
+
+    // Safe context estimation for Llama applies +15% margin (minimum 8 tokens)
+    let msg = vec![ChatMessage {
+        role: "user".to_string(),
+        content: snippet.to_string(),
+    }];
+    let llama_safe =
+        TokenEstimator::estimate_request_context_safe(&msg, None, Some("fast-chat-v1"));
+    assert!(!llama_safe.is_exact);
+    assert!(llama_safe.safety_margin_applied >= 8);
+
+    // Safe context estimation for GPT is exact with 0 margin
+    let gpt_safe = TokenEstimator::estimate_request_context_safe(&msg, None, Some("gpt-4o"));
+    assert!(gpt_safe.is_exact);
+    assert_eq!(gpt_safe.safety_margin_applied, 0);
+    // 3 tokens framing + 1 token role ("user") + 19 tokens content + 3 tokens primer = 26 tokens
+    assert_eq!(gpt_safe.estimated_tokens, 26);
+}
