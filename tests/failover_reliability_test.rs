@@ -1139,3 +1139,305 @@ async fn test_failover_respects_task_and_modality_compatibility() {
     // Compatible text fallback was called
     assert_eq!(fallback.call_count(), 1);
 }
+
+// =========================================================================
+// 10. TARGETED ACCEPTANCE GAP VERIFICATIONS
+// =========================================================================
+
+#[tokio::test]
+async fn test_all_candidates_exhausted_returns_canonical_error_envelope_and_usage() {
+    let mut config_raw = AppConfig::default_local();
+    config_raw.max_retries = 1; // 2 attempts per candidate
+    config_raw.max_failover_candidates = 3;
+    let config = Arc::new(config_raw);
+
+    let registry = Arc::new(ModelRegistry::empty());
+
+    let m1 = ModelMetadata {
+        model_id: "candidate-1".to_string(),
+        display_name: "Candidate 1".to_string(),
+        provider_id: "p1-api".to_string(),
+        supported_modalities: vec!["text".to_string()],
+        context_window: 32768,
+        max_output_tokens: 4096,
+        streaming_supported: true,
+        tool_calling_supported: false,
+        speed_tier: "fast".to_string(),
+        cost_tier: "free-tier".to_string(),
+        available: true,
+        capabilities: vec!["simple_chat".to_string()],
+        last_health_check: "2026-10-20T00:00:00Z".to_string(),
+    };
+    let m2 = ModelMetadata {
+        model_id: "candidate-2".to_string(),
+        display_name: "Candidate 2".to_string(),
+        provider_id: "p2-api".to_string(),
+        supported_modalities: vec!["text".to_string()],
+        context_window: 32768,
+        max_output_tokens: 4096,
+        streaming_supported: true,
+        tool_calling_supported: false,
+        speed_tier: "balanced".to_string(),
+        cost_tier: "low-cost".to_string(),
+        available: true,
+        capabilities: vec!["simple_chat".to_string()],
+        last_health_check: "2026-10-20T00:00:00Z".to_string(),
+    };
+    let m3 = ModelMetadata {
+        model_id: "candidate-3".to_string(),
+        display_name: "Candidate 3".to_string(),
+        provider_id: "p3-api".to_string(),
+        supported_modalities: vec!["text".to_string()],
+        context_window: 32768,
+        max_output_tokens: 4096,
+        streaming_supported: true,
+        tool_calling_supported: false,
+        speed_tier: "advanced".to_string(),
+        cost_tier: "premium".to_string(),
+        available: true,
+        capabilities: vec!["simple_chat".to_string()],
+        last_health_check: "2026-10-20T00:00:00Z".to_string(),
+    };
+
+    registry.register_model(m1.clone()).unwrap();
+    registry.register_model(m2.clone()).unwrap();
+    registry.register_model(m3.clone()).unwrap();
+
+    let providers = Arc::new(ProviderRegistry::new());
+
+    let p1 = Arc::new(
+        MockProviderAdapter::new("p1-api", "Provider 1")
+            .with_models(vec![m1])
+            .with_simulated_error(ProviderError::UpstreamError {
+                status_code: 503,
+                message: "P1 Overloaded".to_string(),
+            }),
+    );
+    let p2 = Arc::new(
+        MockProviderAdapter::new("p2-api", "Provider 2")
+            .with_models(vec![m2])
+            .with_simulated_error(ProviderError::UpstreamError {
+                status_code: 502,
+                message: "P2 Gateway Error".to_string(),
+            }),
+    );
+    let p3 = Arc::new(
+        MockProviderAdapter::new("p3-api", "Provider 3")
+            .with_models(vec![m3])
+            .with_simulated_error(ProviderError::UpstreamError {
+                status_code: 500,
+                message: "P3 Internal Error".to_string(),
+            }),
+    );
+
+    providers.register(p1.clone()).unwrap();
+    providers.register(p2.clone()).unwrap();
+    providers.register(p3.clone()).unwrap();
+
+    let router = Arc::new(ModelRouter::new(registry.clone()));
+    let state = AppState::with_all_components(config, registry, providers, router);
+
+    let (base_url, _server) = spawn_test_backend(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/v1/chat/completions", base_url))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "All fail test" }],
+            "routing_mode": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // 1. Correct status code
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    // 2. Verified canonical error envelope per API_SPEC §6.1
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "UPSTREAM_FAILURE");
+    assert!(body["error"]["message"].as_str().is_some());
+    assert!(!body["error"]["message"].as_str().unwrap().is_empty());
+
+    // 3. Exactly 2 attempts on each of the 3 candidates (1 init + 1 retry = 6 total), no loops
+    assert_eq!(p1.call_count(), 2);
+    assert_eq!(p2.call_count(), 2);
+    assert_eq!(p3.call_count(), 2);
+
+    // 4. Exactly one usage record saved as ProviderError, with no fabricated tokens
+    let summary = state
+        .usage
+        .get_summary(UsageQueryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.total_requests, 1);
+    assert_eq!(summary.successful_requests, 0);
+    assert_eq!(summary.total_tokens, 0); // No fabricated tokens
+    assert_eq!(
+        summary.by_outcome.get("provider_error").copied(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn test_retry_after_header_propagation_from_raw_http_wire() {
+    let mut config_raw = AppConfig::default_local();
+    config_raw.max_retries = 2;
+    config_raw.max_retry_after_secs = 2; // Maximum acceptable delay is 2 seconds
+    let config = Arc::new(config_raw);
+
+    // Primary mock HTTP server returns 429 with Retry-After: 120 (seconds)
+    let (primary_url, _h1) = spawn_mock_openai_upstream(|_, _| {
+        let err_body = json!({
+            "error": { "message": "Rate limit reached. Please wait 120 seconds." }
+        });
+        (
+            429,
+            vec![
+                ("Content-Type", "application/json"),
+                ("Retry-After", "120"), // Exceeds 2s max_retry_after_secs bound
+            ],
+            serde_json::to_vec(&err_body).unwrap(),
+        )
+    })
+    .await;
+
+    // Fallback mock HTTP server returns 200 OK
+    let (fallback_url, _h2) = spawn_mock_openai_upstream(|_, _| {
+        let succ_body = json!({
+            "id": "chatcmpl_fallback_wire",
+            "model": "deep-reasoner-v1",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Wire fallback response" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 15, "completion_tokens": 25, "total_tokens": 40 }
+        });
+        (
+            200,
+            vec![("Content-Type", "application/json")],
+            serde_json::to_vec(&succ_body).unwrap(),
+        )
+    })
+    .await;
+
+    let (registry, m1, m2) = create_two_model_registry();
+    let providers = Arc::new(ProviderRegistry::new());
+
+    let primary_adapter = Arc::new(
+        OpenAiCompatibleAdapter::new(
+            "groq-api",
+            "Groq Upstream",
+            &primary_url,
+            Some("key1".to_string()),
+        )
+        .with_models(vec![m1]),
+    );
+    providers.register(primary_adapter).unwrap();
+
+    let fallback_adapter = Arc::new(
+        OpenAiCompatibleAdapter::new(
+            "openrouter-api",
+            "OpenRouter Upstream",
+            &fallback_url,
+            Some("key2".to_string()),
+        )
+        .with_models(vec![m2]),
+    );
+    providers.register(fallback_adapter).unwrap();
+
+    let router = Arc::new(ModelRouter::new(registry.clone()));
+    let state = AppState::with_all_components(config, registry, providers, router);
+
+    let (base_url, _server) = spawn_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(format!("{}/api/v1/chat/completions", base_url))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "Test wire retry-after propagation" }],
+            "routing_mode": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let elapsed = start.elapsed();
+    // Must complete in under 2 seconds: candidate loop must NOT sleep 120s!
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Request waited excessively: {:?}",
+        elapsed
+    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["provider_used"], "openrouter-api");
+    assert_eq!(body["is_fallback"], true);
+    assert_eq!(body["message"]["content"], "Wire fallback response");
+    assert_eq!(body["usage"]["total_tokens"], 40);
+}
+
+#[tokio::test]
+async fn test_overall_deadline_shared_across_failover_candidates() {
+    let mut config_raw = AppConfig::default_local();
+    config_raw.max_retries = 1;
+    config_raw.overall_request_timeout_secs = 1; // Strict 1 second deadline
+    config_raw.upstream_timeout_secs = 1;
+    let config = Arc::new(config_raw);
+
+    let (registry, m1, m2) = create_two_model_registry();
+    let providers = Arc::new(ProviderRegistry::new());
+
+    // Candidate 1 delays 600ms and fails with 503
+    let p1 = Arc::new(
+        MockProviderAdapter::new("groq-api", "Groq Primary")
+            .with_models(vec![m1])
+            .with_delay(Duration::from_millis(600))
+            .with_simulated_error(ProviderError::UpstreamError {
+                status_code: 503,
+                message: "Primary slow failure".to_string(),
+            }),
+    );
+    providers.register(p1).unwrap();
+
+    // Candidate 2 delays 600ms (would succeed if deadline permitted)
+    let p2 = Arc::new(
+        MockProviderAdapter::new("openrouter-api", "OpenRouter Fallback")
+            .with_models(vec![m2])
+            .with_delay(Duration::from_millis(600)),
+    );
+    providers.register(p2).unwrap();
+
+    let router = Arc::new(ModelRouter::new(registry.clone()));
+    let state = AppState::with_all_components(config, registry, providers, router);
+
+    let (base_url, _server) = spawn_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(format!("{}/api/v1/chat/completions", base_url))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "Deadline multi-candidate test" }],
+            "routing_mode": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let elapsed = start.elapsed();
+    // Total execution must be bounded by ~1.2s rather than allowing candidate 2 to run for an additional 600ms
+    assert!(
+        elapsed < Duration::from_millis(2000),
+        "Execution exceeded bounded deadline: {:?}",
+        elapsed
+    );
+    assert!(
+        resp.status() == reqwest::StatusCode::GATEWAY_TIMEOUT
+            || resp.status() == reqwest::StatusCode::BAD_GATEWAY
+    );
+}
+
