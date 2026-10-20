@@ -9,6 +9,7 @@ pub mod models;
 pub mod providers;
 pub mod quota;
 pub mod registry;
+pub mod reliability;
 pub mod router;
 pub mod routes;
 pub mod usage;
@@ -26,6 +27,7 @@ pub use inference::{ChatCompletionRequest, InferenceService};
 pub use providers::ProviderRegistry;
 pub use quota::{ProviderQuota, QuotaService};
 pub use registry::{ModelFilter, ModelRegistry, RegistryError};
+pub use reliability::RetryPolicy;
 pub use router::{
     ClassificationResult, MAX_PROMPT_LENGTH, ModelRouter, RoutingPolicy, RoutingPreviewRequest,
     RoutingPreviewResponse, ScoredCandidate, TaskCategory, TaskClassifier, TaskComplexity,

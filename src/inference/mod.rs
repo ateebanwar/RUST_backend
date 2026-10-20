@@ -15,8 +15,9 @@ use crate::router::ModelRouter;
 use crate::router::classifier::{TaskClassifier, TaskModality};
 use crate::router::policy::RoutingPolicy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Inbound request payload for chat completion endpoints conforming to API_SPEC.md §5.1.
@@ -260,35 +261,13 @@ impl InferenceService {
                 ),
             };
 
-            // Rank remaining available models as fallback targets
-            let all_available = self
-                .registry
-                .query_models(&ModelFilter::new().with_available_only(true));
-            let mut ordered = vec![primary.clone()];
-            let fallbacks = RoutingPolicy::rank_candidates(
-                &all_available,
-                &classification.category,
-                &classification.complexity,
-                &parsed_modality,
-            );
-
-            for fb in fallbacks {
-                if fb.model_id != primary.model_id {
-                    ordered.push(CandidateExecutionTarget {
-                        model_id: fb.model_id,
-                        provider_id: fb.provider_id,
-                        reason: fb.selection_reason,
-                    });
-                }
-            }
-
             Ok(RoutingResolution {
-                selected_model_id: primary.model_id,
-                provider_id: primary.provider_id,
+                selected_model_id: primary.model_id.clone(),
+                provider_id: primary.provider_id.clone(),
                 detected_task,
                 estimated_complexity,
-                selection_reason: primary.reason,
-                ordered_candidates: ordered,
+                selection_reason: primary.reason.clone(),
+                ordered_candidates: vec![primary],
             })
         } else {
             // Automatic routing: verify catalog has models supporting modality
@@ -359,7 +338,7 @@ impl InferenceService {
         }
     }
 
-    /// Execute a standard buffered chat completion with bounded failover.
+    /// Execute a standard buffered chat completion with bounded retry, failover, and overall deadline enforcement.
     pub async fn execute_completion(
         &self,
         req: &ChatCompletionRequest,
@@ -367,14 +346,26 @@ impl InferenceService {
         req.validate()?;
         let resolution = self.resolve_candidates(req)?;
 
-        let timeout = Duration::from_secs(self.config.upstream_timeout_secs);
-        let max_attempts = resolution.ordered_candidates.len().min(3); // bounded retry ceiling
-        let mut last_error: Option<ProviderError> = None;
+        let policy = self.config.retry_policy();
+        let deadline = Instant::now() + Duration::from_secs(policy.overall_request_timeout_secs);
+        let max_candidates = if req.routing_mode.eq_ignore_ascii_case("manual") {
+            1
+        } else {
+            resolution
+                .ordered_candidates
+                .len()
+                .min(policy.max_failover_candidates)
+        };
 
-        for (attempt_idx, candidate) in resolution.ordered_candidates[..max_attempts]
-            .iter()
-            .enumerate()
-        {
+        let mut failed_model_ids: HashSet<String> = HashSet::new();
+        let mut last_error: Option<ProviderError> = None;
+        let mut candidate_attempt_count = 0;
+
+        for candidate in resolution.ordered_candidates.iter().take(max_candidates) {
+            if failed_model_ids.contains(&candidate.model_id) {
+                continue;
+            }
+
             let adapter = match self.providers.get(&candidate.provider_id) {
                 Ok(a) => a,
                 Err(err) => {
@@ -384,56 +375,109 @@ impl InferenceService {
                         error = %err,
                         "Skipping candidate due to adapter lookup failure"
                     );
+                    failed_model_ids.insert(candidate.model_id.clone());
                     last_error = Some(err);
                     continue;
                 }
             };
 
-            let completion_req = CompletionRequest {
-                model_id: candidate.model_id.clone(),
-                messages: req.messages.clone(),
-                temperature: req.temperature,
-                max_tokens: req.max_tokens,
-                timeout,
-                stream: false,
-            };
-
-            info!(
-                attempt = attempt_idx + 1,
-                provider_id = candidate.provider_id.as_str(),
-                model_id = candidate.model_id.as_str(),
-                "Dispatching completion to provider adapter"
-            );
-
-            match adapter.complete(&completion_req).await {
-                Ok(mut response) => {
-                    response.is_fallback = attempt_idx > 0;
-                    response.routing_reason = Some(candidate.reason.clone());
-                    return Ok(response);
+            for retry_idx in 0..=policy.max_retries_per_candidate {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(AppError::GatewayTimeout(
+                        "Overall request processing deadline exceeded".to_string(),
+                    ));
                 }
-                Err(provider_err) => {
-                    warn!(
-                        attempt = attempt_idx + 1,
-                        provider_id = candidate.provider_id.as_str(),
-                        model_id = candidate.model_id.as_str(),
-                        error = %provider_err,
-                        "Provider adapter completion execution failed"
-                    );
+                let remaining = deadline - now;
+                let attempt_timeout =
+                    Duration::from_secs(self.config.upstream_timeout_secs).min(remaining);
 
-                    // Check if error is non-retryable (invalid request, bad parameters)
-                    if let ProviderError::InvalidRequest(_) = provider_err {
-                        return Err(provider_err.into());
-                    }
-                    if let ProviderError::CapabilityMismatch(_) = provider_err {
-                        return Err(provider_err.into());
-                    }
+                let completion_req = CompletionRequest {
+                    model_id: candidate.model_id.clone(),
+                    messages: req.messages.clone(),
+                    temperature: req.temperature,
+                    max_tokens: req.max_tokens,
+                    timeout: attempt_timeout,
+                    stream: false,
+                };
 
-                    last_error = Some(provider_err);
+                info!(
+                    candidate_index = candidate_attempt_count + 1,
+                    retry_attempt = retry_idx + 1,
+                    provider_id = candidate.provider_id.as_str(),
+                    model_id = candidate.model_id.as_str(),
+                    "Dispatching completion to provider adapter"
+                );
+
+                match adapter.complete(&completion_req).await {
+                    Ok(mut response) => {
+                        response.is_fallback = candidate_attempt_count > 0;
+                        response.routing_reason = Some(candidate.reason.clone());
+                        return Ok(response);
+                    }
+                    Err(provider_err) => {
+                        warn!(
+                            candidate_index = candidate_attempt_count + 1,
+                            retry_attempt = retry_idx + 1,
+                            provider_id = candidate.provider_id.as_str(),
+                            model_id = candidate.model_id.as_str(),
+                            error = %provider_err,
+                            "Provider adapter completion execution failed"
+                        );
+
+                        if crate::reliability::is_non_retryable_error(&provider_err) {
+                            return Err(provider_err.into());
+                        }
+
+                        last_error = Some(provider_err.clone());
+
+                        if crate::reliability::is_transient_error(&provider_err)
+                            && retry_idx < policy.max_retries_per_candidate
+                        {
+                            let retry_after = match &provider_err {
+                                ProviderError::RateLimited { retry_after_secs } => {
+                                    *retry_after_secs
+                                }
+                                _ => None,
+                            };
+                            let backoff = crate::reliability::calculate_backoff(
+                                retry_idx,
+                                retry_after,
+                                &policy,
+                            );
+                            if backoff == Duration::MAX {
+                                warn!(
+                                    provider_id = candidate.provider_id.as_str(),
+                                    model_id = candidate.model_id.as_str(),
+                                    "Upstream Retry-After exceeds max allowable wait bound; abandoning candidate"
+                                );
+                                break;
+                            }
+
+                            let now_post = Instant::now();
+                            if now_post + backoff >= deadline {
+                                return Err(AppError::GatewayTimeout(
+                                    "Overall request processing deadline exceeded during retry backoff"
+                                        .to_string(),
+                                ));
+                            }
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+
+                        break;
+                    }
                 }
+            }
+
+            failed_model_ids.insert(candidate.model_id.clone());
+            candidate_attempt_count += 1;
+
+            if req.routing_mode.eq_ignore_ascii_case("manual") {
+                break;
             }
         }
 
-        // All candidates exhausted
         if let Some(err) = last_error {
             match err {
                 ProviderError::ProviderNotFound(p) => Err(AppError::UpstreamFailure(format!(
@@ -448,7 +492,7 @@ impl InferenceService {
         }
     }
 
-    /// Initiate a streaming chat completion with bounded failover.
+    /// Initiate a streaming chat completion with bounded retry, failover, and overall deadline enforcement.
     pub async fn execute_stream(
         &self,
         req: &ChatCompletionRequest,
@@ -456,14 +500,26 @@ impl InferenceService {
         req.validate()?;
         let resolution = self.resolve_candidates(req)?;
 
-        let timeout = Duration::from_secs(self.config.upstream_timeout_secs);
-        let max_attempts = resolution.ordered_candidates.len().min(3);
-        let mut last_error: Option<ProviderError> = None;
+        let policy = self.config.retry_policy();
+        let deadline = Instant::now() + Duration::from_secs(policy.overall_request_timeout_secs);
+        let max_candidates = if req.routing_mode.eq_ignore_ascii_case("manual") {
+            1
+        } else {
+            resolution
+                .ordered_candidates
+                .len()
+                .min(policy.max_failover_candidates)
+        };
 
-        for (attempt_idx, candidate) in resolution.ordered_candidates[..max_attempts]
-            .iter()
-            .enumerate()
-        {
+        let mut failed_model_ids: HashSet<String> = HashSet::new();
+        let mut last_error: Option<ProviderError> = None;
+        let mut candidate_attempt_count = 0;
+
+        for candidate in resolution.ordered_candidates.iter().take(max_candidates) {
+            if failed_model_ids.contains(&candidate.model_id) {
+                continue;
+            }
+
             let adapter = match self.providers.get(&candidate.provider_id) {
                 Ok(a) => a,
                 Err(err) => {
@@ -473,51 +529,105 @@ impl InferenceService {
                         error = %err,
                         "Skipping stream candidate due to adapter lookup failure"
                     );
+                    failed_model_ids.insert(candidate.model_id.clone());
                     last_error = Some(err);
                     continue;
                 }
             };
 
-            let completion_req = CompletionRequest {
-                model_id: candidate.model_id.clone(),
-                messages: req.messages.clone(),
-                temperature: req.temperature,
-                max_tokens: req.max_tokens,
-                timeout,
-                stream: true,
-            };
-
-            match adapter.stream(&completion_req).await {
-                Ok(stream) => {
-                    let mut actual_resolution = resolution.clone();
-                    actual_resolution.selected_model_id = candidate.model_id.clone();
-                    actual_resolution.provider_id = candidate.provider_id.clone();
-                    actual_resolution.selection_reason = candidate.reason.clone();
-
-                    return Ok(StreamExecutionResult {
-                        resolution: actual_resolution,
-                        is_fallback: attempt_idx > 0,
-                        stream,
-                    });
+            for retry_idx in 0..=policy.max_retries_per_candidate {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(AppError::GatewayTimeout(
+                        "Overall request processing deadline exceeded".to_string(),
+                    ));
                 }
-                Err(provider_err) => {
-                    warn!(
-                        attempt = attempt_idx + 1,
-                        provider_id = candidate.provider_id.as_str(),
-                        model_id = candidate.model_id.as_str(),
-                        error = %provider_err,
-                        "Provider adapter stream initiation failed"
-                    );
+                let remaining = deadline - now;
+                let attempt_timeout =
+                    Duration::from_secs(self.config.upstream_timeout_secs).min(remaining);
 
-                    if let ProviderError::InvalidRequest(_) = provider_err {
-                        return Err(provider_err.into());
-                    }
-                    if let ProviderError::CapabilityMismatch(_) = provider_err {
-                        return Err(provider_err.into());
-                    }
+                let completion_req = CompletionRequest {
+                    model_id: candidate.model_id.clone(),
+                    messages: req.messages.clone(),
+                    temperature: req.temperature,
+                    max_tokens: req.max_tokens,
+                    timeout: attempt_timeout,
+                    stream: true,
+                };
 
-                    last_error = Some(provider_err);
+                match adapter.stream(&completion_req).await {
+                    Ok(stream) => {
+                        let mut actual_resolution = resolution.clone();
+                        actual_resolution.selected_model_id = candidate.model_id.clone();
+                        actual_resolution.provider_id = candidate.provider_id.clone();
+                        actual_resolution.selection_reason = candidate.reason.clone();
+
+                        return Ok(StreamExecutionResult {
+                            resolution: actual_resolution,
+                            is_fallback: candidate_attempt_count > 0,
+                            stream,
+                        });
+                    }
+                    Err(provider_err) => {
+                        warn!(
+                            candidate_index = candidate_attempt_count + 1,
+                            retry_attempt = retry_idx + 1,
+                            provider_id = candidate.provider_id.as_str(),
+                            model_id = candidate.model_id.as_str(),
+                            error = %provider_err,
+                            "Provider adapter stream initiation failed"
+                        );
+
+                        if crate::reliability::is_non_retryable_error(&provider_err) {
+                            return Err(provider_err.into());
+                        }
+
+                        last_error = Some(provider_err.clone());
+
+                        if crate::reliability::is_transient_error(&provider_err)
+                            && retry_idx < policy.max_retries_per_candidate
+                        {
+                            let retry_after = match &provider_err {
+                                ProviderError::RateLimited { retry_after_secs } => {
+                                    *retry_after_secs
+                                }
+                                _ => None,
+                            };
+                            let backoff = crate::reliability::calculate_backoff(
+                                retry_idx,
+                                retry_after,
+                                &policy,
+                            );
+                            if backoff == Duration::MAX {
+                                warn!(
+                                    provider_id = candidate.provider_id.as_str(),
+                                    model_id = candidate.model_id.as_str(),
+                                    "Upstream Retry-After exceeds max allowable wait bound for stream; abandoning candidate"
+                                );
+                                break;
+                            }
+
+                            let now_post = Instant::now();
+                            if now_post + backoff >= deadline {
+                                return Err(AppError::GatewayTimeout(
+                                    "Overall request processing deadline exceeded during stream retry backoff"
+                                        .to_string(),
+                                ));
+                            }
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+
+                        break;
+                    }
                 }
+            }
+
+            failed_model_ids.insert(candidate.model_id.clone());
+            candidate_attempt_count += 1;
+
+            if req.routing_mode.eq_ignore_ascii_case("manual") {
+                break;
             }
         }
 

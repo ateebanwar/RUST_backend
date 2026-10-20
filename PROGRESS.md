@@ -2,7 +2,7 @@
 
 **Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
 **Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
-**Current Phase:** Phase 8 Complete | Phase 9 Ready for Review & Authorization  
+**Current Phase:** Phase 9 Complete | Phase 10 Strictly On Hold  
 **Last Updated:** 2026-10-20
 
 ---
@@ -47,6 +47,18 @@
   - **Read-Only HTTP Endpoints & Bind Protection:** Protected versioned endpoints: `GET /api/v1/usage/summary`, `GET /api/v1/usage/providers`, `GET /api/v1/usage/models`, `GET /api/v1/quotas` with bounded query filters and zero secrets or prompt/completion text exposure. Protected against unauthenticated access when bound to external network interfaces (`host != loopback`).
   - **Retention Policy Cleanup:** Safe startup pruning and async retention cleanup (`UsageService::prune_retention`) based on `usage_retention_days` (validated > 0, disabled by default as conservative baseline).
   - **Verification:** 170 automated tests passing across 9 test suites (`tests/usage_tracking_test.rs` with 25 focused tests); `cargo fmt --check` clean; `cargo check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- [x] **Phase 9 — Failover & Reliability (COMPLETE):**
+  - **Bounded Retry Policy:** Configurable `RetryPolicy` via environment variables (`MAX_RETRIES`, `MAX_FAILOVER_CANDIDATES`, `INITIAL_BACKOFF_MS`, `MAX_BACKOFF_MS`, `MAX_RETRY_AFTER_SECS`, `OVERALL_REQUEST_TIMEOUT_SECS`).
+  - **Error Taxonomy & Immediate Short-Circuiting:** Retries transient failures only (timeouts, network resets, HTTP 408, 429, 500, 502, 503, 504). Zero retries on non-retryable errors (HTTP 400, 401, 403, 404, 422, capability mismatches, disabled providers).
+  - **Exponential Backoff with Jitter:** Deterministic monotonic nanosecond jitter scaling delay between 75% and 125% to mitigate thundering herds.
+  - **Retry-After Enforcement & Delay Caps:** Honors upstream provider `Retry-After` headers; when upstream delay exceeds `max_retry_after_secs`, skips candidate backoff sleep immediately to enable instant fallback.
+  - **Overall Shared Deadline:** Shared `overall_request_timeout_secs` budget enforces strict bounding across all attempts, retries, and sleep intervals; halts with `GatewayTimeout` (504).
+  - **Automatic Routing Failover & Selection Loop Prevention:** Automatic failover evaluates compatible fallback candidates based on task and modality; maintains `failed_model_ids` set to prevent circular reselection.
+  - **Manual Routing Invariant:** User-specified models in manual mode strictly forbid silent provider/model substitution. Transient failures retry the same model; persistent failures return a structured upstream error.
+  - **Streaming Reliability:** Distinguishes pre-stream failure (eligible for retry/failover) from mid-stream failure. Once SSE headers and chunks are sent to client, failover/restarts are strictly forbidden; terminal `event: error` and clean EOF are emitted.
+  - **Idempotency & Exactly-Once Usage Accounting:** Exactly one SQLite usage row recorded per request across all attempts and failovers. No duplicated provider executions when safety cannot be guaranteed.
+  - **Future Hardening Backlog Preserved:** Explicitly documents host-based bind security, retention cleanup reliability, and usage-recording failure observability for future hardening phases.
+  - **Verification:** 191 automated tests passing across 10 test suites (`tests/failover_reliability_test.rs` with 15 focused tests); `cargo fmt --check` clean; `cargo check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ---
 
@@ -64,8 +76,8 @@
 | **7** | **Intelligent Model Router** | **COMPLETE** | Phase 6 | Multi-criteria scoring policy engine, auto/manual routing, fallback ordering | All tests pass (121 tests), live HTTP verification | Approved by User |
 | **7B**| **Real Inference & Gap Repairs** | **COMPLETE** | Phase 7 | Chat completions, SSE stream, HTTP adapter, router dispatch, bounded failover, auth, req IDs | All tests pass (138 tests), clippy clean | Verified |
 | **8** | **Quota & Usage Tracking** | **COMPLETE** | Phase 7B | Persistent SQLite store, token accounting, quota awareness, read-only analytics APIs | 170 tests pass, clippy clean, zero warnings | Verified Complete |
-| **9** | **Failover & Reliability** | **STRICTLY ON HOLD** | Phase 8 | Bounded retries, exponential backoff, circuit breakers | Simulated provider outage tests | Pending Approval |
-| **10** | **Token Optimization** | **NOT STARTED** | Phase 9 | Context window pruning, token estimation, length limits | Token usage benchmark tests | Pending Approval |
+| **9** | **Failover & Reliability** | **COMPLETE** | Phase 8 | Bounded retries, exponential backoff, loop prevention, manual routing invariant, pre vs mid-stream handling | 191 tests pass, clippy clean, zero warnings | Verified Complete |
+| **10** | **Token Optimization** | **STRICTLY ON HOLD** | Phase 9 | Context window pruning, token estimation, length limits | Token usage benchmark tests | Pending Approval |
 | **11** | **Authentication** | **NOT STARTED** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | Auth token verification tests | Pending Approval |
 | **12** | **Authorization & Secret Management** | **NOT STARTED** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Pending Approval |
 | **13** | **Abuse Prevention** | **NOT STARTED** | Phase 12 | Inbound body size limits, rate limiting, connection timeouts | Fuzzing & request flood tests | Pending Approval |
@@ -81,7 +93,7 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Phase 8 Verified Complete:** Persistent usage accounting, exact integer token recording, rate-limit awareness with conservative router integration, SQLite persistence, retention cleanup, external bind protection, and read-only endpoints verified across 170 automated tests with zero Clippy warnings.
-2. **Phase 9 Prepared & Ready (STRICTLY ON HOLD):** Phase 9 (Failover & Reliability) is ready to begin upon user authorization. No Phase 9 code has been implemented.
-3. **Phase Boundary Enforcement:** No speculative quota prediction, distributed coordination, or automatic key rotation introduced.
+1. **Phase 9 Verified Complete:** Bounded retry policy, candidate retry limits, exponential backoff with jitter, Retry-After bounds, automatic failover with loop prevention, strict manual model selection preservation, pre-stream vs mid-stream error handling, and exactly-once usage recording verified across 191 automated tests with zero Clippy warnings.
+2. **Phase 10 Strictly On Hold:** Phase 10 (Token Optimization) and all subsequent phases remain strictly on hold pending explicit user instruction. No Phase 10 code has been implemented.
+3. **Hardening Backlog Retained:** Host-based bind security, retention cleanup reliability, and usage-recording failure observability are documented in `ARCHITECTURE.md` §8 as future hardening priorities.
 

@@ -24,6 +24,9 @@ pub struct MockProviderAdapter {
     pub is_healthy: bool,
     pub custom_usage: Option<Option<UsageMetadata>>,
     pub custom_stream_usage: Option<Option<UsageMetadata>>,
+    pub call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub failures_remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub transient_mode: bool,
 }
 
 impl MockProviderAdapter {
@@ -74,6 +77,9 @@ impl MockProviderAdapter {
             is_healthy: true,
             custom_usage: None,
             custom_stream_usage: None,
+            call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            failures_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            transient_mode: false,
         }
     }
 
@@ -137,6 +143,20 @@ impl MockProviderAdapter {
         self.custom_stream_usage = Some(usage);
         self
     }
+
+    /// Configure transient failure count before succeeding.
+    pub fn with_transient_failures(mut self, count: usize, err: ProviderError) -> Self {
+        self.failures_remaining
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self.should_fail_with = Some(err);
+        self.transient_mode = true;
+        self
+    }
+
+    /// Return total invocation attempts observed by this mock.
+    pub fn call_count(&self) -> usize {
+        self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl ProviderAdapter for MockProviderAdapter {
@@ -159,6 +179,9 @@ impl ProviderAdapter for MockProviderAdapter {
 
     fn complete<'a>(&'a self, req: &'a CompletionRequest) -> BoxedCompletionFuture<'a> {
         Box::pin(async move {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
             // 1. Check timeout / delay simulation
             if let Some(delay) = self.simulated_delay {
                 if delay > req.timeout {
@@ -169,7 +192,22 @@ impl ProviderAdapter for MockProviderAdapter {
             }
 
             // 2. Simulated failure check
-            if let Some(ref err) = self.should_fail_with {
+            let should_fail = if self.transient_mode {
+                let remaining = self
+                    .failures_remaining
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if remaining > 0 {
+                    self.failures_remaining
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    self.should_fail_with.clone()
+                } else {
+                    None
+                }
+            } else {
+                self.should_fail_with.clone()
+            };
+
+            if let Some(ref err) = should_fail {
                 return Err(err.clone());
             }
 
@@ -200,6 +238,9 @@ impl ProviderAdapter for MockProviderAdapter {
 
     fn stream<'a>(&'a self, req: &'a CompletionRequest) -> BoxedStreamFuture<'a> {
         Box::pin(async move {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
             // 1. Check timeout / delay simulation
             if let Some(delay) = self.simulated_delay {
                 if delay > req.timeout {
@@ -210,7 +251,22 @@ impl ProviderAdapter for MockProviderAdapter {
             }
 
             // 2. Simulated failure check
-            if let Some(ref err) = self.should_fail_with {
+            let should_fail = if self.transient_mode {
+                let remaining = self
+                    .failures_remaining
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if remaining > 0 {
+                    self.failures_remaining
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    self.should_fail_with.clone()
+                } else {
+                    None
+                }
+            } else {
+                self.should_fail_with.clone()
+            };
+
+            if let Some(ref err) = should_fail {
                 return Err(err.clone());
             }
 

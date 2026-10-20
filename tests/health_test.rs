@@ -160,6 +160,12 @@ fn test_valid_configuration_accepted() {
         gemini_api_key: None,
         database_path: "data/usage.db".to_string(),
         usage_retention_days: None,
+        max_retries: 1,
+        max_failover_candidates: 3,
+        initial_backoff_ms: 50,
+        max_backoff_ms: 1000,
+        max_retry_after_secs: 5,
+        overall_request_timeout_secs: 30,
     };
     assert!(config.validate().is_ok());
 }

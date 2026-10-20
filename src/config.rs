@@ -107,6 +107,18 @@ pub struct AppConfig {
     pub database_path: String,
     /// Usage history retention window in days (loaded from USAGE_RETENTION_DAYS).
     pub usage_retention_days: Option<u64>,
+    /// Maximum retries per candidate for transient errors (loaded from MAX_RETRIES).
+    pub max_retries: u32,
+    /// Maximum candidate failover targets to attempt in auto mode (loaded from MAX_FAILOVER_CANDIDATES).
+    pub max_failover_candidates: usize,
+    /// Initial retry backoff in milliseconds (loaded from INITIAL_BACKOFF_MS).
+    pub initial_backoff_ms: u64,
+    /// Maximum backoff ceiling in milliseconds (loaded from MAX_BACKOFF_MS).
+    pub max_backoff_ms: u64,
+    /// Maximum accepted upstream Retry-After delay in seconds (loaded from MAX_RETRY_AFTER_SECS).
+    pub max_retry_after_secs: u64,
+    /// Overall request processing deadline in seconds (loaded from OVERALL_REQUEST_TIMEOUT_SECS).
+    pub overall_request_timeout_secs: u64,
 }
 
 impl AppConfig {
@@ -127,6 +139,12 @@ impl AppConfig {
             api_key: None,
             database_path: "data/usage.db".to_string(),
             usage_retention_days: None,
+            max_retries: 1,
+            max_failover_candidates: 3,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 1000,
+            max_retry_after_secs: 5,
+            overall_request_timeout_secs: 30,
         }
     }
 
@@ -283,8 +301,51 @@ impl AppConfig {
             config.usage_retention_days = Some(days);
         }
 
+        if let Some(r) = get_var("MAX_RETRIES").and_then(|r| r.trim().parse::<u32>().ok()) {
+            config.max_retries = r;
+        }
+
+        if let Some(c) =
+            get_var("MAX_FAILOVER_CANDIDATES").and_then(|r| r.trim().parse::<usize>().ok())
+        {
+            config.max_failover_candidates = c;
+        }
+
+        if let Some(ms) = get_var("INITIAL_BACKOFF_MS").and_then(|r| r.trim().parse::<u64>().ok()) {
+            config.initial_backoff_ms = ms;
+        }
+
+        if let Some(ms) = get_var("MAX_BACKOFF_MS").and_then(|r| r.trim().parse::<u64>().ok()) {
+            config.max_backoff_ms = ms;
+        }
+
+        if let Some(secs) =
+            get_var("MAX_RETRY_AFTER_SECS").and_then(|r| r.trim().parse::<u64>().ok())
+        {
+            config.max_retry_after_secs = secs;
+        }
+
+        if let Some(secs) = get_var("OVERALL_REQUEST_TIMEOUT_SECS")
+            .or_else(|| get_var("REQUEST_TIMEOUT_SECS"))
+            .and_then(|r| r.trim().parse::<u64>().ok())
+        {
+            config.overall_request_timeout_secs = secs;
+        }
+
         config.validate()?;
         Ok(config)
+    }
+
+    /// Create RetryPolicy from current application configuration.
+    pub fn retry_policy(&self) -> crate::reliability::RetryPolicy {
+        crate::reliability::RetryPolicy {
+            max_retries_per_candidate: self.max_retries,
+            max_failover_candidates: self.max_failover_candidates,
+            initial_backoff_ms: self.initial_backoff_ms,
+            max_backoff_ms: self.max_backoff_ms,
+            max_retry_after_secs: self.max_retry_after_secs,
+            overall_request_timeout_secs: self.overall_request_timeout_secs,
+        }
     }
 
     /// Check if API authentication is required on protected routes.
@@ -375,6 +436,54 @@ impl AppConfig {
             });
         }
 
+        if self.max_retries > 5 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAX_RETRIES",
+                value: self.max_retries.to_string(),
+                reason: "MAX_RETRIES must not exceed 5",
+            });
+        }
+
+        if self.max_failover_candidates == 0 || self.max_failover_candidates > 10 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAX_FAILOVER_CANDIDATES",
+                value: self.max_failover_candidates.to_string(),
+                reason: "MAX_FAILOVER_CANDIDATES must be between 1 and 10",
+            });
+        }
+
+        if self.initial_backoff_ms == 0 || self.initial_backoff_ms > 5000 {
+            return Err(ConfigError::InvalidValue {
+                key: "INITIAL_BACKOFF_MS",
+                value: self.initial_backoff_ms.to_string(),
+                reason: "INITIAL_BACKOFF_MS must be between 1 and 5000 ms",
+            });
+        }
+
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(ConfigError::InvalidValue {
+                key: "MAX_BACKOFF_MS",
+                value: self.max_backoff_ms.to_string(),
+                reason: "MAX_BACKOFF_MS must be greater than or equal to INITIAL_BACKOFF_MS",
+            });
+        }
+
+        if self.max_retry_after_secs == 0 || self.max_retry_after_secs > 60 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAX_RETRY_AFTER_SECS",
+                value: self.max_retry_after_secs.to_string(),
+                reason: "MAX_RETRY_AFTER_SECS must be between 1 and 60 seconds",
+            });
+        }
+
+        if self.overall_request_timeout_secs == 0 || self.overall_request_timeout_secs > 120 {
+            return Err(ConfigError::InvalidValue {
+                key: "OVERALL_REQUEST_TIMEOUT_SECS",
+                value: self.overall_request_timeout_secs.to_string(),
+                reason: "OVERALL_REQUEST_TIMEOUT_SECS must be between 1 and 120 seconds",
+            });
+        }
+
         Ok(())
     }
 }
@@ -406,6 +515,15 @@ impl fmt::Debug for AppConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("database_path", &self.database_path)
             .field("usage_retention_days", &self.usage_retention_days)
+            .field("max_retries", &self.max_retries)
+            .field("max_failover_candidates", &self.max_failover_candidates)
+            .field("initial_backoff_ms", &self.initial_backoff_ms)
+            .field("max_backoff_ms", &self.max_backoff_ms)
+            .field("max_retry_after_secs", &self.max_retry_after_secs)
+            .field(
+                "overall_request_timeout_secs",
+                &self.overall_request_timeout_secs,
+            )
             .finish()
     }
 }

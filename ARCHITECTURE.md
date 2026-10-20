@@ -304,3 +304,95 @@ Protected versioned analytics endpoints returning bounded aggregations:
 - **Server Bind Protection:** When the server binds to a non-loopback address (e.g. `0.0.0.0`), operational endpoints strictly require authentication, preventing exposure over external networks without an API key. Local loopback development (`127.0.0.1`, `localhost`) permits dev access without keys.
 - **Zero-Secret Guarantee:** Endpoints never persist, log, or return API keys, prompts, or completions.
 
+---
+
+## 7. Phase 9: Failover & Reliability Architecture
+
+### 7.1 Architecture & Pipeline Flow
+Phase 9 integrates a bounded, configurable resilience engine within `InferenceService` and `src/reliability/`:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant GW as Axum Gateway / chat.rs
+    participant Inf as InferenceService
+    participant Pol as RetryPolicy
+    participant Router as ModelRouter
+    participant Adapter as ProviderAdapter
+    participant Usage as UsageStorage (SQLite)
+
+    Client->>GW: POST /api/v1/chat/completions or /stream
+    GW->>Inf: execute_completion() / execute_stream()
+    Inf->>Router: resolve_candidates() [Auto: ranked list; Manual: strict [primary]]
+    Note over Inf: Set shared overall deadline (overall_request_timeout_secs)
+    loop Candidate Selection (max_failover_candidates)
+        Note over Inf: Check candidate not in failed_model_ids
+        loop Candidate Retry Loop (max_retries_per_candidate)
+            Note over Inf: Enforce remaining deadline: min(upstream_timeout, deadline - now)
+            Inf->>Adapter: complete() or stream()
+            alt Success
+                Adapter-->>Inf: CompletionResponse / ProviderStream
+                Inf-->>GW: Return response / stream to client
+            else Non-Retryable Error (400, 401, 403, 404, 422, disabled)
+                Adapter-->>Inf: ProviderError
+                Note over Inf: Short-circuit immediately: NO RETRY, NO FAILOVER
+                Inf-->>GW: AppError
+            else Transient Error (500, 502, 503, 504, 408, 429, Timeout, Network)
+                Adapter-->>Inf: ProviderError
+                Inf->>Pol: calculate_backoff(attempt, retry_after)
+                alt Delay > max_retry_after_secs or deadline exceeded
+                    Note over Inf: Break candidate retry loop immediately (avoid excessive sleep)
+                else Valid Delay
+                    Note over Inf: Sleep with exponential backoff & jitter
+                end
+            end
+        end
+        Note over Inf: Add candidate to failed_model_ids (loop prevention)
+        Note over Inf: In manual mode: fail immediately (never switch models)
+    end
+    Note over Inf: Record final request outcome exactly once
+    Inf-->>Usage: record_request() (exactly 1 row)
+    Inf-->>GW: Final Success or Structured AppError
+```
+
+### 7.2 Decision Rules & Invariants
+1. **Transient vs Non-Retryable Error Taxonomy:**
+   - **Transient (Retry Eligible):** `ProviderError::Timeout`, `ProviderError::NetworkFailure`, `ProviderError::RateLimited`, and `ProviderError::UpstreamError` with HTTP status 408, 429, 500, 502, 503, 504.
+   - **Non-Retryable (Immediate Short-Circuit):** `ProviderError::AuthenticationFailed`, `ProviderError::InvalidRequest`, `ProviderError::ModelNotFound`, `ProviderError::CapabilityMismatch`, `ProviderError::ProviderDisabled`, `ProviderError::ProviderNotFound`, and HTTP status codes 400–404, 422.
+2. **Exponential Backoff with Jitter:**
+   - Backoff delay formula: $t = \min(\text{initial\_backoff} \times 2^{\text{attempt}-1}, \text{max\_backoff})$.
+   - Deterministic pseudo-random jitter scales delay between 75% and 125% based on system monotonic nanoseconds, preventing thundering herds.
+3. **Retry-After Enforcement:**
+   - When upstream returns a `Retry-After` delay, the engine respects the specified duration.
+   - If `retry_after > max_retry_after_secs`, the policy yields `Duration::MAX`. The execution loop abandons that candidate immediately rather than blocking worker threads, enabling instant failover to secondary providers.
+4. **Shared Request Deadline:**
+   - All attempts, retries, and sleep delays share the overarching `overall_request_timeout_secs` deadline.
+   - Each attempt computes `attempt_timeout = min(upstream_timeout_secs, remaining_deadline)`. If the deadline expires, the engine aborts with `GatewayTimeout` (504).
+5. **Selection Loop Prevention:**
+   - `failed_model_ids` hash set tracks all models that exhausted attempts or failed with candidate-terminal errors during the request.
+   - Exhausted candidates are never reselected during alternative candidate iteration.
+6. **Manual Routing Invariant:**
+   - In `manual` routing mode, `resolve_candidates` returns strictly `vec![requested_model]`.
+   - The engine allows bounded retries of the *same* requested model if transient, but **never** substitutes or falls back to an alternative model/provider.
+7. **Streaming Reliability (Pre-Stream vs Mid-Stream):**
+   - **Pre-Stream:** Upstream connection errors before headers or chunks are delivered allow bounded retries and automatic failover.
+   - **Mid-Stream:** Once HTTP headers and the initial SSE `event: routing` or chunk are sent, failover and restarts are strictly disallowed. An upstream disconnection emits a structured `event: error` and clean `event: done` EOF, preserving stream integrity and avoiding duplicate billing or garbled output.
+8. **Exactly-Once Usage Finalization:**
+   - Request usage recording occurs exactly once across all attempts, retries, and failovers. The single recorded row captures the final outcome (`Success`, `ProviderError`, `Timeout`, `StreamInterrupted`, `ClientCancelled`).
+
+---
+
+## 8. Future Hardening Backlog
+
+As identified during the Phase 8 and Phase 9 baseline audits, the following architectural enhancements remain preserved for future hardening phases:
+
+1. **Host-Based Bind Security Hardening:**
+   - *Status:* Baseline loopback vs non-loopback authentication enforcement is in place.
+   - *Backlog Scope:* Support explicit reverse-proxy IP allowlisting (`CIDR` ranges) and mutual TLS (mTLS) for enterprise cluster ingress.
+2. **Retention Cleanup Reliability & Observability:**
+   - *Status:* Baseline startup and explicit pruning via `UsageService::prune_retention` are implemented.
+   - *Backlog Scope:* Dedicated cron-driven background sweeper task with dead-letter and vacuum metrics for high-volume SQLite instances.
+3. **Usage-Recording Failure Observability:**
+   - *Status:* Failures to persist usage log structured warnings without interrupting client AI traffic.
+   - *Backlog Scope:* Out-of-band persistent retry queue / disk-buffered ring buffer to guarantee zero telemetry loss during transient disk saturation.
+
