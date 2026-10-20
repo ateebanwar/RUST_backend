@@ -50,15 +50,15 @@
 - [x] **Phase 9 — Failover & Reliability (COMPLETE):**
   - **Bounded Retry Policy:** Configurable `RetryPolicy` via environment variables (`MAX_RETRIES`, `MAX_FAILOVER_CANDIDATES`, `INITIAL_BACKOFF_MS`, `MAX_BACKOFF_MS`, `MAX_RETRY_AFTER_SECS`, `OVERALL_REQUEST_TIMEOUT_SECS`).
   - **Error Taxonomy & Immediate Short-Circuiting:** Retries transient failures only (timeouts, network resets, HTTP 408, 429, 500, 502, 503, 504). Zero retries on non-retryable errors (HTTP 400, 401, 403, 404, 422, capability mismatches, disabled providers).
-  - **Exponential Backoff with Jitter:** Deterministic monotonic nanosecond jitter scaling delay between 75% and 125% to mitigate thundering herds.
-  - **Retry-After Enforcement & Delay Caps:** Honors upstream provider `Retry-After` headers; when upstream delay exceeds `max_retry_after_secs`, skips candidate backoff sleep immediately to enable instant fallback.
+  - **Exponential Backoff with SplitMix64 Atomic Monotonic Jitter:** Non-locking pseudo-random jitter combining an atomic sequence counter (`AtomicU64`) with monotonic process clock nanoseconds (`LazyLock<Instant>`) via SplitMix64 mixing, scaling delay strictly between 75% and 125% with zero lock contention.
+  - **Retry-After Enforcement (delay-seconds & HTTP-date):** RFC 9110 compliant parsing supporting both integer `delay-seconds` and RFC 7231 `HTTP-date` formats; past dates safely clamp to 0s wait, and delays exceeding `max_retry_after_secs` trigger immediate candidate abandonment without blocking worker threads.
   - **Overall Shared Deadline:** Shared `overall_request_timeout_secs` budget enforces strict bounding across all attempts, retries, and sleep intervals; halts with `GatewayTimeout` (504).
   - **Automatic Routing Failover & Selection Loop Prevention:** Automatic failover evaluates compatible fallback candidates based on task and modality; maintains `failed_model_ids` set to prevent circular reselection.
   - **Manual Routing Invariant:** User-specified models in manual mode strictly forbid silent provider/model substitution. Transient failures retry the same model; persistent failures return a structured upstream error.
   - **Streaming Reliability:** Distinguishes pre-stream failure (eligible for retry/failover) from mid-stream failure. Once SSE headers and chunks are sent to client, failover/restarts are strictly forbidden; terminal `event: error` and clean EOF are emitted.
-  - **Idempotency & Exactly-Once Usage Accounting:** Exactly one SQLite usage row recorded per request across all attempts and failovers. No duplicated provider executions when safety cannot be guaranteed.
+  - **Idempotency & Reconciled Usage Accounting:** Exactly one SQLite usage row recorded per request across all attempts and failovers. Missing tokens remain strictly `None` (SQL `NULL`) with `UsageSource::Unavailable`, while `UsageSummary` records `unknown_usage_requests == 1` and aggregated known tokens as `0`.
   - **Future Hardening Backlog Preserved:** Explicitly documents host-based bind security, retention cleanup reliability, and usage-recording failure observability for future hardening phases.
-  - **Verification:** 191 automated tests passing across 10 test suites (`tests/failover_reliability_test.rs` with 15 focused tests); `cargo fmt --check` clean; `cargo check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean.
+  - **Verification:** 196 automated tests passing across 10 test suites (`tests/failover_reliability_test.rs` with 19 focused tests); `cargo fmt --check` clean; `cargo check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ---
 
@@ -76,7 +76,7 @@
 | **7** | **Intelligent Model Router** | **COMPLETE** | Phase 6 | Multi-criteria scoring policy engine, auto/manual routing, fallback ordering | All tests pass (121 tests), live HTTP verification | Approved by User |
 | **7B**| **Real Inference & Gap Repairs** | **COMPLETE** | Phase 7 | Chat completions, SSE stream, HTTP adapter, router dispatch, bounded failover, auth, req IDs | All tests pass (138 tests), clippy clean | Verified |
 | **8** | **Quota & Usage Tracking** | **COMPLETE** | Phase 7B | Persistent SQLite store, token accounting, quota awareness, read-only analytics APIs | 170 tests pass, clippy clean, zero warnings | Verified Complete |
-| **9** | **Failover & Reliability** | **COMPLETE** | Phase 8 | Bounded retries, exponential backoff, loop prevention, manual routing invariant, pre vs mid-stream handling | 191 tests pass, clippy clean, zero warnings | Verified Complete |
+| **9** | **Failover & Reliability** | **COMPLETE** | Phase 8 | Bounded retries, exponential backoff, loop prevention, manual routing invariant, pre vs mid-stream handling | 196 tests pass, clippy clean, zero warnings | Verified Complete |
 | **10** | **Token Optimization** | **STRICTLY ON HOLD** | Phase 9 | Context window pruning, token estimation, length limits | Token usage benchmark tests | Pending Approval |
 | **11** | **Authentication** | **NOT STARTED** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | Auth token verification tests | Pending Approval |
 | **12** | **Authorization & Secret Management** | **NOT STARTED** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Pending Approval |
@@ -93,7 +93,7 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Phase 9 Verified Complete:** Bounded retry policy, candidate retry limits, exponential backoff with jitter, Retry-After bounds, automatic failover with loop prevention, strict manual model selection preservation, pre-stream vs mid-stream error handling, and exactly-once usage recording verified across 191 automated tests with zero Clippy warnings.
+1. **Phase 9 Verified Complete & Formally Closed:** Bounded retry policy, candidate retry limits, SplitMix64 atomic monotonic backoff jitter, RFC 9110 HTTP-date and delay-seconds `Retry-After` parsing, automatic failover with loop prevention, strict manual model selection preservation, pre-stream vs mid-stream error handling, and reconciled missing usage accounting verified across 196 automated tests with zero Clippy warnings.
 2. **Phase 10 Strictly On Hold:** Phase 10 (Token Optimization) and all subsequent phases remain strictly on hold pending explicit user instruction. No Phase 10 code has been implemented.
 3. **Hardening Backlog Retained:** Host-based bind security, retention cleanup reliability, and usage-recording failure observability are documented in `ARCHITECTURE.md` §8 as future hardening priorities.
 

@@ -21,7 +21,7 @@ use ai_backend::providers::{
 };
 use ai_backend::registry::ModelRegistry;
 use ai_backend::router::ModelRouter;
-use ai_backend::usage::UsageQueryFilter;
+use ai_backend::usage::{UsageQueryFilter, UsageSource};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1272,11 +1272,23 @@ async fn test_all_candidates_exhausted_returns_canonical_error_envelope_and_usag
         .unwrap();
     assert_eq!(summary.total_requests, 1);
     assert_eq!(summary.successful_requests, 0);
-    assert_eq!(summary.total_tokens, 0); // No fabricated tokens
-    assert_eq!(
-        summary.by_outcome.get("provider_error").copied(),
-        Some(1)
-    );
+    assert_eq!(summary.total_tokens, 0); // Aggregated sum of known tokens is 0
+    assert_eq!(summary.known_usage_requests, 0);
+    assert_eq!(summary.unknown_usage_requests, 1);
+    assert_eq!(summary.by_outcome.get("provider_error").copied(), Some(1));
+
+    // Verify stored SQLite row: prompt/completion/total tokens are strictly None (SQL NULL),
+    // and usage_source is UsageSource::Unavailable rather than fabricated 0
+    let records = state
+        .usage
+        .get_records(UsageQueryFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].prompt_tokens, None);
+    assert_eq!(records[0].completion_tokens, None);
+    assert_eq!(records[0].total_tokens, None);
+    assert_eq!(records[0].usage_source, UsageSource::Unavailable);
 }
 
 #[tokio::test]
@@ -1381,6 +1393,116 @@ async fn test_retry_after_header_propagation_from_raw_http_wire() {
 }
 
 #[tokio::test]
+async fn test_retry_after_http_date_propagation_from_raw_http_wire() {
+    let mut config_raw = AppConfig::default_local();
+    config_raw.max_retries = 2;
+    config_raw.max_retry_after_secs = 2; // Maximum acceptable delay is 2 seconds
+    let config = Arc::new(config_raw);
+
+    // Compute future HTTP-date (1 hour into future)
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let future_date_str = ai_backend::reliability::format_http_date(now_epoch + 3600);
+
+    // Primary mock HTTP server returns 429 with Retry-After as RFC 9110 HTTP-date
+    let future_date_static: &'static str = Box::leak(future_date_str.into_boxed_str());
+    let (primary_url, _h1) = spawn_mock_openai_upstream(move |_, _| {
+        let err_body = json!({
+            "error": { "message": "Rate limited until future timestamp." }
+        });
+        (
+            429,
+            vec![
+                ("Content-Type", "application/json"),
+                ("Retry-After", future_date_static),
+            ],
+            serde_json::to_vec(&err_body).unwrap(),
+        )
+    })
+    .await;
+
+    // Fallback mock HTTP server returns 200 OK
+    let (fallback_url, _h2) = spawn_mock_openai_upstream(|_, _| {
+        let succ_body = json!({
+            "id": "chatcmpl_fallback_http_date",
+            "model": "deep-reasoner-v1",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "HTTP-date fallback response" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 18, "total_tokens": 30 }
+        });
+        (
+            200,
+            vec![("Content-Type", "application/json")],
+            serde_json::to_vec(&succ_body).unwrap(),
+        )
+    })
+    .await;
+
+    let (registry, m1, m2) = create_two_model_registry();
+    let providers = Arc::new(ProviderRegistry::new());
+
+    let primary_adapter = Arc::new(
+        OpenAiCompatibleAdapter::new(
+            "groq-api",
+            "Groq Upstream",
+            &primary_url,
+            Some("key1".to_string()),
+        )
+        .with_models(vec![m1]),
+    );
+    providers.register(primary_adapter).unwrap();
+
+    let fallback_adapter = Arc::new(
+        OpenAiCompatibleAdapter::new(
+            "openrouter-api",
+            "OpenRouter Upstream",
+            &fallback_url,
+            Some("key2".to_string()),
+        )
+        .with_models(vec![m2]),
+    );
+    providers.register(fallback_adapter).unwrap();
+
+    let router = Arc::new(ModelRouter::new(registry.clone()));
+    let state = AppState::with_all_components(config, registry, providers, router);
+
+    let (base_url, _server) = spawn_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(format!("{}/api/v1/chat/completions", base_url))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "Test wire HTTP-date retry-after" }],
+            "routing_mode": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let elapsed = start.elapsed();
+    // Must complete in under 2 seconds: candidate loop must parse HTTP-date, recognize it exceeds 2s cap,
+    // and fail over immediately without waiting for 3600 seconds!
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Request waited excessively: {:?}",
+        elapsed
+    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["provider_used"], "openrouter-api");
+    assert_eq!(body["is_fallback"], true);
+    assert_eq!(body["message"]["content"], "HTTP-date fallback response");
+    assert_eq!(body["usage"]["total_tokens"], 30);
+}
+
+#[tokio::test]
 async fn test_overall_deadline_shared_across_failover_candidates() {
     let mut config_raw = AppConfig::default_local();
     config_raw.max_retries = 1;
@@ -1440,4 +1562,3 @@ async fn test_overall_deadline_shared_across_failover_candidates() {
             || resp.status() == reqwest::StatusCode::BAD_GATEWAY
     );
 }
-

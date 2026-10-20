@@ -359,12 +359,15 @@ sequenceDiagram
 1. **Transient vs Non-Retryable Error Taxonomy:**
    - **Transient (Retry Eligible):** `ProviderError::Timeout`, `ProviderError::NetworkFailure`, `ProviderError::RateLimited`, and `ProviderError::UpstreamError` with HTTP status 408, 429, 500, 502, 503, 504.
    - **Non-Retryable (Immediate Short-Circuit):** `ProviderError::AuthenticationFailed`, `ProviderError::InvalidRequest`, `ProviderError::ModelNotFound`, `ProviderError::CapabilityMismatch`, `ProviderError::ProviderDisabled`, `ProviderError::ProviderNotFound`, and HTTP status codes 400–404, 422.
-2. **Exponential Backoff with Jitter:**
+2. **Exponential Backoff with Monotonic Non-Locking Jitter:**
    - Backoff delay formula: $t = \min(\text{initial\_backoff} \times 2^{\text{attempt}-1}, \text{max\_backoff})$.
-   - Deterministic pseudo-random jitter scales delay between 75% and 125% based on system monotonic nanoseconds, preventing thundering herds.
-3. **Retry-After Enforcement:**
-   - When upstream returns a `Retry-After` delay, the engine respects the specified duration.
+   - Non-locking pseudo-random jitter combines an atomic sequence counter (`AtomicU64` with Weyl constant `0x9E3779B97F4A7C15`) and monotonic clock nanoseconds (`LazyLock<Instant>`) via SplitMix64 mixing, scaling delay strictly between 75% and 125% with zero lock contention or external dependencies.
+   - For deterministic testability, `calculate_backoff_with_jitter` allows tests to specify explicit jitter percentages.
+3. **Retry-After Enforcement (delay-seconds & HTTP-date):**
+   - Implements RFC 9110 §10.2.3 compliant parsing supporting both integer `delay-seconds` (e.g. `120`) and RFC 7231 IMF-fixdate `HTTP-date` (e.g. `Sun, 06 Nov 2026 08:49:37 GMT`).
+   - Past dates safely clamp to 0 seconds wait without underflow.
    - If `retry_after > max_retry_after_secs`, the policy yields `Duration::MAX`. The execution loop abandons that candidate immediately rather than blocking worker threads, enabling instant failover to secondary providers.
+   - Malformed or invalid header values safely return `None` and fall back to standard bounded exponential backoff.
 4. **Shared Request Deadline:**
    - All attempts, retries, and sleep delays share the overarching `overall_request_timeout_secs` deadline.
    - Each attempt computes `attempt_timeout = min(upstream_timeout_secs, remaining_deadline)`. If the deadline expires, the engine aborts with `GatewayTimeout` (504).
@@ -379,6 +382,14 @@ sequenceDiagram
    - **Mid-Stream:** Once HTTP headers and the initial SSE `event: routing` or chunk are sent, failover and restarts are strictly disallowed. An upstream disconnection emits a structured `event: error` and clean `event: done` EOF, preserving stream integrity and avoiding duplicate billing or garbled output.
 8. **Exactly-Once Usage Finalization:**
    - Request usage recording occurs exactly once across all attempts, retries, and failovers. The single recorded row captures the final outcome (`Success`, `ProviderError`, `Timeout`, `StreamInterrupted`, `ClientCancelled`).
+
+### 7.3 Duplicate Execution, Idempotency, and Upstream Billing Risks
+- **Inherent Upstream Ambiguity:** While connection failures (`err.is_connect()`) guarantee that the upstream never received the request payload, upstream HTTP timeouts (`ProviderError::Timeout`) introduce unavoidable ambiguity: the provider's inference cluster may have accepted the request and commenced GPU token generation before the client-side attempt timeout expired.
+- **Provider Protocol Limitations:** Contemporary LLM inference endpoints (Groq, OpenRouter, OpenAI, Anthropic) lack a standardized, universally honored idempotency header contract for chat completions.
+- **Mitigation & Safety Invariants:**
+  1. *Strict Attempt Bounding:* Retries per candidate are strictly capped (`max_retries = 1` by default), preventing unbounded retry loops or bill multiplication.
+  2. *Zero Mid-Stream Duplication:* Once any SSE header or token delta is dispatched to the client, retries and failovers are completely prohibited. Mid-stream transport drops terminate with an error event, preventing duplicate token emissions or double-billing.
+  3. *Unavoidable Uncertainty:* Because remote AI providers do not support transactional rollback or cancellation receipts for started GPU inference batches, retrying an ambiguous timeout carries unavoidable financial risk at the upstream account layer. The platform minimizes this exposure by capping retries, enforcing overall deadlines, and leaving client-side retries to explicit user discretion.
 
 ---
 

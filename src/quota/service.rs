@@ -87,7 +87,7 @@ impl QuotaService {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
         {
-            obs.retry_after_secs = s.trim().parse::<u64>().ok();
+            obs.retry_after_secs = crate::reliability::parse_retry_after_header(s);
         }
 
         obs

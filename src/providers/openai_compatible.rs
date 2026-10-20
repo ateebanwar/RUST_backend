@@ -176,11 +176,12 @@ impl OpenAiCompatibleAdapter {
     }
 
     /// Extract safe retry_after seconds from HTTP response headers.
+    /// Supports both integer delay-seconds and standard RFC 7231 / RFC 9110 HTTP-date formats.
     fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         headers
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(crate::reliability::parse_retry_after_header)
     }
 }
 
