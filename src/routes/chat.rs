@@ -1,11 +1,13 @@
 //! Chat completion and SSE streaming HTTP handlers.
 //!
-//! Conforms strictly to API_SPEC.md §5 and §6.
+//! Conforms strictly to API_SPEC.md §5 and §6, and Phase 8 Usage and Quota Tracking.
 
 use crate::errors::AppError;
 use crate::inference::ChatCompletionRequest;
-use crate::models::CompletionResponse;
+use crate::models::{CompletionResponse, UsageMetadata};
 use crate::providers::ProviderStream;
+use crate::usage::UsageService;
+use crate::usage::model::{RequestOutcome, RoutingMode};
 use crate::{AppState, RequestId};
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -15,7 +17,9 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::convert::Infallible;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Handler for POST /api/v1/chat/completions (Buffered synchronous completion)
 #[allow(clippy::result_large_err)]
@@ -24,19 +28,144 @@ pub async fn chat_completions(
     Extension(RequestId(req_id)): Extension<RequestId>,
     Json(mut payload): Json<ChatCompletionRequest>,
 ) -> Result<(StatusCode, Json<CompletionResponse>), Response> {
+    let start_instant = Instant::now();
+    let start_epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let routing_mode = if payload.routing_mode.eq_ignore_ascii_case("manual") {
+        RoutingMode::Manual
+    } else {
+        RoutingMode::Auto
+    };
+
     payload.stream = false;
-    let response = state
-        .inference
-        .execute_completion(&payload)
-        .await
-        .map_err(|err| err.to_response_with_id(&req_id))?;
-    Ok((StatusCode::OK, Json(response)))
+
+    // Resolve candidates first to identify resolved provider/model even if execution fails
+    let resolution_candidate = state.inference.resolve_candidates(&payload).ok();
+
+    match state.inference.execute_completion(&payload).await {
+        Ok(response) => {
+            state
+                .usage
+                .record_buffered(
+                    &req_id,
+                    &response.provider_used,
+                    &response.model_used,
+                    routing_mode,
+                    start_instant,
+                    start_epoch_ms,
+                    RequestOutcome::Success,
+                    None,
+                    response.usage.as_ref(),
+                )
+                .await;
+
+            Ok((StatusCode::OK, Json(response)))
+        }
+        Err(err) => {
+            let outcome = match &err {
+                AppError::GatewayTimeout(_) => RequestOutcome::Timeout,
+                AppError::RateLimited { .. } | AppError::UpstreamFailure(_) => {
+                    RequestOutcome::ProviderError
+                }
+                AppError::InvalidRequest(_)
+                | AppError::UnsupportedModality(_)
+                | AppError::NotFound(_) => RequestOutcome::PreDispatchFailure,
+                _ => RequestOutcome::ProviderError,
+            };
+
+            let (prov, mdl) = match &resolution_candidate {
+                Some(r) => (r.provider_id.as_str(), r.selected_model_id.as_str()),
+                None => (
+                    "unresolved",
+                    payload
+                        .requested_model_id
+                        .as_deref()
+                        .unwrap_or("unresolved"),
+                ),
+            };
+
+            state
+                .usage
+                .record_buffered(
+                    &req_id,
+                    prov,
+                    mdl,
+                    routing_mode,
+                    start_instant,
+                    start_epoch_ms,
+                    outcome,
+                    Some(err.error_code().to_string()),
+                    None,
+                )
+                .await;
+
+            Err(err.to_response_with_id(&req_id))
+        }
+    }
+}
+
+/// Drop guard ensuring that client disconnects or cancellations are finalized exactly once.
+struct StreamFinalizationGuard {
+    finalized: Arc<AtomicBool>,
+    usage_service: Arc<UsageService>,
+    request_id: String,
+    provider_id: String,
+    model_id: String,
+    routing_mode: RoutingMode,
+    start_instant: Instant,
+    start_epoch_ms: u64,
+    latest_usage: Arc<std::sync::Mutex<Option<UsageMetadata>>>,
+}
+
+impl Drop for StreamFinalizationGuard {
+    fn drop(&mut self) {
+        // If not already finalized by normal completion or upstream error,
+        // the client connection was aborted/cancelled prematurely.
+        if !self.finalized.swap(true, Ordering::SeqCst) {
+            let usage = self.latest_usage.lock().unwrap().clone();
+            let usage_svc = self.usage_service.clone();
+            let req_id = self.request_id.clone();
+            let prov = self.provider_id.clone();
+            let mdl = self.model_id.clone();
+            let r_mode = self.routing_mode;
+            let s_inst = self.start_instant;
+            let s_epoch = self.start_epoch_ms;
+
+            tokio::spawn(async move {
+                usage_svc
+                    .record_streaming(
+                        &req_id,
+                        &prov,
+                        &mdl,
+                        r_mode,
+                        s_inst,
+                        s_epoch,
+                        RequestOutcome::ClientCancelled,
+                        Some("client_disconnected".to_string()),
+                        usage.as_ref(),
+                    )
+                    .await;
+            });
+        }
+    }
 }
 
 enum SseStreamState {
-    SendRouting(Event, ProviderStream),
-    Streaming(ProviderStream),
-    Terminated,
+    SendRouting {
+        routing_ev: Event,
+        inner: ProviderStream,
+        guard: Arc<StreamFinalizationGuard>,
+    },
+    Streaming {
+        inner: ProviderStream,
+        guard: Arc<StreamFinalizationGuard>,
+    },
+    Terminated {
+        _guard: Arc<StreamFinalizationGuard>,
+    },
 }
 
 /// Handler for POST /api/v1/chat/stream (Server-Sent Events streaming completion)
@@ -46,12 +175,57 @@ pub async fn chat_stream(
     Extension(RequestId(req_id)): Extension<RequestId>,
     Json(mut payload): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, Response> {
+    let start_instant = Instant::now();
+    let start_epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let routing_mode = if payload.routing_mode.eq_ignore_ascii_case("manual") {
+        RoutingMode::Manual
+    } else {
+        RoutingMode::Auto
+    };
+
     payload.stream = true;
-    let stream_res = state
-        .inference
-        .execute_stream(&payload)
-        .await
-        .map_err(|err| err.to_response_with_id(&req_id))?;
+
+    let stream_res = match state.inference.execute_stream(&payload).await {
+        Ok(res) => res,
+        Err(err) => {
+            let outcome = match &err {
+                AppError::GatewayTimeout(_) => RequestOutcome::Timeout,
+                AppError::RateLimited { .. } | AppError::UpstreamFailure(_) => {
+                    RequestOutcome::ProviderError
+                }
+                AppError::InvalidRequest(_)
+                | AppError::UnsupportedModality(_)
+                | AppError::NotFound(_) => RequestOutcome::PreDispatchFailure,
+                _ => RequestOutcome::ProviderError,
+            };
+
+            let fallback_model = payload
+                .requested_model_id
+                .clone()
+                .unwrap_or_else(|| "unresolved".to_string());
+
+            state
+                .usage
+                .record_streaming(
+                    &req_id,
+                    "unresolved",
+                    &fallback_model,
+                    routing_mode,
+                    start_instant,
+                    start_epoch_ms,
+                    outcome,
+                    Some(err.error_code().to_string()),
+                    None,
+                )
+                .await;
+
+            return Err(err.to_response_with_id(&req_id));
+        }
+    };
 
     let model_used = stream_res.resolution.selected_model_id.clone();
     let provider_used = stream_res.resolution.provider_id.clone();
@@ -68,29 +242,107 @@ pub async fn chat_stream(
         .to_string(),
     );
 
-    let initial_state = SseStreamState::SendRouting(routing_event, stream_res.stream);
+    let guard = Arc::new(StreamFinalizationGuard {
+        finalized: Arc::new(AtomicBool::new(false)),
+        usage_service: state.usage.clone(),
+        request_id: req_id,
+        provider_id: provider_used,
+        model_id: model_used,
+        routing_mode,
+        start_instant,
+        start_epoch_ms,
+        latest_usage: Arc::new(std::sync::Mutex::new(None)),
+    });
+
+    let initial_state = SseStreamState::SendRouting {
+        routing_ev: routing_event,
+        inner: stream_res.stream,
+        guard,
+    };
 
     let sse_stream = futures_util::stream::unfold(initial_state, |state| async move {
         match state {
-            SseStreamState::SendRouting(routing_ev, inner) => Some((
+            SseStreamState::SendRouting {
+                routing_ev,
+                inner,
+                guard,
+            } => Some((
                 Ok::<Event, Infallible>(routing_ev),
-                SseStreamState::Streaming(inner),
+                SseStreamState::Streaming { inner, guard },
             )),
-            SseStreamState::Streaming(mut inner) => match inner.next().await {
+            SseStreamState::Streaming { mut inner, guard } => match inner.next().await {
                 Some(Ok(chunk)) => {
+                    if let Some(u) = chunk.usage {
+                        *guard.latest_usage.lock().unwrap() = Some(u);
+                    }
+
                     if chunk.is_done {
+                        if !guard.finalized.swap(true, Ordering::SeqCst) {
+                            let usage = guard.latest_usage.lock().unwrap().clone();
+                            let usage_svc = guard.usage_service.clone();
+                            let req_id = guard.request_id.clone();
+                            let prov = guard.provider_id.clone();
+                            let mdl = guard.model_id.clone();
+                            let r_mode = guard.routing_mode;
+                            let s_inst = guard.start_instant;
+                            let s_epoch = guard.start_epoch_ms;
+
+                            tokio::spawn(async move {
+                                usage_svc
+                                    .record_streaming(
+                                        &req_id,
+                                        &prov,
+                                        &mdl,
+                                        r_mode,
+                                        s_inst,
+                                        s_epoch,
+                                        RequestOutcome::Success,
+                                        None,
+                                        usage.as_ref(),
+                                    )
+                                    .await;
+                            });
+                        }
+
                         let done_ev = Event::default()
                             .event("done")
                             .data(json!({ "status": "completed" }).to_string());
-                        Some((Ok(done_ev), SseStreamState::Terminated))
+                        Some((Ok(done_ev), SseStreamState::Terminated { _guard: guard }))
                     } else {
                         let chunk_ev = Event::default()
                             .event("chunk")
                             .data(json!({ "delta": chunk.delta }).to_string());
-                        Some((Ok(chunk_ev), SseStreamState::Streaming(inner)))
+                        Some((Ok(chunk_ev), SseStreamState::Streaming { inner, guard }))
                     }
                 }
                 Some(Err(err)) => {
+                    if !guard.finalized.swap(true, Ordering::SeqCst) {
+                        let usage = guard.latest_usage.lock().unwrap().clone();
+                        let usage_svc = guard.usage_service.clone();
+                        let req_id = guard.request_id.clone();
+                        let prov = guard.provider_id.clone();
+                        let mdl = guard.model_id.clone();
+                        let r_mode = guard.routing_mode;
+                        let s_inst = guard.start_instant;
+                        let s_epoch = guard.start_epoch_ms;
+
+                        tokio::spawn(async move {
+                            usage_svc
+                                .record_streaming(
+                                    &req_id,
+                                    &prov,
+                                    &mdl,
+                                    r_mode,
+                                    s_inst,
+                                    s_epoch,
+                                    RequestOutcome::StreamInterrupted,
+                                    Some("stream_interrupted".to_string()),
+                                    usage.as_ref(),
+                                )
+                                .await;
+                        });
+                    }
+
                     let err_app: AppError = err.into();
                     let error_ev = Event::default().event("error").data(
                         json!({
@@ -100,16 +352,43 @@ pub async fn chat_stream(
                         })
                         .to_string(),
                     );
-                    Some((Ok(error_ev), SseStreamState::Terminated))
+                    Some((Ok(error_ev), SseStreamState::Terminated { _guard: guard }))
                 }
                 None => {
+                    if !guard.finalized.swap(true, Ordering::SeqCst) {
+                        let usage = guard.latest_usage.lock().unwrap().clone();
+                        let usage_svc = guard.usage_service.clone();
+                        let req_id = guard.request_id.clone();
+                        let prov = guard.provider_id.clone();
+                        let mdl = guard.model_id.clone();
+                        let r_mode = guard.routing_mode;
+                        let s_inst = guard.start_instant;
+                        let s_epoch = guard.start_epoch_ms;
+
+                        tokio::spawn(async move {
+                            usage_svc
+                                .record_streaming(
+                                    &req_id,
+                                    &prov,
+                                    &mdl,
+                                    r_mode,
+                                    s_inst,
+                                    s_epoch,
+                                    RequestOutcome::Success,
+                                    None,
+                                    usage.as_ref(),
+                                )
+                                .await;
+                        });
+                    }
+
                     let done_ev = Event::default()
                         .event("done")
                         .data(json!({ "status": "completed" }).to_string());
-                    Some((Ok(done_ev), SseStreamState::Terminated))
+                    Some((Ok(done_ev), SseStreamState::Terminated { _guard: guard }))
                 }
             },
-            SseStreamState::Terminated => None,
+            SseStreamState::Terminated { .. } => None,
         }
     });
 

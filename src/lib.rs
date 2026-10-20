@@ -7,9 +7,11 @@ pub mod errors;
 pub mod inference;
 pub mod models;
 pub mod providers;
+pub mod quota;
 pub mod registry;
 pub mod router;
 pub mod routes;
+pub mod usage;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue};
@@ -22,12 +24,14 @@ pub use config::AppConfig;
 pub use errors::AppError;
 pub use inference::{ChatCompletionRequest, InferenceService};
 pub use providers::ProviderRegistry;
+pub use quota::{ProviderQuota, QuotaService};
 pub use registry::{ModelFilter, ModelRegistry, RegistryError};
 pub use router::{
     ClassificationResult, MAX_PROMPT_LENGTH, ModelRouter, RoutingPolicy, RoutingPreviewRequest,
     RoutingPreviewResponse, ScoredCandidate, TaskCategory, TaskClassifier, TaskComplexity,
     TaskModality,
 };
+pub use usage::{UsageRecord, UsageService, UsageStorage};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -43,6 +47,8 @@ pub struct AppState {
     pub providers: Arc<ProviderRegistry>,
     pub router: Arc<ModelRouter>,
     pub inference: Arc<InferenceService>,
+    pub usage: Arc<UsageService>,
+    pub quota: Arc<QuotaService>,
     pub start_time: std::time::Instant,
 }
 
@@ -50,6 +56,45 @@ impl AppState {
     pub fn new(config: Arc<AppConfig>) -> Self {
         let registry = Arc::new(ModelRegistry::new());
         let providers = Arc::new(ProviderRegistry::new());
+        let quota = Arc::new(QuotaService::new());
+
+        let usage_storage = match UsageStorage::new(&config.database_path) {
+            Ok(s) => Arc::new(s),
+            Err(err) => {
+                tracing::error!(
+                    path = %config.database_path,
+                    error = %err,
+                    "Failed to initialize SQLite usage storage at configured path, falling back to in-memory store"
+                );
+                Arc::new(
+                    UsageStorage::new(":memory:")
+                        .expect("Failed to initialize fallback in-memory SQLite storage"),
+                )
+            }
+        };
+        let usage = Arc::new(UsageService::new(usage_storage));
+
+        // Enforce usage retention cleanup on startup if explicitly configured
+        if let Some(retention_days) = config.usage_retention_days.filter(|&d| d > 0) {
+            match usage.prune_retention_sync(retention_days) {
+                Ok(pruned) => {
+                    if pruned > 0 {
+                        tracing::info!(
+                            retention_days,
+                            pruned_records = pruned,
+                            "Enforced usage retention policy on startup"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        retention_days,
+                        error = %err,
+                        "Failed to execute startup usage retention cleanup"
+                    );
+                }
+            }
+        }
 
         // Register Groq adapter if GROQ_API_KEY is configured
         if let Some(groq_key) = &config.groq_api_key {
@@ -62,14 +107,20 @@ impl AppState {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "openai/gpt-oss-20b".to_string());
 
+            let groq_base_url = config
+                .groq_base_url
+                .as_deref()
+                .unwrap_or("https://api.groq.com/openai/v1");
+
             let groq_adapter = Arc::new(
                 providers::OpenAiCompatibleAdapter::new(
                     "groq-api",
                     "Groq Cloud Fast Inference",
-                    "https://api.groq.com/openai/v1",
+                    groq_base_url,
                     Some(groq_key.clone()),
                 )
                 .with_rate_limit_tier("free-tier-standard")
+                .with_quota_service(quota.clone())
                 .with_model_wire_map({
                     let mut map = std::collections::HashMap::new();
                     map.insert("fast-chat-v1".to_string(), groq_fast_model.clone());
@@ -107,6 +158,7 @@ impl AppState {
                     Some(or_key.clone()),
                 )
                 .with_rate_limit_tier("standard-tier")
+                .with_quota_service(quota.clone())
                 .with_model_wire_map({
                     let mut map = std::collections::HashMap::new();
                     map.insert(
@@ -120,12 +172,15 @@ impl AppState {
         }
 
         let router = Arc::new(ModelRouter::new(registry.clone()));
-        let inference = Arc::new(InferenceService::new(
-            config.clone(),
-            registry.clone(),
-            providers.clone(),
-            router.clone(),
-        ));
+        let inference = Arc::new(
+            InferenceService::new(
+                config.clone(),
+                registry.clone(),
+                providers.clone(),
+                router.clone(),
+            )
+            .with_quota_service(quota.clone()),
+        );
 
         Self {
             config,
@@ -133,6 +188,8 @@ impl AppState {
             providers,
             router,
             inference,
+            usage,
+            quota,
             start_time: std::time::Instant::now(),
         }
     }
@@ -143,18 +200,26 @@ impl AppState {
         router: Arc<ModelRouter>,
     ) -> Self {
         let providers = Arc::new(ProviderRegistry::new());
-        let inference = Arc::new(InferenceService::new(
-            config.clone(),
-            registry.clone(),
-            providers.clone(),
-            router.clone(),
-        ));
+        let quota = Arc::new(QuotaService::new());
+        let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
+        let usage = Arc::new(UsageService::new(storage));
+        let inference = Arc::new(
+            InferenceService::new(
+                config.clone(),
+                registry.clone(),
+                providers.clone(),
+                router.clone(),
+            )
+            .with_quota_service(quota.clone()),
+        );
         Self {
             config,
             registry,
             providers,
             router,
             inference,
+            usage,
+            quota,
             start_time: std::time::Instant::now(),
         }
     }
@@ -165,18 +230,55 @@ impl AppState {
         providers: Arc<ProviderRegistry>,
         router: Arc<ModelRouter>,
     ) -> Self {
-        let inference = Arc::new(InferenceService::new(
-            config.clone(),
-            registry.clone(),
-            providers.clone(),
-            router.clone(),
-        ));
+        let quota = Arc::new(QuotaService::new());
+        let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
+        let usage = Arc::new(UsageService::new(storage));
+        let inference = Arc::new(
+            InferenceService::new(
+                config.clone(),
+                registry.clone(),
+                providers.clone(),
+                router.clone(),
+            )
+            .with_quota_service(quota.clone()),
+        );
         Self {
             config,
             registry,
             providers,
             router,
             inference,
+            usage,
+            quota,
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    pub fn with_usage_and_quota(
+        config: Arc<AppConfig>,
+        registry: Arc<ModelRegistry>,
+        providers: Arc<ProviderRegistry>,
+        router: Arc<ModelRouter>,
+        usage: Arc<UsageService>,
+        quota: Arc<QuotaService>,
+    ) -> Self {
+        let inference = Arc::new(
+            InferenceService::new(
+                config.clone(),
+                registry.clone(),
+                providers.clone(),
+                router.clone(),
+            )
+            .with_quota_service(quota.clone()),
+        );
+        Self {
+            config,
+            registry,
+            providers,
+            router,
+            inference,
+            usage,
+            quota,
             start_time: std::time::Instant::now(),
         }
     }
@@ -224,23 +326,38 @@ async fn request_id_and_auth_middleware(
     // 2. Authentication enforcement (API_SPEC.md §1.1)
     let path = req.uri().path();
     let is_public_probe = path == "/api/v1/health" || path == "/api/v1/ready";
+    let is_operational_data = path.starts_with("/api/v1/usage") || path == "/api/v1/quotas";
 
-    if !is_public_probe && state.config.is_auth_required() {
-        let is_authorized = req
-            .headers()
-            .get("x-api-key")
-            .and_then(|hdr| hdr.to_str().ok())
-            .is_some_and(|key| state.config.validate_api_key(key.trim()))
-            || req
-                .headers()
-                .get("authorization")
+    // Operational endpoints on non-loopback bind address must always be authenticated
+    // to prevent exposing telemetry over an externally reachable unauthenticated server.
+    let operational_protection_required = is_operational_data && !state.config.is_loopback_host();
+
+    if !is_public_probe && (state.config.is_auth_required() || operational_protection_required) {
+        let is_authorized = if operational_protection_required && state.config.api_key.is_none() {
+            // When bound to an external address without an API key, operational data access is rejected.
+            false
+        } else {
+            req.headers()
+                .get("x-api-key")
                 .and_then(|hdr| hdr.to_str().ok())
-                .and_then(|val| val.trim().strip_prefix("Bearer "))
-                .is_some_and(|tok| state.config.validate_api_key(tok.trim()));
+                .is_some_and(|key| state.config.validate_api_key(key.trim()))
+                || req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|hdr| hdr.to_str().ok())
+                    .and_then(|val| val.trim().strip_prefix("Bearer "))
+                    .is_some_and(|tok| state.config.validate_api_key(tok.trim()))
+        };
 
         if !is_authorized {
-            let err =
-                AppError::Unauthorized("Missing or invalid authentication credentials".to_string());
+            let err = AppError::Unauthorized(
+                if operational_protection_required && state.config.api_key.is_none() {
+                    "Authentication required: operational telemetry is protected on external interfaces"
+                        .to_string()
+                } else {
+                    "Missing or invalid authentication credentials".to_string()
+                },
+            );
             return err.to_response_with_id(&request_id_str);
         }
     }

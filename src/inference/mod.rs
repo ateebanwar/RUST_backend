@@ -171,6 +171,7 @@ pub struct InferenceService {
     registry: Arc<ModelRegistry>,
     providers: Arc<ProviderRegistry>,
     router: Arc<ModelRouter>,
+    quota_service: Option<Arc<crate::quota::QuotaService>>,
 }
 
 impl InferenceService {
@@ -186,7 +187,14 @@ impl InferenceService {
             registry,
             providers,
             router,
+            quota_service: None,
         }
+    }
+
+    /// Builder method to attach a QuotaService for rate-limit-aware candidate prioritization.
+    pub fn with_quota_service(mut self, quota_service: Arc<crate::quota::QuotaService>) -> Self {
+        self.quota_service = Some(quota_service);
+        self
     }
 
     /// Access underlying providers registry.
@@ -219,7 +227,14 @@ impl InferenceService {
         let estimated_complexity = classification.complexity.as_str().to_string();
 
         if req.routing_mode.eq_ignore_ascii_case("manual") {
-            let preferred_id = req.requested_model_id.as_deref().unwrap();
+            let preferred_id = match req.requested_model_id.as_deref() {
+                Some(id) if !id.trim().is_empty() => id.trim(),
+                _ => {
+                    return Err(AppError::InvalidRequest(
+                        "requested_model_id is required when routing_mode is 'manual'".to_string(),
+                    ));
+                }
+            };
             let model = self.registry.get_model(preferred_id).ok_or_else(|| {
                 AppError::NotFound(format!("Model '{preferred_id}' not found in registry"))
             })?;
@@ -309,8 +324,7 @@ impl InferenceService {
                 )));
             }
 
-            let primary = &scored[0];
-            let ordered_candidates: Vec<CandidateExecutionTarget> = scored
+            let mut ordered_candidates: Vec<CandidateExecutionTarget> = scored
                 .iter()
                 .map(|sc| CandidateExecutionTarget {
                     model_id: sc.model_id.clone(),
@@ -319,12 +333,27 @@ impl InferenceService {
                 })
                 .collect();
 
+            // Conservative Quota Awareness: In automatic routing mode, deprioritize candidates
+            // that are currently confirmed to be rate-limited, without altering relative priority
+            // among non-rate-limited candidates.
+            if let Some(quota_svc) = &self.quota_service {
+                ordered_candidates.sort_by_key(|c| {
+                    if quota_svc.is_rate_limited(&c.provider_id, Some(&c.model_id)) {
+                        1
+                    } else {
+                        0
+                    }
+                });
+            }
+
+            let primary = &ordered_candidates[0];
+
             Ok(RoutingResolution {
                 selected_model_id: primary.model_id.clone(),
                 provider_id: primary.provider_id.clone(),
                 detected_task,
                 estimated_complexity,
-                selection_reason: primary.selection_reason.clone(),
+                selection_reason: primary.reason.clone(),
                 ordered_candidates,
             })
         }

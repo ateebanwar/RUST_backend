@@ -231,7 +231,7 @@ Under the **Zero-Cost Infrastructure Constraint**, no dedicated Redis or Postgre
 | **Chat History & Messages** | User Google Drive (`drive.appdata`) | Indefinite | Restored on demand; persistent across app uninstalls |
 | **Model Registry Metadata** | In-Memory Static + Background Refresh | Lifetime of container / microVM | Re-initialized from config in <1ms on cold start |
 | **Circuit Breaker State** | In-Memory Ephemeral per Instance | Lifetime of microVM instance | Resets on cold start; rapidly re-trips upon encountering upstream 5xx/429 |
-| **Usage Tracking** | In-Memory counters + Client-reflected stats | Ephemeral per instance | Reported in response metadata for client-side local caching |
+| **Usage Tracking** | Durable Local SQLite (`data/usage.db`) | Indefinite across restarts | Parameterized SQL, WAL mode, async via `spawn_blocking`, non-fatal error isolation |
 | **Active Connections / SSE** | Ephemeral TCP stream | Request lifetime | Strict 10s upstream timeouts prevent hanging microVMs |
 
 ---
@@ -244,3 +244,63 @@ Under the **Zero-Cost Infrastructure Constraint**, no dedicated Redis or Postgre
 | **Custom AI IDE** | REST + SSE | Personal Access Token / API Key | Multi-file Codebase Context, Inline Diff, Terminal |
 | **VS Code Extension** | REST + SSE | API Key / Local Loopback OAuth | Code Selection Context, Chat Assistant, Refactoring |
 | **CLI / External API** | REST JSON | API Key (`X-API-Key`) | Scripted Execution, Automated Testing |
+
+---
+
+## 6. Phase 8: Quota & Usage Tracking Architecture
+
+### 6.1 Data Flow and Telemetry Separation
+Phase 8 establishes a clean separation between **Local Usage Accounting** and **Provider Quota Observations**:
+- **Local Usage Accounting:** Records historical telemetry of completed and attempted requests in a durable SQLite database.
+- **Provider Quota Awareness:** Tracks real-time provider rate limits (`x-ratelimit-remaining-*`, `retry-after`) in an in-memory TTL-bounded service to inform model candidate prioritization without speculative guesswork.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant GW as Axum Gateway / chat.rs
+    participant Inf as InferenceService
+    participant Adapter as OpenAiCompatibleAdapter
+    participant Quota as QuotaService
+    participant Usage as UsageStorage (SQLite)
+
+    Client->>GW: POST /api/v1/chat/completions or /stream
+    GW->>Inf: execute_completion() / execute_stream()
+    Inf->>Quota: is_rate_limited(provider, model)
+    Note over Inf: Deprioritizes confirmed rate-limited candidates in auto mode
+    Inf->>Adapter: complete() / stream()
+    Adapter->>Quota: record_observation(headers) / record_rate_limited(429)
+    Adapter-->>GW: CompletionResponse / ProviderStream
+    Note over GW: Drop-Guard / AtomicBool ensures exactly-once finalization
+    GW-->>Usage: record_buffered() / record_streaming() via spawn_blocking
+    GW-->>Client: Response / SSE Stream
+```
+
+### 6.2 Token Representation & Missing Usage Semantics
+- Exact integers (`u64`) are used for token accounting (`prompt_tokens`, `completion_tokens`, `total_tokens`).
+- `UsageSource::Reported`: Provider supplied authoritative token counts. If `total_tokens` is omitted but prompt and completion exist, total is computed as `prompt + completion`.
+- `UsageSource::Unavailable`: Provider did not return usage or the stream was aborted prematurely. Missing usage is preserved as `None` (JSON `null`) and is never silently replaced with zero or fabricated estimates.
+
+### 6.3 Streaming Cancellation & Exactly-Once Finalization
+- Streaming requests utilize an atomic state transition (`AtomicBool::swap(true, Ordering::SeqCst)`) inside `StreamFinalizationGuard`.
+- Terminal branches (`chunk.is_done`, `ProviderError`, or stream drop on client disconnect) compete atomically. Exactly one record is written:
+  - Normal finish -> `RequestOutcome::Success`.
+  - Upstream transport failure -> `RequestOutcome::StreamInterrupted`.
+  - Client aborted HTTP socket -> `RequestOutcome::ClientCancelled`.
+
+### 6.4 SQLite Storage Engine, Retention, & Concurrency
+- Configured via `DATABASE_PATH` (default `"data/usage.db"`).
+- Retention enforcement via `USAGE_RETENTION_DAYS` (validated > 0; disabled by default to preserve all history). When configured, safe cleanup prunes expired records on startup and via `UsageService::prune_retention` off the Tokio worker path.
+- Versioned, idempotent migrations via `schema_migrations` table.
+- Multi-column indexed on `start_time`, `provider_id`, `model_id`, and `outcome`.
+- Offloaded from Tokio async runtime worker threads using `tokio::task::spawn_blocking`.
+- Database write errors log structured warnings and **never** fail client AI responses.
+
+### 6.5 Read-Only Inspection Endpoints & External Interface Security
+Protected versioned analytics endpoints returning bounded aggregations:
+- `GET /api/v1/usage/summary`: High-level totals, outcomes, request modes, latency averages, and token totals.
+- `GET /api/v1/usage/providers`: Aggregations grouped by provider.
+- `GET /api/v1/usage/models`: Aggregations grouped by model.
+- `GET /api/v1/quotas`: Active rate-limit observations with freshness and staleness flags.
+- **Server Bind Protection:** When the server binds to a non-loopback address (e.g. `0.0.0.0`), operational endpoints strictly require authentication, preventing exposure over external networks without an API key. Local loopback development (`127.0.0.1`, `localhost`) permits dev access without keys.
+- **Zero-Secret Guarantee:** Endpoints never persist, log, or return API keys, prompts, or completions.
+

@@ -2,8 +2,8 @@
 
 **Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
 **Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
-**Current Phase:** Phase 7 Complete | Phase 8 Ready for Review & Authorization  
-**Last Updated:** 2026-10-19
+**Current Phase:** Phase 8 Complete | Phase 9 Ready for Review & Authorization  
+**Last Updated:** 2026-10-20
 
 ---
 
@@ -35,7 +35,18 @@
   - **GAP-009 (Provider Catalog Status Derivation):** Marked catalog providers `status: "offline", enabled: false` when 0 adapters are active.
   - **GAP-010 (Provider Base URL Omission & Secret Redaction):** Hidden `base_url` from public provider JSON and redacted secrets in debug logs.
   - **GAP-011 (Scoring Documentation & Weights Reconciliation):** Formally reconciled scoring weights in `ARCHITECTURE.md` §2.1 and added mathematical regression tests proving bounded score and overflow-free arithmetic.
-  - **Verification:** 144 automated tests passing across 8 test suites; zero Clippy warnings; `cargo fmt` clean.
+  - **Live Groq Cloud Integration Verified:** Genuine cloud inference validated for buffered completion, SSE streaming (with 4-stage TTFC timing breakdown: TimeToHeaders, UpstreamDelta, ClientTTFC, TotalDuration), auto/manual routing, and strict reasoning isolation with content integrity (`test_openai_adapter_reasoning_isolation_and_content_integrity` covering empty content, reasoning-only, streaming deltas, and normal content).
+  - **Verification:** 146 automated tests passing across 8 test suites; zero Clippy warnings (`-D warnings`); `cargo fmt` clean; standalone daemon load tested with mock upstream and bounded live Groq Cloud.
+- [x] **Phase 8 — Quota & Usage Tracking (COMPLETE):**
+  - **Data Model:** Exact integer token accounting (`prompt_tokens`, `completion_tokens`, `total_tokens`), explicit `None`/`unavailable` semantics (no fabricated estimates), structured outcome classification (`Success`, `ProviderError`, `Timeout`, `ClientCancelled`, `PreDispatchFailure`, `StreamInterrupted`).
+  - **Persistent Storage:** Local SQLite storage engine (`rusqlite` bundled) with versioned idempotent migrations (`schema_migrations`), WAL mode, multi-column indexing (`start_time`, `provider_id`, `model_id`, `outcome`), parameterized SQL queries, and async offloading via `tokio::task::spawn_blocking`.
+  - **Buffered Request Accounting:** End-to-end recording of provider, model, latency, start/completion timestamps, and exact outcome. Zero duplicate writes on error paths.
+  - **Streaming Chat Accounting:** Zero in-memory generation buffering, streaming token extraction (including terminal usage events and OpenAI/Groq `stream_options.include_usage`), and drop-guard finalization guaranteeing exactly-once accounting on normal finish, upstream disconnects, and client cancellations.
+  - **Quota & Rate-Limit Awareness:** Normalized representation of provider rate-limit response headers (`x-ratelimit-remaining-*`, `x-ratelimit-limit-*`, `retry-after`), active 429 tracking, TTL freshness expiration (60s), and strict provider/model scope isolation.
+  - **Intelligent Routing Integration:** Conservative candidate deprioritization in automatic mode for active rate limits while strictly preserving user-specified models in manual mode. Unknown quota does not imply zero or unlimited.
+  - **Read-Only HTTP Endpoints & Bind Protection:** Protected versioned endpoints: `GET /api/v1/usage/summary`, `GET /api/v1/usage/providers`, `GET /api/v1/usage/models`, `GET /api/v1/quotas` with bounded query filters and zero secrets or prompt/completion text exposure. Protected against unauthenticated access when bound to external network interfaces (`host != loopback`).
+  - **Retention Policy Cleanup:** Safe startup pruning and async retention cleanup (`UsageService::prune_retention`) based on `usage_retention_days` (validated > 0, disabled by default as conservative baseline).
+  - **Verification:** 170 automated tests passing across 9 test suites (`tests/usage_tracking_test.rs` with 25 focused tests); `cargo fmt --check` clean; `cargo check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ---
 
@@ -51,9 +62,9 @@
 | **5** | **Central Model Registry** | **COMPLETE** | Phase 4 | Thread-safe model catalog, query filters, metadata validation, availability tracking | All tests pass (88 tests), live HTTP verification | Approved by User |
 | **6** | **Task Classification** | **COMPLETE** | Phase 5 | Deterministic `TaskClassifier` across all 15 categories, 3 complexity tiers, Roman Hindi/Hinglish | All tests pass (104 tests), live HTTP verification | Approved by User |
 | **7** | **Intelligent Model Router** | **COMPLETE** | Phase 6 | Multi-criteria scoring policy engine, auto/manual routing, fallback ordering | All tests pass (121 tests), live HTTP verification | Approved by User |
-| **7B**| **Real Inference & Gap Repairs** | **COMPLETE** | Phase 7 | Chat completions, SSE stream, HTTP adapter, router dispatch, bounded failover, auth, req IDs | All tests pass (132 tests), clippy clean | Verified |
-| **8** | **Quota & Usage Tracking** | **STRICTLY ON HOLD** | Phase 7B | Multi-tier usage counters (reported vs measured vs estimated) | Awaiting authorization | ON HOLD |
-| **9** | **Failover & Reliability** | **NOT STARTED** | Phase 8 | Bounded retries, exponential backoff, circuit breakers | Simulated provider outage tests | Pending Approval |
+| **7B**| **Real Inference & Gap Repairs** | **COMPLETE** | Phase 7 | Chat completions, SSE stream, HTTP adapter, router dispatch, bounded failover, auth, req IDs | All tests pass (138 tests), clippy clean | Verified |
+| **8** | **Quota & Usage Tracking** | **COMPLETE** | Phase 7B | Persistent SQLite store, token accounting, quota awareness, read-only analytics APIs | 170 tests pass, clippy clean, zero warnings | Verified Complete |
+| **9** | **Failover & Reliability** | **STRICTLY ON HOLD** | Phase 8 | Bounded retries, exponential backoff, circuit breakers | Simulated provider outage tests | Pending Approval |
 | **10** | **Token Optimization** | **NOT STARTED** | Phase 9 | Context window pruning, token estimation, length limits | Token usage benchmark tests | Pending Approval |
 | **11** | **Authentication** | **NOT STARTED** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | Auth token verification tests | Pending Approval |
 | **12** | **Authorization & Secret Management** | **NOT STARTED** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Pending Approval |
@@ -70,7 +81,7 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Phase 7B Verified Complete:** End-to-end chat completion and SSE streaming endpoints, concrete OpenAI-compatible HTTP adapter, router-to-provider execution, bounded failover (max 3 attempts), request ID propagation, constant-time API authentication, provider URL redaction, and catalog readiness consistency verified across 132 tests with zero Clippy warnings.
-2. **Phase 8 Remains STRICTLY ON HOLD:** Per governing instructions, Phase 8 (Usage and Quota Tracking) is NOT started and remains on hold until formal user authorization.
-3. **Phase Boundary Enforcement:** No full quota tracking, rate limit resets, or token accounting databases implemented. Only minimum usage metadata required by the inference contract is returned.
+1. **Phase 8 Verified Complete:** Persistent usage accounting, exact integer token recording, rate-limit awareness with conservative router integration, SQLite persistence, retention cleanup, external bind protection, and read-only endpoints verified across 170 automated tests with zero Clippy warnings.
+2. **Phase 9 Prepared & Ready (STRICTLY ON HOLD):** Phase 9 (Failover & Reliability) is ready to begin upon user authorization. No Phase 9 code has been implemented.
+3. **Phase Boundary Enforcement:** No speculative quota prediction, distributed coordination, or automatic key rotation introduced.
 

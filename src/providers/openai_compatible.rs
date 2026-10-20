@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[derive(Debug, Serialize)]
+struct OpenAiStreamOptions {
+    include_usage: bool,
+}
+
 /// Internal request payload matching standard OpenAI chat completion API.
 #[derive(Debug, Serialize)]
 struct OpenAiChatRequest<'a> {
@@ -29,6 +34,8 @@ struct OpenAiChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OpenAiStreamOptions>,
 }
 
 /// Internal response payload from OpenAI chat completion API.
@@ -59,6 +66,9 @@ struct OpenAiMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +76,8 @@ struct OpenAiDelta {
     #[allow(dead_code)]
     role: Option<String>,
     content: Option<String>,
+    #[allow(dead_code)]
+    reasoning: Option<String>,
 }
 
 fn default_role() -> String {
@@ -92,6 +104,7 @@ pub struct OpenAiCompatibleAdapter {
     rate_limit_tier: String,
     static_models: Vec<ModelMetadata>,
     model_wire_map: HashMap<String, String>,
+    quota_service: Option<std::sync::Arc<crate::quota::QuotaService>>,
 }
 
 impl OpenAiCompatibleAdapter {
@@ -116,6 +129,7 @@ impl OpenAiCompatibleAdapter {
             rate_limit_tier: "standard-tier".to_string(),
             static_models: Vec::new(),
             model_wire_map: HashMap::new(),
+            quota_service: None,
         }
     }
 
@@ -140,6 +154,15 @@ impl OpenAiCompatibleAdapter {
     /// Builder method to set rate limit tier.
     pub fn with_rate_limit_tier(mut self, tier: impl Into<String>) -> Self {
         self.rate_limit_tier = tier.into();
+        self
+    }
+
+    /// Builder method to attach a QuotaService for automatic rate-limit telemetry extraction.
+    pub fn with_quota_service(
+        mut self,
+        quota_service: std::sync::Arc<crate::quota::QuotaService>,
+    ) -> Self {
+        self.quota_service = Some(quota_service);
         self
     }
 
@@ -215,6 +238,7 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 temperature: req.temperature,
                 max_tokens: req.max_tokens,
                 stream: false,
+                stream_options: None,
             };
 
             let mut request_builder = self
@@ -259,6 +283,9 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 }
                 if status_code == 429 {
                     let retry_after = Self::extract_retry_after(response.headers());
+                    if let Some(qs) = &self.quota_service {
+                        qs.record_rate_limited(&self.provider_id, Some(&req.model_id), retry_after);
+                    }
                     return Err(ProviderError::RateLimited {
                         retry_after_secs: retry_after,
                     });
@@ -275,6 +302,15 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                     status_code,
                     message: "Upstream provider returned an error".to_string(),
                 });
+            }
+
+            if let Some(qs) = &self.quota_service {
+                let obs = crate::quota::QuotaService::extract_headers(
+                    &self.provider_id,
+                    Some(&req.model_id),
+                    response.headers(),
+                );
+                qs.record_observation(obs);
             }
 
             let parsed: OpenAiChatResponse =
@@ -336,6 +372,9 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 temperature: req.temperature,
                 max_tokens: req.max_tokens,
                 stream: true,
+                stream_options: Some(OpenAiStreamOptions {
+                    include_usage: true,
+                }),
             };
 
             let mut request_builder = self
@@ -380,6 +419,9 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 }
                 if status_code == 429 {
                     let retry_after = Self::extract_retry_after(response.headers());
+                    if let Some(qs) = &self.quota_service {
+                        qs.record_rate_limited(&self.provider_id, Some(&req.model_id), retry_after);
+                    }
                     return Err(ProviderError::RateLimited {
                         retry_after_secs: retry_after,
                     });
@@ -396,6 +438,15 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                     status_code,
                     message: "Upstream provider streaming error".to_string(),
                 });
+            }
+
+            if let Some(qs) = &self.quota_service {
+                let obs = crate::quota::QuotaService::extract_headers(
+                    &self.provider_id,
+                    Some(&req.model_id),
+                    response.headers(),
+                );
+                qs.record_observation(obs);
             }
 
             // Stream byte chunks and parse SSE framing line-by-line via unfold

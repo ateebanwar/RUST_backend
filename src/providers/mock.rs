@@ -19,8 +19,11 @@ pub struct MockProviderAdapter {
     pub capabilities: Vec<String>,
     pub should_fail_with: Option<ProviderError>,
     pub simulated_delay: Option<Duration>,
+    pub chunk_delay: Option<Duration>,
     pub stream_chunks: Vec<String>,
     pub is_healthy: bool,
+    pub custom_usage: Option<Option<UsageMetadata>>,
+    pub custom_stream_usage: Option<Option<UsageMetadata>>,
 }
 
 impl MockProviderAdapter {
@@ -62,12 +65,15 @@ impl MockProviderAdapter {
             ],
             should_fail_with: None,
             simulated_delay: None,
+            chunk_delay: None,
             stream_chunks: vec![
                 "Mock ".to_string(),
                 "streaming ".to_string(),
                 "response".to_string(),
             ],
             is_healthy: true,
+            custom_usage: None,
+            custom_stream_usage: None,
         }
     }
 
@@ -102,6 +108,12 @@ impl MockProviderAdapter {
         self
     }
 
+    /// Configure simulated delay between streaming chunks.
+    pub fn with_chunk_delay(mut self, delay: Duration) -> Self {
+        self.chunk_delay = Some(delay);
+        self
+    }
+
     /// Configure health status returned by check_health.
     pub fn with_health(mut self, healthy: bool) -> Self {
         self.is_healthy = healthy;
@@ -111,6 +123,18 @@ impl MockProviderAdapter {
     /// Configure enabled state on metadata.
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.metadata.enabled = enabled;
+        self
+    }
+
+    /// Configure custom usage returned by complete.
+    pub fn with_usage(mut self, usage: Option<UsageMetadata>) -> Self {
+        self.custom_usage = Some(usage);
+        self
+    }
+
+    /// Configure custom usage returned in terminal stream chunk.
+    pub fn with_stream_usage(mut self, usage: Option<UsageMetadata>) -> Self {
+        self.custom_stream_usage = Some(usage);
         self
     }
 }
@@ -164,12 +188,12 @@ impl ProviderAdapter for MockProviderAdapter {
                     role: "assistant".to_string(),
                     content: format!("Mock completion response for model {}", req.model_id),
                 },
-                usage: Some(UsageMetadata {
+                usage: self.custom_usage.clone().unwrap_or(Some(UsageMetadata {
                     prompt_tokens: 25,
                     completion_tokens: 35,
                     total_tokens: 60,
                     is_estimated: false,
-                }),
+                })),
             })
         })
     }
@@ -200,32 +224,70 @@ impl ProviderAdapter for MockProviderAdapter {
                 return Err(ProviderError::ModelNotFound(req.model_id.clone()));
             }
 
-            // 5. Generate stream chunks
-            let mut chunks: Vec<Result<StreamChunk, ProviderError>> = self
-                .stream_chunks
-                .iter()
-                .map(|text| {
-                    Ok(StreamChunk {
-                        delta: text.clone(),
-                        is_done: false,
-                        usage: None,
-                    })
-                })
-                .collect();
-
-            // Final done chunk with usage
-            chunks.push(Ok(StreamChunk {
-                delta: String::new(),
-                is_done: true,
-                usage: Some(UsageMetadata {
+            let stream_usage = self
+                .custom_stream_usage
+                .clone()
+                .unwrap_or(Some(UsageMetadata {
                     prompt_tokens: 25,
                     completion_tokens: 35,
                     total_tokens: 60,
                     is_estimated: false,
-                }),
-            }));
+                }));
 
-            let stream: ProviderStream = Box::pin(futures_util::stream::iter(chunks));
+            let chunk_delay = self.chunk_delay;
+            let stream: ProviderStream = if let Some(delay) = chunk_delay {
+                let stream_chunks = self.stream_chunks.clone();
+                let unfold_stream = futures_util::stream::unfold(
+                    (0usize, stream_chunks, stream_usage),
+                    move |(idx, chunks, usage)| async move {
+                        tokio::time::sleep(delay).await;
+                        if idx < chunks.len() {
+                            let delta = chunks[idx].clone();
+                            Some((
+                                Ok(StreamChunk {
+                                    delta,
+                                    is_done: false,
+                                    usage: None,
+                                }),
+                                (idx + 1, chunks, usage),
+                            ))
+                        } else if idx == chunks.len() {
+                            Some((
+                                Ok(StreamChunk {
+                                    delta: String::new(),
+                                    is_done: true,
+                                    usage,
+                                }),
+                                (idx + 1, chunks, None),
+                            ))
+                        } else {
+                            None
+                        }
+                    },
+                );
+                Box::pin(unfold_stream)
+            } else {
+                let mut chunks: Vec<Result<StreamChunk, ProviderError>> = self
+                    .stream_chunks
+                    .iter()
+                    .map(|text| {
+                        Ok(StreamChunk {
+                            delta: text.clone(),
+                            is_done: false,
+                            usage: None,
+                        })
+                    })
+                    .collect();
+
+                chunks.push(Ok(StreamChunk {
+                    delta: String::new(),
+                    is_done: true,
+                    usage: stream_usage,
+                }));
+
+                Box::pin(futures_util::stream::iter(chunks))
+            };
+
             Ok(stream)
         })
     }

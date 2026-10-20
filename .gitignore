@@ -1,0 +1,21 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Environment & Credentials
+.env
+.env.*
+*.key
+*.pem
+*.secret
+secrets/
+
+# IDE & Editor artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test & Log artifacts
+*.log
+scratch/

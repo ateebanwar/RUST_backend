@@ -93,6 +93,8 @@ pub struct AppConfig {
     pub groq_api_key: Option<String>,
     /// Upstream Groq Cloud model override (loaded from GROQ_MODEL).
     pub groq_model: Option<String>,
+    /// Upstream Groq Cloud API base URL override (loaded from GROQ_BASE_URL).
+    pub groq_base_url: Option<String>,
     /// Upstream OpenRouter API key (loaded from OPENROUTER_API_KEY).
     pub openrouter_api_key: Option<String>,
     /// Upstream Google Gemini API key (loaded from GEMINI_API_KEY).
@@ -101,6 +103,10 @@ pub struct AppConfig {
     pub gemini_api_key: Option<String>,
     /// Backend API key for authenticating protected routes (loaded from API_KEY).
     pub api_key: Option<String>,
+    /// Path to persistent SQLite database for usage tracking (loaded from DATABASE_PATH).
+    pub database_path: String,
+    /// Usage history retention window in days (loaded from USAGE_RETENTION_DAYS).
+    pub usage_retention_days: Option<u64>,
 }
 
 impl AppConfig {
@@ -115,17 +121,76 @@ impl AppConfig {
             upstream_timeout_secs: 10,      // 10s per DECISIONS.md DEC-002
             groq_api_key: None,
             groq_model: None,
+            groq_base_url: None,
             openrouter_api_key: None,
             gemini_api_key: None,
             api_key: None,
+            database_path: "data/usage.db".to_string(),
+            usage_retention_days: None,
         }
     }
 
-    /// Load configuration from environment variables with fallback to local defaults.
+    /// Parse .env key-value pairs from raw string content.
+    pub fn parse_dotenv(content: &str) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        for line in content.lines() {
+            let mut line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(stripped) = line.strip_prefix("export ") {
+                line = stripped.trim();
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim().to_string();
+                let mut v = v.trim();
+                if (v.starts_with('"') || v.starts_with('\'')) && v.len() >= 2 {
+                    let quote_char = v.chars().next().unwrap();
+                    if let Some(end_idx) = v[1..].find(quote_char) {
+                        v = &v[1..=end_idx];
+                    }
+                } else if let Some(idx) = v.find('#') {
+                    let before_comment = &v[..idx];
+                    if before_comment.ends_with(|c: char| c.is_whitespace()) {
+                        v = before_comment.trim();
+                    }
+                }
+                if !k.is_empty() {
+                    map.insert(k, v.to_string());
+                }
+            }
+        }
+        map
+    }
+
+    /// Helper to read local .env key-value pairs without external dependencies.
+    fn load_dotenv() -> std::collections::HashMap<String, String> {
+        if let Ok(content) = std::fs::read_to_string(".env") {
+            Self::parse_dotenv(&content)
+        } else {
+            std::collections::HashMap::new()
+        }
+    }
+
+    /// Load configuration from environment variables with fallback to local .env and defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
         let mut config = Self::default_local();
+        let dotenv_map = Self::load_dotenv();
 
-        if let Ok(host_val) = std::env::var("HOST") {
+        let get_var = |key: &str| -> Option<String> {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    dotenv_map
+                        .get(key)
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                })
+        };
+
+        if let Some(host_val) = get_var("HOST") {
             let host_trimmed = host_val.trim();
             if host_trimmed.is_empty() {
                 return Err(ConfigError::InvalidValue {
@@ -137,7 +202,7 @@ impl AppConfig {
             config.host = host_trimmed.to_string();
         }
 
-        if let Ok(port_val) = std::env::var("PORT") {
+        if let Some(port_val) = get_var("PORT") {
             let parsed_port =
                 port_val
                     .trim()
@@ -150,15 +215,15 @@ impl AppConfig {
             config.port = parsed_port;
         }
 
-        if let Ok(env_val) = std::env::var("APP_ENV") {
+        if let Some(env_val) = get_var("APP_ENV") {
             config.environment = env_val.trim().parse()?;
         }
 
-        if let Ok(mode_val) = std::env::var("DEPLOYMENT_MODE") {
+        if let Some(mode_val) = get_var("DEPLOYMENT_MODE") {
             config.deployment_mode = mode_val.trim().parse()?;
         }
 
-        if let Ok(body_limit_val) = std::env::var("MAX_BODY_SIZE_BYTES") {
+        if let Some(body_limit_val) = get_var("MAX_BODY_SIZE_BYTES") {
             let parsed_limit =
                 body_limit_val
                     .trim()
@@ -171,7 +236,7 @@ impl AppConfig {
             config.max_body_size_bytes = parsed_limit;
         }
 
-        if let Ok(timeout_val) = std::env::var("UPSTREAM_TIMEOUT_SECS") {
+        if let Some(timeout_val) = get_var("UPSTREAM_TIMEOUT_SECS") {
             let parsed_timeout =
                 timeout_val
                     .trim()
@@ -184,39 +249,38 @@ impl AppConfig {
             config.upstream_timeout_secs = parsed_timeout;
         }
 
-        if let Ok(key) = std::env::var("GROQ_API_KEY") {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                config.groq_api_key = Some(trimmed.to_string());
-            }
+        if let Some(key) = get_var("GROQ_API_KEY") {
+            config.groq_api_key = Some(key);
         }
 
-        if let Ok(model) = std::env::var("GROQ_MODEL") {
-            let trimmed = model.trim();
-            if !trimmed.is_empty() {
-                config.groq_model = Some(trimmed.to_string());
-            }
+        if let Some(model) = get_var("GROQ_MODEL") {
+            config.groq_model = Some(model);
         }
 
-        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                config.openrouter_api_key = Some(trimmed.to_string());
-            }
+        if let Some(url) = get_var("GROQ_BASE_URL") {
+            config.groq_base_url = Some(url);
         }
 
-        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                config.gemini_api_key = Some(trimmed.to_string());
-            }
+        if let Some(key) = get_var("OPENROUTER_API_KEY") {
+            config.openrouter_api_key = Some(key);
         }
 
-        if let Ok(key) = std::env::var("API_KEY").or_else(|_| std::env::var("BACKEND_API_KEY")) {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                config.api_key = Some(trimmed.to_string());
-            }
+        if let Some(key) = get_var("GEMINI_API_KEY") {
+            config.gemini_api_key = Some(key);
+        }
+
+        if let Some(key) = get_var("API_KEY").or_else(|| get_var("BACKEND_API_KEY")) {
+            config.api_key = Some(key);
+        }
+
+        if let Some(db) = get_var("DATABASE_PATH") {
+            config.database_path = db;
+        }
+
+        if let Some(days) =
+            get_var("USAGE_RETENTION_DAYS").and_then(|r| r.trim().parse::<u64>().ok())
+        {
+            config.usage_retention_days = Some(days);
         }
 
         config.validate()?;
@@ -227,6 +291,18 @@ impl AppConfig {
     /// In production, authentication is strictly mandatory.
     pub fn is_auth_required(&self) -> bool {
         self.environment == Environment::Production || self.api_key.is_some()
+    }
+
+    /// Check if the configured host bind address is loopback (accessible only locally).
+    pub fn is_loopback_host(&self) -> bool {
+        if self.host == "localhost" {
+            return true;
+        }
+        if let Ok(ip) = self.host.parse::<IpAddr>() {
+            ip.is_loopback()
+        } else {
+            false
+        }
     }
 
     /// Constant-time validation of an incoming API key against configured key.
@@ -291,6 +367,14 @@ impl AppConfig {
             });
         }
 
+        if self.usage_retention_days == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                key: "USAGE_RETENTION_DAYS",
+                value: "0".to_string(),
+                reason: "Usage retention days must be greater than zero when configured",
+            });
+        }
+
         Ok(())
     }
 }
@@ -310,6 +394,7 @@ impl fmt::Debug for AppConfig {
                 &self.groq_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("groq_model", &self.groq_model)
+            .field("groq_base_url", &self.groq_base_url)
             .field(
                 "openrouter_api_key",
                 &self.openrouter_api_key.as_ref().map(|_| "[REDACTED]"),
@@ -319,6 +404,8 @@ impl fmt::Debug for AppConfig {
                 &self.gemini_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("database_path", &self.database_path)
+            .field("usage_retention_days", &self.usage_retention_days)
             .finish()
     }
 }
@@ -435,5 +522,27 @@ mod tests {
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("super_secret_auth_key_12345"));
         assert!(!debug_str.contains("gsk_top_secret_groq_key_9999"));
+    }
+
+    #[test]
+    fn test_dotenv_parser_handles_edge_cases() {
+        let env_content = r#"
+            # Comment line
+            PORT=9000
+            export HOST="0.0.0.0" # inline comment
+            GROQ_API_KEY='secret_key_val'
+            EMPTY_VAL=
+            NO_EQUAL_SIGN_LINE
+            WITH_EQUALS=part1=part2
+            UNQUOTED_WITH_COMMENT=my_value # trailing comment
+        "#;
+        let map = AppConfig::parse_dotenv(env_content);
+        assert_eq!(map.get("PORT").unwrap(), "9000");
+        assert_eq!(map.get("HOST").unwrap(), "0.0.0.0");
+        assert_eq!(map.get("GROQ_API_KEY").unwrap(), "secret_key_val");
+        assert_eq!(map.get("EMPTY_VAL").unwrap(), "");
+        assert_eq!(map.get("WITH_EQUALS").unwrap(), "part1=part2");
+        assert_eq!(map.get("UNQUOTED_WITH_COMMENT").unwrap(), "my_value");
+        assert!(!map.contains_key("NO_EQUAL_SIGN_LINE"));
     }
 }

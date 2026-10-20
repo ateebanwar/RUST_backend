@@ -1404,3 +1404,181 @@ fn test_scoring_formula_and_weights_determinism() {
     assert!(scored_fast_low.total_score <= 125);
     assert!(scored_adv_high.total_score <= 125);
 }
+
+#[tokio::test]
+async fn test_openai_adapter_reasoning_isolation_and_content_integrity() {
+    let (upstream_url, _handle) = spawn_mock_openai_upstream(|_path, body| {
+        let is_stream = body.contains("\"stream\":true") || body.contains("\"stream\": true");
+        if is_stream {
+            // Emits: 1 reasoning chunk, 1 content chunk, 1 usage chunk
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":null,\"reasoning\":\"internal thought\"}}]}\n\n\
+                       data: {\"choices\":[{\"delta\":{\"content\":\"Final answer\"}}]}\n\n\
+                       data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                       data: [DONE]\n\n";
+            (
+                200,
+                vec![("content-type", "text/event-stream")],
+                sse.as_bytes().to_vec(),
+            )
+        } else if body.contains("empty-content") {
+            // Case 1: Pure empty content response without reasoning
+            let resp = json!({
+                "id": "chatcmpl_empty_content",
+                "model": "openai/gpt-oss-120b",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 0,
+                    "total_tokens": 5
+                }
+            });
+            (
+                200,
+                vec![("content-type", "application/json")],
+                serde_json::to_vec(&resp).unwrap(),
+            )
+        } else if body.contains("reasoning-only") {
+            // Case 2: Model ran out of tokens during reasoning; content is empty string
+            let resp = json!({
+                "id": "chatcmpl_reasoning_only",
+                "model": "openai/gpt-oss-120b",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning": "Internal chain of thought that must not leak"
+                    },
+                    "finish_reason": "length"
+                }],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 10,
+                    "total_tokens": 22
+                }
+            });
+            (
+                200,
+                vec![("content-type", "application/json")],
+                serde_json::to_vec(&resp).unwrap(),
+            )
+        } else {
+            // Case 2: Normal response with both content and reasoning
+            let resp = json!({
+                "id": "chatcmpl_normal",
+                "model": "openai/gpt-oss-120b",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "User-facing answer",
+                        "reasoning": "Internal thought"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 6,
+                    "total_tokens": 14
+                }
+            });
+            (
+                200,
+                vec![("content-type", "application/json")],
+                serde_json::to_vec(&resp).unwrap(),
+            )
+        }
+    })
+    .await;
+
+    let adapter = OpenAiCompatibleAdapter::new(
+        "test-provider",
+        "Test Reasoning Provider",
+        &upstream_url,
+        Some("test_key".to_string()),
+    );
+
+    // 1. Verify empty content (null/absent) defaults cleanly to empty string and captures usage
+    let req_empty = CompletionRequest {
+        model_id: "test-model".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "empty-content prompt".to_string(),
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: false,
+        timeout: Duration::from_secs(5),
+    };
+    let res_empty = adapter.complete(&req_empty).await.unwrap();
+    assert_eq!(
+        res_empty.message.content, "",
+        "Empty content must resolve to empty string without error"
+    );
+    assert_eq!(res_empty.usage.as_ref().unwrap().prompt_tokens, 5);
+    assert_eq!(res_empty.usage.as_ref().unwrap().completion_tokens, 0);
+    assert_eq!(res_empty.usage.as_ref().unwrap().total_tokens, 5);
+
+    // 2. Verify reasoning-only output does NOT leak into content, but usage is preserved
+    let req_reasoning_only = CompletionRequest {
+        model_id: "test-model".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "reasoning-only prompt".to_string(),
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: false,
+        timeout: Duration::from_secs(5),
+    };
+    let res1 = adapter.complete(&req_reasoning_only).await.unwrap();
+    assert_eq!(
+        res1.message.content, "",
+        "Reasoning must never be substituted as user-facing content"
+    );
+    assert_eq!(res1.usage.as_ref().unwrap().prompt_tokens, 12);
+    assert_eq!(res1.usage.as_ref().unwrap().completion_tokens, 10);
+    assert_eq!(res1.usage.as_ref().unwrap().total_tokens, 22);
+
+    // 3. Verify normal content output is cleanly extracted and preserved
+    let req_normal = CompletionRequest {
+        model_id: "test-model".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "normal prompt".to_string(),
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: false,
+        timeout: Duration::from_secs(5),
+    };
+    let res2 = adapter.complete(&req_normal).await.unwrap();
+    assert_eq!(res2.message.content, "User-facing answer");
+    assert_eq!(res2.usage.as_ref().unwrap().total_tokens, 14);
+
+    // 4. Verify streaming deltas: reasoning chunks are filtered out; only content deltas emitted
+    let mut stream = adapter.stream(&req_normal).await.unwrap();
+
+    // First content chunk
+    let chunk1 = stream.next().await.unwrap().unwrap();
+    assert_eq!(
+        chunk1.delta, "Final answer",
+        "Stream chunk must contain user-facing content, not reasoning"
+    );
+
+    // Usage chunk
+    let chunk2 = stream.next().await.unwrap().unwrap();
+    assert_eq!(chunk2.delta, "");
+    assert_eq!(chunk2.usage.as_ref().unwrap().total_tokens, 15);
+
+    // Completion chunk
+    let chunk3 = stream.next().await.unwrap().unwrap();
+    assert!(chunk3.is_done);
+}

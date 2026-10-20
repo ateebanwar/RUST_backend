@@ -155,8 +155,11 @@ fn test_valid_configuration_accepted() {
         api_key: None,
         groq_api_key: None,
         groq_model: None,
+        groq_base_url: None,
         openrouter_api_key: None,
         gemini_api_key: None,
+        database_path: "data/usage.db".to_string(),
+        usage_retention_days: None,
     };
     assert!(config.validate().is_ok());
 }

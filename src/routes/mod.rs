@@ -4,12 +4,13 @@ pub mod chat;
 pub mod health;
 pub mod models;
 pub mod routing;
+pub mod usage;
 
 use crate::AppState;
 use axum::Router;
 use axum::routing::{get, post};
 
-/// Register all foundational, model discovery, and chat completion routes on the Axum Router.
+/// Register all foundational, model discovery, chat completion, and usage/quota routes on the Axum Router.
 pub fn create_routes() -> Router<AppState> {
     Router::new()
         // Health & System Discovery (API_SPEC.md §2)
@@ -24,4 +25,9 @@ pub fn create_routes() -> Router<AppState> {
         // Chat Completions & Streaming (API_SPEC.md §5 & §6)
         .route("/api/v1/chat/completions", post(chat::chat_completions))
         .route("/api/v1/chat/stream", post(chat::chat_stream))
+        // Quota & Usage Tracking (Phase 8)
+        .route("/api/v1/usage/summary", get(usage::get_usage_summary))
+        .route("/api/v1/usage/providers", get(usage::get_usage_providers))
+        .route("/api/v1/usage/models", get(usage::get_usage_models))
+        .route("/api/v1/quotas", get(usage::get_quotas))
 }

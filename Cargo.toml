@@ -11,6 +11,7 @@ tokio = { version = "1.53.3", features = ["full"] }
 tracing = "0.1.44"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
 
 [profile.dev]
 codegen-units = 1
