@@ -28,13 +28,13 @@ All notable project changes, architectural decisions, and document synchronizati
   - Added Test 22: Production configuration startup rejection of `AUTH_REQUIRED=false`.
   - Added Test 23: Loopback host normalization for `[::1]`, `::1`, and case-insensitive `LOCALHOST`.
   - Added Test 24: `Config::is_auth_required` precedence in production and non-loopback configurations.
-  - Suite expanded from 19 to 24 tests; full backend test suite increased to **311 passing tests** (81 unit + 230 integration across 17 test suites, 0 failures, 1 ignored load benchmark).
+  - Suite expanded from 19 to 24 tests; full backend test suite increased to **312 passing tests** (81 unit + 231 integration across 16 integration binaries, 0 failures, 1 ignored load benchmark).
 
 ### Verification
 - `cargo fmt --check`: Passed with exit code 0.
 - `cargo check`: Passed with exit code 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
-- `cargo test`: **311 automated tests passing** across 17 test suites with 0 failures, 0 errors, 1 ignored (controlled benchmark).
+- `cargo test`: **312 automated tests passing** across 17 test suites (81 unit + 231 integration) with 0 failures, 0 errors, 1 ignored (controlled benchmark).
 - `cargo audit -n`: Passed with exit code 0 (1,348 advisories checked, 183 dependencies scanned).
 - `cargo build --release`: Passed with exit code 0.
 - `gitleaks detect -v`: Passed with exit code 0 (0 leaks detected).
