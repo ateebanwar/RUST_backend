@@ -234,7 +234,7 @@ impl HttpJwksProvider {
             *attempt_lock = Some(Instant::now());
         }
 
-        let response = self
+        let mut response = self
             .http_client
             .get(&self.jwks_url)
             .send()
@@ -257,16 +257,19 @@ impl HttpJwksProvider {
             )));
         }
 
-        let bytes = response
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|err| OidcError::JwksFetchFailed(err.to_string()))?;
-
-        if bytes.len() > Self::MAX_JWKS_RESPONSE_BYTES {
-            return Err(OidcError::JwksFetchFailed(format!(
-                "JWKS response size ({} bytes) exceeds maximum allowed 256 KB",
-                bytes.len()
-            )));
+            .map_err(|err| OidcError::JwksFetchFailed(err.to_string()))?
+        {
+            if bytes.len() + chunk.len() > Self::MAX_JWKS_RESPONSE_BYTES {
+                return Err(OidcError::JwksFetchFailed(format!(
+                    "JWKS response exceeded maximum allowed limit of {} bytes while reading body",
+                    Self::MAX_JWKS_RESPONSE_BYTES
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
         }
 
         let jwks: JwksResponse = serde_json::from_slice(&bytes)
@@ -311,15 +314,17 @@ impl JwksProvider for HttpJwksProvider {
                 }
             }
 
-            // Check refresh throttle: avoid flooding Google if a recent attempt already failed
+            // Check refresh throttle: atomically verify interval and mark attempt under write lock
+            // to prevent concurrent thundering-herd requests to Google JWKS endpoint
             {
-                let attempt_lock = self.last_fetch_attempt.read().await;
+                let mut attempt_lock = self.last_fetch_attempt.write().await;
                 if let Some(last_attempt) = *attempt_lock
                     && last_attempt.elapsed() < Self::MIN_REFRESH_INTERVAL
                 {
                     // Return UnknownKeyId rather than pounding upstream endpoint
                     return Err(OidcError::UnknownKeyId(kid.to_string()));
                 }
+                *attempt_lock = Some(Instant::now());
             }
 
             // Refresh from remote
@@ -460,10 +465,9 @@ impl GoogleOidcValidator {
             )));
         }
 
-        // 6. Validate authorized party (azp) if present
+        // 6. Validate authorized party (azp) if present: must match one of the configured client IDs
         if let Some(azp) = &claims.azp
             && !self.client_ids.contains(azp)
-            && !claims.matches_audience(&self.client_ids)
         {
             return Err(OidcError::InvalidAudience(format!(
                 "Token azp '{azp}' does not match configured Google client IDs"

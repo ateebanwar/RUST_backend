@@ -2,6 +2,46 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-21 — Forensic Security Remediation: Query Percent-Decoding, OIDC azp Validation, Streaming JWKS Limits, and Configuration Precedence
+
+### Audited, Corrected & Verified
+- **Percent-Encoded Query Parameter Credential Defense (`src/auth/service.rs`):**
+  - Implemented `percent_decode` helper to safely decode URL hex escape sequences (`%xx`) and `+`/whitespace before credential detection.
+  - Hardened `AuthService::contains_credential_query` to normalize query parameters, split on both `&` and `;`, and inspect canonicalized keys against an expanded credential keyword list (`api_key`, `apikey`, `api-key`, `access_token`, `accesstoken`, `access-token`, `token`, `auth_token`, `authtoken`, `auth-token`, `auth`, `bearer`, `secret`, `client_secret`, `client-secret`).
+  - Guarantees that evasion techniques utilizing percent-encoding (e.g., `?api%5fkey=...`) cannot bypass query-credential rejection or leak secrets into server logs.
+- **Google OIDC `azp` (Authorized Party) Claim Enforcement (`src/auth/oidc.rs`):**
+  - Resolved logic flaw in `GoogleOidcValidator::verify` where `azp` validation was bypassed when `claims.matches_audience(...)` was true.
+  - Enforced that if an `azp` claim is present in a Google ID token, it MUST strictly match configured Google Client IDs, preventing token re-presentation attacks by unauthorized cross-client applications.
+- **Streaming Chunk-by-Chunk JWKS Download Ceiling (`src/auth/oidc.rs`):**
+  - Replaced unconstrained `response.bytes().await` with incremental streaming chunk inspection (`response.chunk().await`).
+  - Bounded downloads strictly at 256 KB (`MAX_JWKS_RESPONSE_BYTES = 262_144`); immediately aborts the connection if an upstream server transmits exceeding bytes, neutralizing memory exhaustion and payload amplification from unbounded chunked transfers.
+- **Atomic Write-Lock JWKS Unknown-`kid` Throttling (`src/auth/oidc.rs`):**
+  - Updated `HttpJwksProvider::get_decoding_key` to check and record `last_fetch_attempt` under an atomic write lock *before* dispatching outbound network requests.
+  - Eliminates thundering-herd race conditions and prevents outbound network amplification under concurrent requests with invalid key identifiers.
+- **Configuration Precedence & Production Validation (`src/config.rs`):**
+  - Fixed `Config::is_auth_required` precedence: server binding to non-loopback addresses (`!is_loopback_host()`) or running in production (`APP_ENV=production`) unconditionally requires authentication, ignoring `auth_required = Some(false)`.
+  - Added strict validation in `Config::validate()` to reject `auth_required = Some(false)` when `APP_ENV=production` with `ConfigError::InvalidValue`.
+  - Enhanced loopback host normalization to support IPv6 bracket notation (e.g., `[::1]`) and case-insensitive `"localhost"`.
+- **Integration Test Expansion (`tests/authentication_test.rs`):**
+  - Added Test 20: Percent-encoded query parameter credential rejection (`?api%5fkey=secret` returns HTTP 401 `Unauthorized`).
+  - Added Test 21: Google OIDC `azp` claim verification rejecting tokens with unauthorized presenters even when audience matches.
+  - Added Test 22: Production configuration startup rejection of `AUTH_REQUIRED=false`.
+  - Added Test 23: Loopback host normalization for `[::1]`, `::1`, and case-insensitive `LOCALHOST`.
+  - Added Test 24: `Config::is_auth_required` precedence in production and non-loopback configurations.
+  - Suite expanded from 19 to 24 tests; full backend test suite increased to **311 passing tests** (81 unit + 230 integration across 17 test suites, 0 failures, 1 ignored load benchmark).
+
+### Verification
+- `cargo fmt --check`: Passed with exit code 0.
+- `cargo check`: Passed with exit code 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
+- `cargo test`: **311 automated tests passing** across 17 test suites with 0 failures, 0 errors, 1 ignored (controlled benchmark).
+- `cargo audit -n`: Passed with exit code 0 (1,348 advisories checked, 183 dependencies scanned).
+- `cargo build --release`: Passed with exit code 0.
+- `gitleaks detect -v`: Passed with exit code 0 (0 leaks detected).
+- Phase 12 (Authorization & Secret Management) remains strictly on hold.
+
+---
+
 ## 2026-10-21 — Phase 11: Security Audit Remediation, Query Credential Rejection, Scope Authorization, and Non-Loopback Bind Protection
 
 ### Audited, Corrected & Verified

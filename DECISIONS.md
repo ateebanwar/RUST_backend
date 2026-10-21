@@ -29,6 +29,7 @@
 | **DEC-016** | Centralized Model-ID-to-Tokenizer Mapping, Truthful Framing Semantics, and Effective Message Context Admission | **APPROVED** | 2026-10-21 | Tokenizer Correctness & Routing Safety |
 | **DEC-017** | Phase 11 Multi-Client Authentication, Google OIDC ID Token Verification, and Constant-Time Credential Validation | **APPROVED** | 2026-10-21 | Authentication & Identity Security |
 | **DEC-018** | Phase 11 Hardening: Query-Parameter Credential Proscription, Route Scope Authorization, and Non-Loopback Bind Protection | **APPROVED** | 2026-10-21 | Authentication & Security Hardening |
+| **DEC-019** | Forensic Security Remediation: Query Percent-Decoding, OIDC azp Claim Validation, Streaming JWKS Limits, and Configuration Precedence | **APPROVED** | 2026-10-21 | Authentication & Security Hardening |
 
 ---
 
@@ -297,3 +298,18 @@
   4. *Google OIDC & JWKS Hardening (`src/auth/oidc.rs`, `src/config.rs`):* Enforced a 256 KB response body limit on JWKS downloads; added a 10-second refresh throttle on unknown `kid` to mitigate cache-miss network amplification; enforced HTTPS for `GOOGLE_JWKS_URL` in production; and enabled validation for `nbf`, `iat` future sanity, and `azp` client ID verification.
   5. *Diagnostic Credential Redaction (`src/auth/pat.rs`):* Implemented custom zero-leak `std::fmt::Debug` on `ConfiguredCredential` to redact precomputed token hashes.
 - **Consequences:** All identified security gaps are remediated and verified by 306 automated tests across 17 test suites (including 7 new security integration tests) with 0 failures, 0 Clippy warnings, and 0 security vulnerabilities. Phase 12 remains strictly on hold.
+
+---
+
+### DEC-019: Forensic Security Remediation: Query Percent-Decoding, OIDC azp Claim Validation, Streaming JWKS Limits, and Configuration Precedence
+- **Status:** APPROVED
+- **Date:** 2026-10-21
+- **Context:** An independent forensic security audit of the Phase 11 implementation discovered subtle correctness and security edge cases: (1) query-parameter credential proscription could be bypassed via percent-encoded parameter keys (e.g. `api%5fkey` or `access%5ftoken`); (2) Google OIDC `azp` validation contained a redundant condition (`&& !claims.matches_audience(...)`) that effectively bypassed `azp` verification when `aud` matched; (3) JWKS response downloads buffered the entire body before checking size limits, exposing the service to unbounded chunked stream memory exhaustion; (4) concurrent cache misses on unknown `kid` could trigger thundering-herd duplicate outbound requests; (5) `Config::is_auth_required` gave precedence to `auth_required = Some(false)` over production and external interface invariants, and `Config::validate()` did not reject `AUTH_REQUIRED=false` in production.
+- **Decisions Made:**
+  1. *URL Percent-Decoding in Credential Query Proscription (`src/auth/service.rs`):* Added `AuthService::percent_decode` to normalize `%xx` hex encodings and whitespace before matching parameter keys against recognized credential names (`api_key`, `apikey`, `api-key`, `access_token`, `token`, `auth_token`, `auth`, `bearer`, `secret`). Both `&` and `;` delimiters are parsed.
+  2. *Strict OIDC Authorized Party (`azp`) Claim Validation (`src/auth/oidc.rs`):* Corrected `GoogleOidcValidator::validate` to require that any present `azp` claim strictly match one of the application's configured Google Client IDs, in accordance with OpenID Connect Core 1.0 §3.1.3.7.
+  3. *Incremental Streaming JWKS Body Size Ceiling (`src/auth/oidc.rs`):* Replaced `response.bytes().await` with incremental chunk streaming via `response.chunk().await`, immediately aborting with `OidcError::JwksFetchFailed` if total bytes exceed `MAX_JWKS_RESPONSE_BYTES` (256 KB) during transfer.
+  4. *Atomic Refresh Throttling Under Write Lock (`src/auth/oidc.rs`):* In `HttpJwksProvider::get_decoding_key`, `last_fetch_attempt` is checked and atomically updated under an asynchronous write lock before initiating remote HTTP requests, eliminating concurrent outbound fetch amplification.
+  5. *Configuration Precedence & Production Validation (`src/config.rs`):* In `Config::is_auth_required()`, `self.environment == Environment::Production || !self.is_loopback_host()` is evaluated first, guaranteeing that `auth_required = Some(false)` cannot disable authentication in production or on external network interfaces. In `Config::validate()`, setting `AUTH_REQUIRED=false` in production fails closed at startup with `ConfigError::InvalidValue`.
+  6. *Host Normalization for IPv6 Brackets and Case-Insensitivity (`src/config.rs`):* `Config::is_loopback_host` and `Config::validate` strip IPv6 brackets `[` / `]` and match `"localhost"` case-insensitively.
+- **Consequences:** All confirmed forensic defects are corrected and verified by 311 automated tests across 17 test suites (including 5 new tests in `tests/authentication_test.rs`) with 0 failures, 0 Clippy warnings, and 0 secret leaks. Phase 12 remains strictly on hold.

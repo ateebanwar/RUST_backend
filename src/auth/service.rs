@@ -129,25 +129,82 @@ impl AuthService {
         normalized.starts_with("/api/v1/usage") || normalized == "/api/v1/quotas"
     }
 
+    /// Percent-decode a URL query string slice.
+    pub fn percent_decode(input: &str) -> String {
+        fn decode_hex_nibble(b: u8) -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(input.len());
+        let input_bytes = input.as_bytes();
+        let mut i = 0;
+        while i < input_bytes.len() {
+            if input_bytes[i] == b'%' && i + 2 < input_bytes.len() {
+                if let (Some(n1), Some(n2)) = (
+                    decode_hex_nibble(input_bytes[i + 1]),
+                    decode_hex_nibble(input_bytes[i + 2]),
+                ) {
+                    bytes.push((n1 << 4) | n2);
+                    i += 3;
+                    continue;
+                }
+            } else if input_bytes[i] == b'+' {
+                bytes.push(b' ');
+                i += 1;
+                continue;
+            }
+            bytes.push(input_bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     /// Check whether a query string contains credential-bearing parameters.
+    ///
+    /// Correctly decodes percent-encoded parameters, handles duplicate keys, empty values,
+    /// and matches recognized credential parameters (`api_key`, `access_token`, `token`,
+    /// `auth_token`, `auth`, `bearer`, etc.).
     pub fn contains_credential_query(query: Option<&str>) -> bool {
         let Some(q) = query else {
             return false;
         };
-        for pair in q.split('&') {
-            let key = pair
+
+        // Normalize delimiters: support standard '&' and ';' delimiters
+        for pair in q.split(['&', ';']) {
+            let pair_trimmed = pair.trim();
+            if pair_trimmed.is_empty() {
+                continue;
+            }
+
+            // Percent-decode first to prevent percent-encoding bypass (e.g. api%5fkey or %61%70%69...)
+            let decoded_pair = Self::percent_decode(pair_trimmed);
+            let raw_key = decoded_pair
                 .split('=')
                 .next()
                 .unwrap_or("")
                 .trim()
                 .to_ascii_lowercase();
-            if key == "api_key"
-                || key == "apikey"
-                || key == "access_token"
-                || key == "token"
-                || key == "auth_token"
-                || key == "auth"
-                || key == "bearer"
+
+            if raw_key == "api_key"
+                || raw_key == "apikey"
+                || raw_key == "api-key"
+                || raw_key == "access_token"
+                || raw_key == "accesstoken"
+                || raw_key == "access-token"
+                || raw_key == "token"
+                || raw_key == "auth_token"
+                || raw_key == "authtoken"
+                || raw_key == "auth-token"
+                || raw_key == "auth"
+                || raw_key == "bearer"
+                || raw_key == "secret"
+                || raw_key == "client_secret"
+                || raw_key == "client-secret"
             {
                 return true;
             }

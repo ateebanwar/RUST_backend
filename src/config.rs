@@ -459,14 +459,16 @@ impl AppConfig {
     }
 
     /// Check if API authentication is required on protected routes.
-    /// In production, authentication is strictly mandatory.
+    /// In production or on non-loopback network interfaces, authentication is strictly mandatory.
     pub fn is_auth_required(&self) -> bool {
+        // In production or on non-loopback hosts, authentication is strictly and unconditionally required
+        if self.environment == Environment::Production || !self.is_loopback_host() {
+            return true;
+        }
         if let Some(explicit) = self.auth_required {
             return explicit;
         }
-        self.environment == Environment::Production
-            || !self.is_loopback_host()
-            || self.api_key.is_some()
+        self.api_key.is_some()
             || !self.api_keys.is_empty()
             || self.google_client_id.is_some()
             || !self.google_client_ids.is_empty()
@@ -474,10 +476,13 @@ impl AppConfig {
 
     /// Check if the configured host bind address is loopback (accessible only locally).
     pub fn is_loopback_host(&self) -> bool {
-        if self.host == "localhost" {
+        let trimmed = self.host.trim();
+        if trimmed.eq_ignore_ascii_case("localhost") {
             return true;
         }
-        if let Ok(ip) = self.host.parse::<IpAddr>() {
+        // Strip IPv6 brackets if present (e.g. "[::1]")
+        let unbracketed = trimmed.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = unbracketed.parse::<IpAddr>() {
             ip.is_loopback()
         } else {
             false
@@ -521,7 +526,11 @@ impl AppConfig {
             });
         }
 
-        if self.host.parse::<IpAddr>().is_err() && self.host != "localhost" {
+        let host_trimmed = self.host.trim();
+        let host_unbracketed = host_trimmed.trim_start_matches('[').trim_end_matches(']');
+        if host_unbracketed.parse::<IpAddr>().is_err()
+            && !host_trimmed.eq_ignore_ascii_case("localhost")
+        {
             return Err(ConfigError::InvalidValue {
                 key: "HOST",
                 value: self.host.clone(),
@@ -558,6 +567,14 @@ impl AppConfig {
                 .any(|id| !id.trim().is_empty());
 
         if self.environment == Environment::Production {
+            if self.auth_required == Some(false) {
+                return Err(ConfigError::InvalidValue {
+                    key: "AUTH_REQUIRED",
+                    value: "false".to_string(),
+                    reason: "AUTH_REQUIRED cannot be set to false in production environment",
+                });
+            }
+
             if !has_key && !has_google {
                 return Err(ConfigError::InvalidValue {
                     key: "APP_ENV",

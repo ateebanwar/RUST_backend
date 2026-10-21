@@ -507,14 +507,15 @@ graph TD
 
 ### 10.2 Architectural Components & Invariants
 1. **Unconditional Query-Parameter Credential Proscription (`src/auth/service.rs`):**
-   - In accordance with OWASP API Security and REST security best practices, credentials (`api_key`, `apikey`, `access_token`, `token`, `auth_token`, `auth`, `bearer`) passed in URL query strings are strictly prohibited.
+   - In accordance with OWASP API Security and REST security best practices, credentials (`api_key`, `apikey`, `api-key`, `access_token`, `token`, `auth_token`, `auth`, `bearer`, `secret`) passed in URL query strings are strictly prohibited.
+   - Automatically percent-decodes URL query keys (handling `%xx` encodings, `+` and whitespace) and checks against credential parameters to completely eliminate percent-encoding evasion attacks.
    - Any protected request containing credential-bearing query parameters is immediately rejected with HTTP 401 `Unauthorized` and canonical code `UNAUTHORIZED` before any header-based fallback can execute, preventing credential leakage in proxy access logs, browser history, and referrer headers.
 2. **Google OIDC ID Token Validator (`src/auth/oidc.rs`):**
    - Parses RS256 JWT tokens using `jsonwebtoken`.
    - Retrieves public RSA keys via the `JwksProvider` abstraction (`HttpJwksProvider` with in-memory caching and 1-hour TTL).
-   - Validates strict standard claims: issuer (`https://accounts.google.com` or `accounts.google.com`), audience (matching configured `google_client_id` or `google_client_ids`), expiration (with 60-second leeway), non-empty subject, `nbf` (not-before), future `iat` sanity, and `azp` (authorized party) when multiple audiences or client IDs are configured.
-   - Enforces a bounded 256 KB response body limit on JWKS downloads to defend against memory exhaustion and upstream payload amplification.
-   - Employs a 10-second refresh throttle on cache misses caused by unknown key identifiers (`kid`) to prevent cache-miss network request amplification attacks.
+   - Validates strict standard claims: issuer (`https://accounts.google.com` or `accounts.google.com`), audience (matching configured `google_client_id` or `google_client_ids`), expiration (with 60-second leeway), non-empty subject, `nbf` (not-before), future `iat` sanity, and `azp` (authorized party) strictly matching one of the configured Google client IDs.
+   - Enforces an incremental 256 KB streaming body limit during JWKS downloads, aborting immediately upon exceeding 256 KB to defend against memory exhaustion and upstream payload amplification attacks.
+   - Employs an atomic write-locked 10-second refresh throttle on cache misses caused by unknown key identifiers (`kid`) to prevent concurrent cache-miss network amplification attacks.
    - Supports `MockJwksProvider` enabling deterministic, offline, zero-network unit and integration testing.
 3. **Personal Access Token & API Key Validator (`src/auth/pat.rs`):**
    - Validates developer PATs (`pat_<64_hex_chars>`) and backend API keys.

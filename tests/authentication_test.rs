@@ -1,4 +1,4 @@
-//! Comprehensive integration verification tests for Phase 11 — Authentication & Authorization.
+//! Comprehensive integration verification tests for Phase 11 â€” Authentication & Authorization.
 //!
 //! Verifies:
 //! 1. Public probes (/health, /ready) remain accessible without credentials.
@@ -949,4 +949,205 @@ async fn test_public_probes_support_trailing_slashes() {
         .await
         .unwrap();
     assert_ne!(resp_ready.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+// =========================================================================
+// 17. PERCENT-ENCODED QUERY REJECTION & OIDC AZP CLAIM SECURITY
+// =========================================================================
+
+#[tokio::test]
+async fn test_query_parameter_percent_encoded_credentials_strictly_rejected() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("test_secret_key_12345".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // URLs with percent-encoded query parameters or hyphenated parameter variations
+    let evasion_attempt_urls = vec![
+        format!("{base_url}/api/v1/models?api%5fkey=some_secret_123"),
+        format!("{base_url}/api/v1/models?api%5Fkey=some_secret_123"),
+        format!("{base_url}/api/v1/models?%61%70%69%5f%6b%65%79=some_secret_123"),
+        format!("{base_url}/api/v1/models?access%5ftoken=some_secret_123"),
+        format!("{base_url}/api/v1/models?token%3dsome_secret_123"),
+        format!("{base_url}/api/v1/models?api-key=some_secret_123"),
+        format!("{base_url}/api/v1/models?access-token=some_secret_123"),
+        format!("{base_url}/api/v1/models?auth-token=some_secret_123"),
+        format!("{base_url}/api/v1/models?secret=some_secret_123"),
+        format!("{base_url}/api/v1/models?bearer=some_secret_123"),
+        format!("{base_url}/api/v1/models?other=valid;api_key=some_secret_123"),
+    ];
+
+    for url in evasion_attempt_urls {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Percent-encoded query credential in '{url}' must be rejected with HTTP 401"
+        );
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("query parameters"),
+            "Error message must indicate query parameters are prohibited for credentials"
+        );
+    }
+
+    // Verify legitimate non-credential queries are NOT rejected as query credentials
+    // (with valid header credentials, they succeed)
+    let resp_legit = client
+        .get(format!(
+            "{base_url}/api/v1/models?limit=10&offset=0&category=fast"
+        ))
+        .header("Authorization", "Bearer test_secret_key_12345")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_legit.status(),
+        reqwest::StatusCode::OK,
+        "Legitimate non-credential query parameters must not be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_google_oidc_azp_validation_rejects_unauthorized_client_id() {
+    let mut mock_jwks = MockJwksProvider::new();
+    let decoding_key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_KEY_PEM.as_bytes())
+        .expect("Valid RSA public key");
+    mock_jwks.add_key(TEST_KID, decoding_key);
+
+    let validator = GoogleOidcValidator::new(Arc::new(mock_jwks), vec![TEST_CLIENT_ID.to_string()]);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Token has valid audience (TEST_CLIENT_ID), but unauthorized presenter azp!
+    let claims = GoogleClaims {
+        iss: "https://accounts.google.com".to_string(),
+        sub: "google_user_sub_998877".to_string(),
+        aud: serde_json::Value::String(TEST_CLIENT_ID.to_string()),
+        exp: now + 3600,
+        iat: Some(now - 10),
+        nbf: Some(now - 10),
+        azp: Some("unauthorized-foreign-app.apps.googleusercontent.com".to_string()),
+        email: Some("attacker@example.com".to_string()),
+        email_verified: Some(true),
+        name: Some("Foreign Client User".to_string()),
+        picture: None,
+    };
+
+    let token = create_test_jwt(&claims, Some(TEST_KID), TEST_RSA_PRIVATE_KEY_PEM)
+        .expect("Signed test JWT");
+
+    let result = validator.validate(&token, ClientType::Flutter).await;
+    assert!(
+        result.is_err(),
+        "Token with unauthorized azp presenter must be rejected"
+    );
+
+    let err = result.unwrap_err();
+    match err {
+        ai_backend::auth::OidcError::InvalidAudience(msg) => {
+            assert!(
+                msg.contains("azp") && msg.contains("does not match"),
+                "Error should specifically identify unauthorized azp: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidAudience error for azp mismatch, got: {other:?}"),
+    }
+
+    // Now test token with matching authorized azp: must succeed!
+    let mut valid_azp_claims = claims;
+    valid_azp_claims.azp = Some(TEST_CLIENT_ID.to_string());
+    let valid_token = create_test_jwt(&valid_azp_claims, Some(TEST_KID), TEST_RSA_PRIVATE_KEY_PEM)
+        .expect("Signed test JWT");
+
+    let valid_result = validator.validate(&valid_token, ClientType::Flutter).await;
+    assert!(
+        valid_result.is_ok(),
+        "Token with matching azp must be accepted"
+    );
+}
+
+#[test]
+fn test_config_production_rejects_auth_required_false() {
+    let mut config = AppConfig::default_local();
+    config.environment = Environment::Production;
+    config.api_key = Some("valid_production_key_12345".to_string());
+    config.auth_required = Some(false); // Explicitly attempting to disable auth in production
+
+    let err = config.validate().unwrap_err();
+    match err {
+        ConfigError::InvalidValue { key, reason, .. } => {
+            assert_eq!(key, "AUTH_REQUIRED");
+            assert!(
+                reason.contains("cannot be set to false in production"),
+                "Expected error rejecting AUTH_REQUIRED=false in production: {reason}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_config_loopback_bracketed_ipv6_and_case_insensitive_localhost() {
+    let mut config = AppConfig::default_local();
+
+    // 1. Bracketed IPv6 loopback
+    config.host = "[::1]".to_string();
+    assert!(config.is_loopback_host());
+    assert!(config.validate().is_ok());
+
+    // 2. Standard IPv6 loopback
+    config.host = "::1".to_string();
+    assert!(config.is_loopback_host());
+    assert!(config.validate().is_ok());
+
+    // 3. Case-insensitive LOCALHOST
+    config.host = "LOCALHOST".to_string();
+    assert!(config.is_loopback_host());
+    assert!(config.validate().is_ok());
+
+    // 4. Wildcard/external non-loopback
+    config.host = "0.0.0.0".to_string();
+    assert!(!config.is_loopback_host());
+}
+
+#[test]
+fn test_config_is_auth_required_precedence_in_production_and_external_bind() {
+    let mut config = AppConfig::default_local();
+
+    // Even if auth_required is explicitly Some(false):
+    config.auth_required = Some(false);
+
+    // If host is non-loopback (e.g. 0.0.0.0), is_auth_required MUST still return true!
+    config.host = "0.0.0.0".to_string();
+    config.environment = Environment::Development;
+    assert!(
+        config.is_auth_required(),
+        "Non-loopback bind must force is_auth_required to true regardless of auth_required"
+    );
+
+    // If environment is Production, is_auth_required MUST still return true!
+    config.host = "127.0.0.1".to_string();
+    config.environment = Environment::Production;
+    assert!(
+        config.is_auth_required(),
+        "Production environment must force is_auth_required to true regardless of auth_required"
+    );
+
+    // Only in development ON loopback can auth_required = Some(false) return false
+    config.environment = Environment::Development;
+    assert!(
+        !config.is_auth_required(),
+        "Development on loopback with explicit false must return false"
+    );
 }

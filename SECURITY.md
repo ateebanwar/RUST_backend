@@ -33,14 +33,17 @@
     - Ingress middleware verifies that the principal possesses the documented scope for the target endpoint: `models:read` for model & provider discovery, `routing:read` for routing preview, `chat` for chat completions and streaming, and `usage:read` for usage and quotas. Requests lacking the required scope are denied with HTTP 403 Forbidden.
     - Caller `X-Client-Type` headers are audit labels only and strictly never grant roles, scopes, or privileges.
  4. **Query Parameter Credential Prohibition:**
-    - Credentials must NEVER be accepted through URL query parameters (e.g. `?api_key=...`, `?access_token=...`).
+    - Credentials must NEVER be accepted through URL query parameters (e.g. `?api_key=...`, `?access_token=...`, `?api-key=...`, `?bearer=...`).
+    - URL query strings are automatically percent-decoded to prevent evasion attacks using percent-encoded parameters (e.g. `?api%5fkey=...` or `%61%70%69...`).
     - Inbound requests containing credentials in query parameters are unconditionally rejected with HTTP 401 Unauthorized, instructing clients to use standard request headers. Query credentials never grant development bypass or fall back to other authentication methods.
  5. **Strict Precedence & Zero Fallback:**
     - Incoming 3-segment JWTs are routed strictly to the Google OIDC validator.
+    - OIDC verification strictly validates signature, `iss`, `aud`, `exp`, `nbf`, `iat`, and `azp` (Authorized Party presenter). If `azp` is present, it MUST match one of the configured Google client IDs.
+    - JWKS response downloads are bounded by a 256 KB streaming body limit and throttled by a 10-second refresh cooldown on unknown `kid` misses under an atomic write lock.
     - Non-JWT tokens and `X-API-Key` headers are routed strictly to the PAT/API Key validator.
     - An invalid credential never receives weaker fallback authentication or developer bypass.
  6. **Fail-Closed Production & External Bind Security:**
-    - In production mode (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present, or if `GOOGLE_JWKS_URL` does not use HTTPS.
+    - In production mode (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present, or if `GOOGLE_JWKS_URL` does not use HTTPS, or if `AUTH_REQUIRED` is configured to `false`.
     - Unauthenticated development bypass is strictly restricted to loopback network interfaces (`127.0.0.1`, `localhost`, `::1`). Binding to any non-loopback network interface (`HOST=0.0.0.0` or public IP) unconditionally enforces authentication across ALL protected routes.
 
 -----
