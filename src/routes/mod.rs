@@ -1,6 +1,7 @@
 //! Route module registrations and Axum router assembly.
 
 pub mod chat;
+pub mod credentials;
 pub mod health;
 pub mod models;
 pub mod routing;
@@ -10,7 +11,7 @@ use crate::AppState;
 use axum::Router;
 use axum::routing::{get, post};
 
-/// Register all foundational, model discovery, chat completion, and usage/quota routes on the Axum Router.
+/// Register all foundational, model discovery, chat completion, usage/quota, and credential routes on the Axum Router.
 pub fn create_routes() -> Router<AppState> {
     Router::new()
         // Health & System Discovery (API_SPEC.md §2)
@@ -30,4 +31,17 @@ pub fn create_routes() -> Router<AppState> {
         .route("/api/v1/usage/providers", get(usage::get_usage_providers))
         .route("/api/v1/usage/models", get(usage::get_usage_models))
         .route("/api/v1/quotas", get(usage::get_quotas))
+        // Dynamic Credential & PAT Lifecycle (Phase 12)
+        .route(
+            "/api/v1/auth/tokens",
+            get(credentials::list_tokens).post(credentials::create_token),
+        )
+        .route(
+            "/api/v1/auth/tokens/{id}",
+            get(credentials::get_token).delete(credentials::revoke_token),
+        )
+        .route(
+            "/api/v1/auth/tokens/{id}/rotate",
+            post(credentials::rotate_token),
+        )
 }

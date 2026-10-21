@@ -1,6 +1,11 @@
 //! Security module: CIDR matching, trusted proxy verification, and host header validation.
 //!
 //! Conforms to MASTER_SPEC.md §13 & §14, ARCHITECTURE.md §2, and THREAT_MODEL.md.
+pub mod encryption;
+pub mod secret;
+
+pub use encryption::{AesGcmCipher, EncryptionError};
+pub use secret::{SecretString, mask_credential};
 
 use std::net::IpAddr;
 

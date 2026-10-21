@@ -2,8 +2,8 @@
 
 **Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
 **Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
-**Current Phase:** Phase 11 Complete | Phase 12 Strictly On Hold
-**Last Updated:** 2026-10-21
+**Current Phase:** Phase 12 Complete | Phase 13 Strictly On Hold
+**Last Updated:** 2026-10-22
 
 ---
 
@@ -95,7 +95,20 @@
   - **Request Identity & Authorization Propagation (`src/auth/principal.rs`):** Strongly-typed `AuthPrincipal` inserted into Axum request extensions containing `subject`, `auth_type`, `client_type` (parsed from `X-Client-Type`), `email`, `roles` (`User`, `Admin`, `Service`), and authorized `scopes`. Zero-leak `Debug` and `Display` formatting redacting emails and credentials.
   - **Strict Precedence & Zero Fallback:** 3-segment JWT tokens route strictly to OIDC; non-JWT tokens and `X-API-Key` headers route strictly to PAT/API key validators. Invalid credentials never fall back to weaker authentication or developer bypass.
   - **Fail-Closed Production Configuration (`src/config.rs`):** Production mode (`APP_ENV=production`) fails closed at startup with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is configured, if `GOOGLE_JWKS_URL` does not use HTTPS, or if `AUTH_REQUIRED=false` is configured.
-  - **Comprehensive Test Coverage & Verification:** **325 automated tests passing** across 17 test suites (89 unit + 236 integration across 16 integration binaries, plus 1 ignored benchmark, including 29 security integration tests in `tests/authentication_test.rs`); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing. Phase 12 remains strictly on hold.
+  - **Comprehensive Test Coverage & Verification:** **325 automated tests passing** across 17 test suites (89 unit + 236 integration across 16 integration binaries, plus 1 ignored benchmark, including 29 security integration tests in `tests/authentication_test.rs`); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing.
+- [x] **Phase 12 — End-to-End Authorization, Secret Management & Hardening (COMPLETE & VERIFIED):**
+  - **Resource Ownership & Tenant Isolation (`src/usage/storage.rs`, `src/routes/usage.rs`, `src/routes/chat.rs`):** Usage records schema migration v3 adds `subject TEXT` with indexing (`idx_usage_records_subject`). Usage queries (`summary`, `providers`, `models`) strictly partition records by authenticated caller subject. Chat completion streaming and buffered paths propagate caller identity to drop-guard usage finalization.
+  - **Insecure Direct Object Reference (IDOR) Mitigation:** Non-admin callers attempting to query another user's telemetry (`?user_id=...` or `?subject=...`) fail closed with HTTP 403 Forbidden (`FORBIDDEN`). Inspecting, rotating, or revoking another user's credential returns HTTP 404 Not Found to prevent resource enumeration.
+  - **Dynamic Personal Access Token (PAT) Engine (`src/auth/credential_store.rs`, `src/routes/credentials.rs`):** SQLite-backed and memory-cached credential lifecycle manager:
+    - `POST /api/v1/auth/tokens`: Generates OS-entropy token (`ring::rand::SystemRandom`), returning plaintext strictly ONCE upon creation.
+    - `GET /api/v1/auth/tokens`: Tenant-isolated listing returning masked credentials (`pat_1234...ef01`), never exposing secrets or raw hashes.
+    - `GET /api/v1/auth/tokens/{id}`: Credential metadata inspection with IDOR mitigation (404 on cross-user lookup).
+    - `POST /api/v1/auth/tokens/{id}/rotate`: Atomic token rotation invalidating the old token and returning the new plaintext token once.
+    - `DELETE /api/v1/auth/tokens/{id}`: Immediate, atomic revocation.
+  - **Privilege Escalation Defense:** Non-admin callers cannot create tokens with scopes exceeding their own authorized scopes.
+  - **Zero-Leak Secret Representations (`src/security/secret.rs`):** `SecretString` wrapper with custom `Debug`, `Display`, and `serde::Serialize` unconditionally outputting `"[REDACTED]"`. `mask_credential` produces safe diagnostic representations.
+  - **Authenticated Encryption at Rest (`src/security/encryption.rs`):** `AesGcmCipher` providing AES-256-GCM authenticated encryption with 96-bit random nonces and Associated Data (AAD) context binding.
+  - **Comprehensive Verification:** **333 automated tests passing** across 18 test suites (including 8 new security integration tests in `tests/authorization_and_ownership_test.rs`); `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing. Phase 13 remains strictly on hold.
 
 ---
 
@@ -116,8 +129,8 @@
 | **9** | **Failover & Reliability** | **COMPLETE** | Phase 8 | Bounded retries, exponential backoff, loop prevention, manual routing invariant, pre vs mid-stream handling | 196 tests pass, clippy clean, zero warnings | Verified Complete |
 | **10** | **Token Optimization & Operational Hardening** | **COMPLETE** | Phase 9 | Model-aware estimation, conservative compaction, context gating, proxy security, durable usage queue | 220 tests pass, clippy clean, zero warnings, release load tested | Verified Complete |
 | **11** | **Authentication** | **COMPLETE** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE), query rejection, route scopes | All tests pass (325 tests), clippy clean, zero warnings | Approved by User |
-| **12** | **Authorization and Secret Management** | **NEXT ELIGIBLE PHASE** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Eligible to Begin |
-| **13** | **Abuse Prevention** | **NOT STARTED** | Phase 12 | Inbound body size limits, rate limiting, connection timeouts | Fuzzing & request flood tests | Pending Approval |
+| **12** | **Authorization and Secret Management** | **COMPLETE** | Phase 11 | Resource ownership, tenant telemetry isolation, dynamic PAT lifecycle, AES-GCM encryption, IDOR defenses | 333 tests pass (18 suites), clippy clean, zero leaks, audit clean | Verified Complete |
+| **13** | **Abuse Prevention** | **NEXT ELIGIBLE PHASE** | Phase 12 | Inbound body size limits, rate limiting, connection timeouts | Fuzzing & request flood tests | Eligible to Begin |
 | **14** | **Security Hardening** | **NOT STARTED** | Phase 13 | SSRF IP allowlisting, dependency audit, security regression suite | `cargo audit`, SSRF block tests | Pending Approval |
 | **15** | **Google Drive Integration** | **NOT STARTED** | Phase 14 | OAuth token exchange, `drive.appdata` scope client, Drive I/O | Mock Google Drive API tests | Pending Approval |
 | **16** | **Chat History & Synchronization** | **NOT STARTED** | Phase 15 | Canonical chat schemas, LWW conflict resolution, pagination | Multi-device sync conflict tests | Pending Approval |
@@ -130,8 +143,8 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Phase 11 Formally Closed & Verified:** All mandatory acceptance criteria (OIDC verification, constant-time PAT/API keys, fail-closed production config, identity propagation, route matrix enforcement, concurrent JWKS handling) are fully verified and passing.
-2. **Phase 12 (Authorization and Secret Management) Is Next Eligible Phase:** Phase 12 remains unstarted and strictly on hold until separate explicit user authorization. No Phase 12 code has been implemented.
+1. **Phase 12 Formally Closed & Verified:** All mandatory acceptance criteria (resource ownership, tenant isolation on telemetry, IDOR defenses, dynamic PAT engine with single exposure, privilege escalation prevention, `SecretString` redaction, `AesGcmCipher` encryption at rest, atomic revocation concurrency) are fully implemented and verified with 333 passing tests.
+2. **Phase 13 (Abuse Prevention) Is Next Eligible Phase:** Phase 13 remains strictly on hold until separate explicit user authorization. No Phase 13 code has been implemented.
 3. **Repository State Protected:** Secrets, local SQLite databases (`data/usage.db`), and compiled binaries (`target/`) are strictly excluded from version control with zero credential leakage.
 
 

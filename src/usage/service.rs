@@ -72,6 +72,7 @@ impl UsageService {
         outcome: RequestOutcome,
         failure_category: Option<String>,
         usage: Option<&UsageMetadata>,
+        subject: Option<&str>,
     ) {
         let latency_ms = start_instant.elapsed().as_millis() as u64;
         let completion_time = SystemTime::now()
@@ -104,6 +105,7 @@ impl UsageService {
             total_tokens,
             usage_source,
             record_status: RecordStatus::Final,
+            subject: subject.map(ToString::to_string),
         };
 
         if let Err(err) = self.storage.record(record.clone()).await {
@@ -146,6 +148,7 @@ impl UsageService {
         outcome: RequestOutcome,
         failure_category: Option<String>,
         usage: Option<&UsageMetadata>,
+        subject: Option<&str>,
     ) {
         let latency_ms = start_instant.elapsed().as_millis() as u64;
         let completion_time = SystemTime::now()
@@ -178,6 +181,7 @@ impl UsageService {
             total_tokens,
             usage_source,
             record_status: RecordStatus::Final,
+            subject: subject.map(ToString::to_string),
         };
 
         if let Err(err) = self.storage.record(record.clone()).await {

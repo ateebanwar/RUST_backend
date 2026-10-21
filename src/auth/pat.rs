@@ -5,6 +5,7 @@
 //! memory exposure.
 
 use super::principal::{AuthPrincipal, AuthRole, AuthType, ClientType};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 /// Length of SHA-256 digest in bytes.
@@ -91,12 +92,15 @@ impl ConfiguredCredential {
             key_id: key_id.clone(),
             subject: format!("service:{key_id}"),
             email: None,
-            roles: vec![AuthRole::Service],
+            roles: vec![AuthRole::Service, AuthRole::Admin],
             scopes: vec![
+                "*".to_string(),
                 "chat".to_string(),
+                "chat:write".to_string(),
                 "models:read".to_string(),
                 "routing:read".to_string(),
                 "usage:read".to_string(),
+                "auth:tokens".to_string(),
             ],
             auth_type: AuthType::ApiKey,
         }
@@ -133,6 +137,7 @@ impl ConfiguredCredential {
 #[derive(Clone, Default)]
 pub struct PatValidator {
     credentials: Vec<ConfiguredCredential>,
+    credential_store: Option<Arc<super::credential_store::CredentialStore>>,
 }
 
 impl PatValidator {
@@ -140,7 +145,19 @@ impl PatValidator {
     pub fn new() -> Self {
         Self {
             credentials: Vec::new(),
+            credential_store: None,
         }
+    }
+
+    /// Attach a dynamic CredentialStore for runtime PAT validation.
+    pub fn with_store(mut self, store: Arc<super::credential_store::CredentialStore>) -> Self {
+        self.credential_store = Some(store);
+        self
+    }
+
+    /// Access reference to attached CredentialStore if configured.
+    pub fn credential_store(&self) -> Option<&Arc<super::credential_store::CredentialStore>> {
+        self.credential_store.as_ref()
     }
 
     /// Create a PatValidator initialized from a list of configured API keys.
@@ -188,16 +205,23 @@ impl PatValidator {
             }
         }
 
-        matched.map(|cred| {
-            AuthPrincipal::new(
+        if let Some(cred) = matched {
+            return Some(AuthPrincipal::new(
                 &cred.subject,
                 cred.auth_type,
                 client_type,
                 cred.email.clone(),
                 cred.roles.clone(),
                 cred.scopes.clone(),
-            )
-        })
+            ));
+        }
+
+        // If not matched by static credentials, query dynamic credential store
+        if let Some(ref store) = self.credential_store {
+            return store.validate_token(trimmed, client_type);
+        }
+
+        None
     }
 }
 

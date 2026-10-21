@@ -48,6 +48,11 @@ impl UsageStorage {
     pub fn db_path(&self) -> &str {
         &self.db_path
     }
+
+    /// Access database connection handle.
+    pub fn conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
     /// Initialize storage at the specified file path or in-memory (":memory:").
     pub fn new(db_path: &str) -> Result<Self, StorageError> {
         let is_memory = db_path == ":memory:" || db_path.contains("mode=memory");
@@ -132,14 +137,17 @@ impl UsageStorage {
                 completion_tokens INTEGER,
                 total_tokens INTEGER,
                 usage_source TEXT NOT NULL,
-                record_status TEXT NOT NULL
+                record_status TEXT NOT NULL,
+                subject TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_usage_records_start_time ON usage_records(start_time);
             CREATE INDEX IF NOT EXISTS idx_usage_records_provider ON usage_records(provider_id);
             CREATE INDEX IF NOT EXISTS idx_usage_records_model ON usage_records(model_id);
             CREATE INDEX IF NOT EXISTS idx_usage_records_outcome ON usage_records(outcome);
-            CREATE INDEX IF NOT EXISTS idx_usage_records_composite ON usage_records(start_time, provider_id, model_id);",
+            CREATE INDEX IF NOT EXISTS idx_usage_records_composite ON usage_records(start_time, provider_id, model_id);
+            CREATE INDEX IF NOT EXISTS idx_usage_records_subject ON usage_records(subject);
+            CREATE INDEX IF NOT EXISTS idx_usage_records_tenant_start_time ON usage_records(subject, start_time);",
         )
         .map_err(|e| StorageError::MigrationError(format!("Schema migration failed: {e}")))?;
 
@@ -177,6 +185,55 @@ impl UsageStorage {
         )
         .map_err(|e| StorageError::MigrationError(format!("Migration v2 log failed: {e}")))?;
 
+        // Migration version 3: Tenant isolation and subject tracking
+        let v3_applied: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !v3_applied {
+            let has_subject_col: bool = conn
+                .prepare("PRAGMA table_info(usage_records)")
+                .and_then(|mut stmt| {
+                    let mut rows = stmt.query([])?;
+                    let mut found = false;
+                    while let Some(row) = rows.next()? {
+                        let name: String = row.get(1)?;
+                        if name == "subject" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Ok(found)
+                })
+                .unwrap_or(false);
+
+            if !has_subject_col {
+                conn.execute_batch("ALTER TABLE usage_records ADD COLUMN subject TEXT;")
+                    .map_err(|e| {
+                        StorageError::MigrationError(format!(
+                            "Schema migration v3 add column failed: {e}"
+                        ))
+                    })?;
+            }
+
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_usage_records_subject ON usage_records(subject);
+                 CREATE INDEX IF NOT EXISTS idx_usage_records_tenant_start_time ON usage_records(subject, start_time);",
+            )
+            .map_err(|e| StorageError::MigrationError(format!("Schema migration v3 indices failed: {e}")))?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?1)",
+                params![now],
+            )
+            .map_err(|e| StorageError::MigrationError(format!("Migration v3 log failed: {e}")))?;
+        }
+
         Ok(())
     }
 
@@ -203,8 +260,9 @@ impl UsageStorage {
             "INSERT OR REPLACE INTO usage_records (
                 id, provider_id, model_id, request_mode, routing_mode,
                 start_time, completion_time, latency_ms, outcome, failure_category,
-                prompt_tokens, completion_tokens, total_tokens, usage_source, record_status
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                prompt_tokens, completion_tokens, total_tokens, usage_source, record_status,
+                subject
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 record.id,
                 record.provider_id,
@@ -221,6 +279,7 @@ impl UsageStorage {
                 total_tokens,
                 record.usage_source.as_str(),
                 record.record_status.as_str(),
+                record.subject,
             ],
         )
         .map_err(|e| {
@@ -459,8 +518,9 @@ impl UsageStorage {
                         "INSERT OR REPLACE INTO usage_records (
                             id, provider_id, model_id, request_mode, routing_mode,
                             start_time, completion_time, latency_ms, outcome, failure_category,
-                            prompt_tokens, completion_tokens, total_tokens, usage_source, record_status
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                            prompt_tokens, completion_tokens, total_tokens, usage_source, record_status,
+                            subject
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                         params![
                             rec.id,
                             rec.provider_id,
@@ -477,6 +537,7 @@ impl UsageStorage {
                             total_tokens,
                             rec.usage_source.as_str(),
                             rec.record_status.as_str(),
+                            rec.subject,
                         ],
                     );
 
@@ -596,7 +657,32 @@ impl UsageStorage {
             .lock()
             .map_err(|e| StorageError::LockError(e.to_string()))?;
 
-        let mut sql = "SELECT 
+        let mut where_clause = String::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(st) = filter.start_time {
+            where_clause.push_str(" AND start_time >= ?");
+            params_vec.push(Box::new(st as i64));
+        }
+        if let Some(et) = filter.end_time {
+            where_clause.push_str(" AND start_time <= ?");
+            params_vec.push(Box::new(et as i64));
+        }
+        if let Some(ref p) = filter.provider_id {
+            where_clause.push_str(" AND provider_id = ?");
+            params_vec.push(Box::new(p.clone()));
+        }
+        if let Some(ref m) = filter.model_id {
+            where_clause.push_str(" AND model_id = ?");
+            params_vec.push(Box::new(m.clone()));
+        }
+        if let Some(ref s) = filter.subject {
+            where_clause.push_str(" AND subject = ?");
+            params_vec.push(Box::new(s.clone()));
+        }
+
+        let sql = format!(
+            "SELECT 
                 COUNT(*) as total_reqs,
                 COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) as success_reqs,
                 COALESCE(SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END), 0) as fail_reqs,
@@ -606,26 +692,8 @@ impl UsageStorage {
                 COALESCE(SUM(completion_tokens), 0) as sum_completion_tokens,
                 COALESCE(SUM(total_tokens), 0) as sum_total_tokens,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency
-            FROM usage_records WHERE 1=1".to_string();
-
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if let Some(st) = filter.start_time {
-            sql.push_str(" AND start_time >= ?");
-            params_vec.push(Box::new(st as i64));
-        }
-        if let Some(et) = filter.end_time {
-            sql.push_str(" AND start_time <= ?");
-            params_vec.push(Box::new(et as i64));
-        }
-        if let Some(ref p) = filter.provider_id {
-            sql.push_str(" AND provider_id = ?");
-            params_vec.push(Box::new(p.clone()));
-        }
-        if let Some(ref m) = filter.model_id {
-            sql.push_str(" AND model_id = ?");
-            params_vec.push(Box::new(m.clone()));
-        }
+            FROM usage_records WHERE 1=1 {where_clause}"
+        );
 
         let rusqlite_params: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|b| b.as_ref()).collect();
@@ -657,26 +725,15 @@ impl UsageStorage {
             .map_err(|e| StorageError::QueryError(format!("Summary query failed: {e}")))?;
 
         // Fetch percentiles (p50, p95)
-        let mut latencies_sql = "SELECT latency_ms FROM usage_records WHERE 1=1".to_string();
-        if let Some(st) = filter.start_time {
-            latencies_sql.push_str(&format!(" AND start_time >= {st}"));
-        }
-        if let Some(et) = filter.end_time {
-            latencies_sql.push_str(&format!(" AND start_time <= {et}"));
-        }
-        if let Some(ref p) = filter.provider_id {
-            latencies_sql.push_str(&format!(" AND provider_id = '{p}'"));
-        }
-        if let Some(ref m) = filter.model_id {
-            latencies_sql.push_str(&format!(" AND model_id = '{m}'"));
-        }
-        latencies_sql.push_str(" ORDER BY latency_ms ASC");
+        let latencies_sql = format!(
+            "SELECT latency_ms FROM usage_records WHERE 1=1 {where_clause} ORDER BY latency_ms ASC"
+        );
 
         let mut stmt = conn.prepare(&latencies_sql).map_err(|e| {
             StorageError::QueryError(format!("Latency query preparation failed: {e}"))
         })?;
         let latencies_iter = stmt
-            .query_map([], |row| row.get::<_, i64>(0))
+            .query_map(rusqlite_params.as_slice(), |row| row.get::<_, i64>(0))
             .map_err(|e| StorageError::QueryError(format!("Latency query failed: {e}")))?;
 
         let mut latencies: Vec<f64> = Vec::new();
@@ -697,13 +754,16 @@ impl UsageStorage {
             latencies[std::cmp::min(idx, latencies.len() - 1)]
         };
 
-        // Group by request mode
+        // Group by request mode (scoped by where_clause)
         let mut by_request_mode = HashMap::new();
+        let req_mode_sql = format!(
+            "SELECT request_mode, COUNT(*) FROM usage_records WHERE 1=1 {where_clause} GROUP BY request_mode"
+        );
         let mut req_mode_stmt = conn
-            .prepare("SELECT request_mode, COUNT(*) FROM usage_records GROUP BY request_mode")
+            .prepare(&req_mode_sql)
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
         let rows = req_mode_stmt
-            .query_map([], |r| {
+            .query_map(rusqlite_params.as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
             })
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
@@ -711,13 +771,16 @@ impl UsageStorage {
             by_request_mode.insert(r.0, r.1);
         }
 
-        // Group by routing mode
+        // Group by routing mode (scoped by where_clause)
         let mut by_routing_mode = HashMap::new();
+        let routing_sql = format!(
+            "SELECT routing_mode, COUNT(*) FROM usage_records WHERE 1=1 {where_clause} GROUP BY routing_mode"
+        );
         let mut routing_stmt = conn
-            .prepare("SELECT routing_mode, COUNT(*) FROM usage_records GROUP BY routing_mode")
+            .prepare(&routing_sql)
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
         let rows = routing_stmt
-            .query_map([], |r| {
+            .query_map(rusqlite_params.as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
             })
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
@@ -725,13 +788,16 @@ impl UsageStorage {
             by_routing_mode.insert(r.0, r.1);
         }
 
-        // Group by outcome
+        // Group by outcome (scoped by where_clause)
         let mut by_outcome = HashMap::new();
+        let outcome_sql = format!(
+            "SELECT outcome, COUNT(*) FROM usage_records WHERE 1=1 {where_clause} GROUP BY outcome"
+        );
         let mut outcome_stmt = conn
-            .prepare("SELECT outcome, COUNT(*) FROM usage_records GROUP BY outcome")
+            .prepare(&outcome_sql)
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
         let rows = outcome_stmt
-            .query_map([], |r| {
+            .query_map(rusqlite_params.as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
             })
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
@@ -777,7 +843,28 @@ impl UsageStorage {
             .lock()
             .map_err(|e| StorageError::LockError(e.to_string()))?;
 
-        let mut sql = "SELECT 
+        let mut where_clause = String::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(st) = filter.start_time {
+            where_clause.push_str(" AND start_time >= ?");
+            params_vec.push(Box::new(st as i64));
+        }
+        if let Some(et) = filter.end_time {
+            where_clause.push_str(" AND start_time <= ?");
+            params_vec.push(Box::new(et as i64));
+        }
+        if let Some(ref p) = filter.provider_id {
+            where_clause.push_str(" AND provider_id = ?");
+            params_vec.push(Box::new(p.clone()));
+        }
+        if let Some(ref s) = filter.subject {
+            where_clause.push_str(" AND subject = ?");
+            params_vec.push(Box::new(s.clone()));
+        }
+
+        let mut sql = format!(
+            "SELECT 
                 provider_id,
                 COUNT(*) as requests,
                 COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END), 0) as successful_requests,
@@ -785,28 +872,22 @@ impl UsageStorage {
                 COALESCE(SUM(CASE WHEN total_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) as known_usage_requests,
                 COALESCE(SUM(total_tokens), 0) as total_tokens,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency
-            FROM usage_records WHERE 1=1".to_string();
+            FROM usage_records WHERE 1=1 {where_clause} GROUP BY provider_id ORDER BY requests DESC"
+        );
 
-        if let Some(st) = filter.start_time {
-            sql.push_str(&format!(" AND start_time >= {st}"));
-        }
-        if let Some(et) = filter.end_time {
-            sql.push_str(&format!(" AND start_time <= {et}"));
-        }
-        if let Some(ref p) = filter.provider_id {
-            sql.push_str(&format!(" AND provider_id = '{p}'"));
-        }
-
-        sql.push_str(" GROUP BY provider_id ORDER BY requests DESC");
         if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
+            sql.push_str(" LIMIT ?");
+            params_vec.push(Box::new(limit as i64));
         }
+
+        let rusqlite_params: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite_params.as_slice(), |row| {
                 Ok(ProviderUsageSummary {
                     provider_id: row.get(0)?,
                     requests: row.get::<_, i64>(1)? as u64,
@@ -846,7 +927,32 @@ impl UsageStorage {
             .lock()
             .map_err(|e| StorageError::LockError(e.to_string()))?;
 
-        let mut sql = "SELECT 
+        let mut where_clause = String::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(st) = filter.start_time {
+            where_clause.push_str(" AND start_time >= ?");
+            params_vec.push(Box::new(st as i64));
+        }
+        if let Some(et) = filter.end_time {
+            where_clause.push_str(" AND start_time <= ?");
+            params_vec.push(Box::new(et as i64));
+        }
+        if let Some(ref p) = filter.provider_id {
+            where_clause.push_str(" AND provider_id = ?");
+            params_vec.push(Box::new(p.clone()));
+        }
+        if let Some(ref m) = filter.model_id {
+            where_clause.push_str(" AND model_id = ?");
+            params_vec.push(Box::new(m.clone()));
+        }
+        if let Some(ref s) = filter.subject {
+            where_clause.push_str(" AND subject = ?");
+            params_vec.push(Box::new(s.clone()));
+        }
+
+        let mut sql = format!(
+            "SELECT 
                 model_id,
                 provider_id,
                 COUNT(*) as requests,
@@ -855,31 +961,22 @@ impl UsageStorage {
                 COALESCE(SUM(CASE WHEN total_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) as known_usage_requests,
                 COALESCE(SUM(total_tokens), 0) as total_tokens,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency
-            FROM usage_records WHERE 1=1".to_string();
+            FROM usage_records WHERE 1=1 {where_clause} GROUP BY model_id, provider_id ORDER BY requests DESC"
+        );
 
-        if let Some(st) = filter.start_time {
-            sql.push_str(&format!(" AND start_time >= {st}"));
-        }
-        if let Some(et) = filter.end_time {
-            sql.push_str(&format!(" AND start_time <= {et}"));
-        }
-        if let Some(ref p) = filter.provider_id {
-            sql.push_str(&format!(" AND provider_id = '{p}'"));
-        }
-        if let Some(ref m) = filter.model_id {
-            sql.push_str(&format!(" AND model_id = '{m}'"));
-        }
-
-        sql.push_str(" GROUP BY model_id, provider_id ORDER BY requests DESC");
         if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
+            sql.push_str(" LIMIT ?");
+            params_vec.push(Box::new(limit as i64));
         }
+
+        let rusqlite_params: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite_params.as_slice(), |row| {
                 Ok(ModelUsageSummary {
                     model_id: row.get(0)?,
                     provider_id: row.get(1)?,
@@ -920,35 +1017,51 @@ impl UsageStorage {
             .lock()
             .map_err(|e| StorageError::LockError(e.to_string()))?;
 
-        let mut sql = "SELECT 
-                id, provider_id, model_id, request_mode, routing_mode,
-                start_time, completion_time, latency_ms, outcome, failure_category,
-                prompt_tokens, completion_tokens, total_tokens, usage_source, record_status
-            FROM usage_records WHERE 1=1"
-            .to_string();
+        let mut where_clause = String::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(st) = filter.start_time {
-            sql.push_str(&format!(" AND start_time >= {st}"));
+            where_clause.push_str(" AND start_time >= ?");
+            params_vec.push(Box::new(st as i64));
         }
         if let Some(et) = filter.end_time {
-            sql.push_str(&format!(" AND start_time <= {et}"));
+            where_clause.push_str(" AND start_time <= ?");
+            params_vec.push(Box::new(et as i64));
         }
         if let Some(ref p) = filter.provider_id {
-            sql.push_str(&format!(" AND provider_id = '{p}'"));
+            where_clause.push_str(" AND provider_id = ?");
+            params_vec.push(Box::new(p.clone()));
         }
         if let Some(ref m) = filter.model_id {
-            sql.push_str(&format!(" AND model_id = '{m}'"));
+            where_clause.push_str(" AND model_id = ?");
+            params_vec.push(Box::new(m.clone()));
+        }
+        if let Some(ref s) = filter.subject {
+            where_clause.push_str(" AND subject = ?");
+            params_vec.push(Box::new(s.clone()));
         }
 
-        sql.push_str(" ORDER BY start_time DESC");
+        let mut sql = format!(
+            "SELECT 
+                id, provider_id, model_id, request_mode, routing_mode,
+                start_time, completion_time, latency_ms, outcome, failure_category,
+                prompt_tokens, completion_tokens, total_tokens, usage_source, record_status,
+                subject
+            FROM usage_records WHERE 1=1 {where_clause} ORDER BY start_time DESC"
+        );
+
         let limit = filter.limit.unwrap_or(100).min(1000);
-        sql.push_str(&format!(" LIMIT {limit}"));
+        sql.push_str(" LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
+
+        let rusqlite_params: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| StorageError::QueryError(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite_params.as_slice(), |row| {
                 let req_mode_str: String = row.get(3)?;
                 let routing_mode_str: String = row.get(4)?;
                 let outcome_str: String = row.get(8)?;
@@ -971,6 +1084,7 @@ impl UsageStorage {
                     total_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                     usage_source: UsageSource::from_str_lossy(&source_str),
                     record_status: RecordStatus::from_str_lossy(&status_str),
+                    subject: row.get::<_, Option<String>>(15)?,
                 })
             })
             .map_err(|e| StorageError::QueryError(e.to_string()))?;

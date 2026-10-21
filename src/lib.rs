@@ -25,6 +25,7 @@ pub use auth::{
     AuthPrincipal, AuthRole, AuthService, AuthType, ClientType, GoogleClaims, GoogleOidcValidator,
     HttpJwksProvider, JwksProvider, MockJwksProvider, PatValidator, auth_middleware,
 };
+pub use auth::{CredentialMetadata, CredentialStore};
 pub use config::AppConfig;
 pub use errors::AppError;
 pub use inference::{ChatCompletionRequest, InferenceService};
@@ -48,6 +49,7 @@ pub struct RequestId(pub String);
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub auth: Arc<AuthService>,
+    pub credentials: Arc<crate::auth::CredentialStore>,
     pub registry: Arc<ModelRegistry>,
     pub providers: Arc<ProviderRegistry>,
     pub router: Arc<ModelRouter>,
@@ -59,7 +61,6 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        let auth = Arc::new(AuthService::new(config.clone()));
         let registry = Arc::new(ModelRegistry::new());
         let providers = Arc::new(ProviderRegistry::new());
         let quota = Arc::new(QuotaService::new());
@@ -82,7 +83,14 @@ impl AppState {
             &config.usage_spool_path,
             config.usage_max_spool_bytes,
         ));
-        let usage = Arc::new(UsageService::with_spool(usage_storage, usage_spool));
+        let usage = Arc::new(UsageService::with_spool(usage_storage.clone(), usage_spool));
+
+        let credentials = Arc::new(
+            crate::auth::CredentialStore::new(usage_storage.conn())
+                .expect("Failed to initialize CredentialStore"),
+        );
+        let auth =
+            Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
 
         // Enforce usage retention cleanup on startup if explicitly configured
         if let Some(retention_days) = config.usage_retention_days.filter(|&d| d > 0) {
@@ -195,6 +203,7 @@ impl AppState {
         Self {
             config,
             auth,
+            credentials,
             registry,
             providers,
             router,
@@ -210,11 +219,16 @@ impl AppState {
         registry: Arc<ModelRegistry>,
         router: Arc<ModelRouter>,
     ) -> Self {
-        let auth = Arc::new(AuthService::new(config.clone()));
         let providers = Arc::new(ProviderRegistry::new());
         let quota = Arc::new(QuotaService::new());
         let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
-        let usage = Arc::new(UsageService::new(storage));
+        let usage = Arc::new(UsageService::new(storage.clone()));
+        let credentials = Arc::new(
+            crate::auth::CredentialStore::new(storage.conn())
+                .expect("In-memory CredentialStore failed"),
+        );
+        let auth =
+            Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
         let inference = Arc::new(
             InferenceService::new(
                 config.clone(),
@@ -227,6 +241,7 @@ impl AppState {
         Self {
             config,
             auth,
+            credentials,
             registry,
             providers,
             router,
@@ -243,10 +258,15 @@ impl AppState {
         providers: Arc<ProviderRegistry>,
         router: Arc<ModelRouter>,
     ) -> Self {
-        let auth = Arc::new(AuthService::new(config.clone()));
         let quota = Arc::new(QuotaService::new());
         let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
-        let usage = Arc::new(UsageService::new(storage));
+        let usage = Arc::new(UsageService::new(storage.clone()));
+        let credentials = Arc::new(
+            crate::auth::CredentialStore::new(storage.conn())
+                .expect("In-memory CredentialStore failed"),
+        );
+        let auth =
+            Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
         let inference = Arc::new(
             InferenceService::new(
                 config.clone(),
@@ -259,6 +279,7 @@ impl AppState {
         Self {
             config,
             auth,
+            credentials,
             registry,
             providers,
             router,
@@ -277,7 +298,12 @@ impl AppState {
         usage: Arc<UsageService>,
         quota: Arc<QuotaService>,
     ) -> Self {
-        let auth = Arc::new(AuthService::new(config.clone()));
+        let credentials = Arc::new(
+            crate::auth::CredentialStore::new(usage.storage().conn())
+                .expect("Failed to initialize CredentialStore"),
+        );
+        let auth =
+            Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
         let inference = Arc::new(
             InferenceService::new(
                 config.clone(),
@@ -290,6 +316,7 @@ impl AppState {
         Self {
             config,
             auth,
+            credentials,
             registry,
             providers,
             router,
@@ -303,6 +330,12 @@ impl AppState {
     /// Builder helper to replace AuthService (e.g. for deterministic mock JWKS in tests).
     pub fn with_auth_service(mut self, auth: Arc<AuthService>) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Builder helper to replace CredentialStore.
+    pub fn with_credentials(mut self, credentials: Arc<crate::auth::CredentialStore>) -> Self {
+        self.credentials = credentials;
         self
     }
 }

@@ -614,6 +614,7 @@ async fn test_durable_usage_retry_queue_lifecycle() {
         total_tokens: Some(75),
         usage_source: UsageSource::Reported,
         record_status: RecordStatus::Final,
+        subject: None,
     };
 
     // Enqueue to retry queue
@@ -659,6 +660,7 @@ async fn test_bounded_retention_prune_and_wal_checkpoint() {
             total_tokens: Some(15),
             usage_source: UsageSource::Reported,
             record_status: RecordStatus::Final,
+            subject: None,
         };
         storage.record(record).await.unwrap();
     }

@@ -451,6 +451,81 @@ data: {"status":"completed"}
 }
 ```
 
+### 8.3 Personal Access Token & Dynamic Credential Lifecycle (Phase 12)
+- **Scope Requirement:** `auth:tokens`
+
+#### 8.3.1 Generate Token
+- **Method & Path:** `POST /api/v1/auth/tokens`
+- **Request Schema:**
+```json
+{
+  "name": "Developer Laptop Key",
+  "owner_subject": "optional_target_subject_for_admin_only",
+  "scopes": ["chat:write", "usage:read"],
+  "expires_in_secs": 2592000
+}
+```
+- **Response Schema (201 Created):**
+Plaintext token is returned exactly ONCE upon creation. Secrets are never persisted in plaintext.
+```json
+{
+  "token": "pat_1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+  "metadata": {
+    "id": "cred_019482710182",
+    "name": "Developer Laptop Key",
+    "owner_subject": "user_12345",
+    "masked_token": "pat_1a2b...5c6d",
+    "roles": ["user"],
+    "scopes": ["chat:write", "usage:read"],
+    "created_at": 1700000000,
+    "expires_at": 1702592000,
+    "revoked": false,
+    "revoked_at": null
+  }
+}
+```
+
+#### 8.3.2 List Tokens
+- **Method & Path:** `GET /api/v1/auth/tokens`
+- **Isolation Rule:** Standard callers view strictly their own credentials. Querying another user returns 403 Forbidden. Plaintext tokens are NEVER exposed.
+- **Response Schema (200 OK):**
+```json
+[
+  {
+    "id": "cred_019482710182",
+    "name": "Developer Laptop Key",
+    "owner_subject": "user_12345",
+    "masked_token": "pat_1a2b...5c6d",
+    "roles": ["user"],
+    "scopes": ["chat:write", "usage:read"],
+    "created_at": 1700000000,
+    "expires_at": 1702592000,
+    "revoked": false,
+    "revoked_at": null
+  }
+]
+```
+
+#### 8.3.3 Inspect Token Metadata
+- **Method & Path:** `GET /api/v1/auth/tokens/{id}`
+- **IDOR Defense:** Requesting a credential owned by another subject returns `404 Not Found` to prevent existence enumeration.
+
+#### 8.3.4 Rotate Token
+- **Method & Path:** `POST /api/v1/auth/tokens/{id}/rotate`
+- **Semantics:** Atomically invalidates the old token (immediately returns 401 on old token usage) and returns the new plaintext token once.
+
+#### 8.3.5 Revoke Token
+- **Method & Path:** `DELETE /api/v1/auth/tokens/{id}`
+- **Response (204 No Content):** Atomically revokes token in persistent storage and validation cache.
+
+---
+
+### 8.4 Resource Ownership & Tenant Telemetry Isolation
+- Standard users are strictly bound to their authenticated `AuthPrincipal.subject`.
+- Usage endpoints (`/api/v1/usage/summary`, `/api/v1/usage/providers`, `/api/v1/usage/models`) automatically filter results by the caller's identity.
+- Attempting to pass `?user_id=` or `?subject=` targeting another user's identifier returns `403 Forbidden` (`code: FORBIDDEN`, IDOR violation).
+- Administrative principals (`AuthRole::Admin`) and service callers (`AuthRole::Service`) may view global aggregated telemetry or pass `?user_id=` filters.
+
 ---
 
 ## 9. API Versioning, Deprecation & Backward Compatibility Policy

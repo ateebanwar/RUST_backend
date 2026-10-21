@@ -140,6 +140,7 @@ async fn test_sqlite_storage_migration_and_persistence() {
             total_tokens: Some(30),
             usage_source: UsageSource::Reported,
             record_status: RecordStatus::Final,
+            subject: None,
         };
 
         storage.record(record).await.expect("Insert must succeed");
@@ -191,6 +192,7 @@ async fn test_sqlite_concurrent_writes_without_data_races() {
                 total_tokens: Some(25),
                 usage_source: UsageSource::Reported,
                 record_status: RecordStatus::Final,
+                subject: None,
             };
             storage_clone.record(record).await.unwrap();
         }));
@@ -664,6 +666,7 @@ async fn test_usage_and_quota_http_endpoints_and_secret_isolation() {
         total_tokens: Some(100),
         usage_source: UsageSource::Reported,
         record_status: RecordStatus::Final,
+        subject: None,
     };
     storage.record(record).await.unwrap();
 
@@ -808,6 +811,7 @@ async fn test_usage_query_filters_and_bounds() {
             total_tokens: Some(30),
             usage_source: UsageSource::Reported,
             record_status: RecordStatus::Final,
+            subject: None,
         },
         UsageRecord {
             id: "req_f_02".to_string(),
@@ -825,6 +829,7 @@ async fn test_usage_query_filters_and_bounds() {
             total_tokens: Some(100),
             usage_source: UsageSource::Reported,
             record_status: RecordStatus::Final,
+            subject: None,
         },
         UsageRecord {
             id: "req_f_03".to_string(),
@@ -842,6 +847,7 @@ async fn test_usage_query_filters_and_bounds() {
             total_tokens: Some(15),
             usage_source: UsageSource::Reported,
             record_status: RecordStatus::Final,
+            subject: None,
         },
     ];
 
@@ -976,6 +982,7 @@ async fn test_usage_retention_pruning() {
         total_tokens: Some(30),
         usage_source: UsageSource::Reported,
         record_status: RecordStatus::Final,
+        subject: None,
     };
     // Record 2: 10 days old
     let r2 = UsageRecord {
@@ -994,6 +1001,7 @@ async fn test_usage_retention_pruning() {
         total_tokens: Some(30),
         usage_source: UsageSource::Reported,
         record_status: RecordStatus::Final,
+        subject: None,
     };
     // Record 3: 1 day old
     let r3 = UsageRecord {
@@ -1012,6 +1020,7 @@ async fn test_usage_retention_pruning() {
         total_tokens: Some(30),
         usage_source: UsageSource::Reported,
         record_status: RecordStatus::Final,
+        subject: None,
     };
 
     storage.record(r1).await.unwrap();

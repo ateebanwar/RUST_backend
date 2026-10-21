@@ -4,12 +4,17 @@
 //! Personal Access Token (PAT) constant-time hashing and verification, authorization roles,
 //! and Axum authentication middleware.
 
+pub mod credential_store;
 pub mod middleware;
 pub mod oidc;
 pub mod pat;
 pub mod principal;
 pub mod service;
 
+pub use credential_store::{
+    CreateTokenRequest, CreateTokenResponse, CredentialMetadata, CredentialStore,
+    RotateTokenResponse,
+};
 pub use middleware::auth_middleware;
 pub use oidc::{
     GoogleClaims, GoogleOidcValidator, HttpJwksProvider, JwksProvider, MockJwksProvider, OidcError,

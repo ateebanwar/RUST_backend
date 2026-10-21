@@ -2,6 +2,7 @@
 //!
 //! Conforms strictly to API_SPEC.md §5 and §6, and Phase 8 Usage and Quota Tracking.
 
+use crate::auth::principal::AuthPrincipal;
 use crate::errors::AppError;
 use crate::inference::ChatCompletionRequest;
 use crate::models::{CompletionResponse, UsageMetadata};
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub async fn chat_completions(
     State(state): State<AppState>,
     Extension(RequestId(req_id)): Extension<RequestId>,
+    principal: Option<Extension<AuthPrincipal>>,
     Json(mut payload): Json<ChatCompletionRequest>,
 ) -> Result<(StatusCode, Json<CompletionResponse>), Response> {
     let start_instant = Instant::now();
@@ -39,6 +41,8 @@ pub async fn chat_completions(
     } else {
         RoutingMode::Auto
     };
+
+    let caller_subject = principal.as_ref().map(|p| p.0.subject.as_str());
 
     payload.stream = false;
 
@@ -56,6 +60,7 @@ pub async fn chat_completions(
                     RequestOutcome::Success,
                     None,
                     response.usage.as_ref(),
+                    caller_subject,
                 )
                 .await;
 
@@ -99,6 +104,7 @@ pub async fn chat_completions(
                     outcome,
                     Some(err.error_code().to_string()),
                     None,
+                    caller_subject,
                 )
                 .await;
 
@@ -118,6 +124,7 @@ struct StreamFinalizationGuard {
     start_instant: Instant,
     start_epoch_ms: u64,
     latest_usage: Arc<std::sync::Mutex<Option<UsageMetadata>>>,
+    subject: Option<String>,
 }
 
 impl Drop for StreamFinalizationGuard {
@@ -133,6 +140,7 @@ impl Drop for StreamFinalizationGuard {
             let r_mode = self.routing_mode;
             let s_inst = self.start_instant;
             let s_epoch = self.start_epoch_ms;
+            let subj = self.subject.clone();
 
             tokio::spawn(async move {
                 usage_svc
@@ -146,6 +154,7 @@ impl Drop for StreamFinalizationGuard {
                         RequestOutcome::ClientCancelled,
                         Some("client_disconnected".to_string()),
                         usage.as_ref(),
+                        subj.as_deref(),
                     )
                     .await;
             });
@@ -173,6 +182,7 @@ enum SseStreamState {
 pub async fn chat_stream(
     State(state): State<AppState>,
     Extension(RequestId(req_id)): Extension<RequestId>,
+    principal: Option<Extension<AuthPrincipal>>,
     Json(mut payload): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, Response> {
     let start_instant = Instant::now();
@@ -186,6 +196,8 @@ pub async fn chat_stream(
     } else {
         RoutingMode::Auto
     };
+
+    let caller_subject = principal.as_ref().map(|p| p.0.subject.clone());
 
     payload.stream = true;
 
@@ -220,6 +232,7 @@ pub async fn chat_stream(
                     outcome,
                     Some(err.error_code().to_string()),
                     None,
+                    caller_subject.as_deref(),
                 )
                 .await;
 
@@ -252,6 +265,7 @@ pub async fn chat_stream(
         start_instant,
         start_epoch_ms,
         latest_usage: Arc::new(std::sync::Mutex::new(None)),
+        subject: caller_subject,
     });
 
     let initial_state = SseStreamState::SendRouting {
@@ -286,6 +300,7 @@ pub async fn chat_stream(
                             let r_mode = guard.routing_mode;
                             let s_inst = guard.start_instant;
                             let s_epoch = guard.start_epoch_ms;
+                            let subj = guard.subject.clone();
 
                             tokio::spawn(async move {
                                 usage_svc
@@ -299,6 +314,7 @@ pub async fn chat_stream(
                                         RequestOutcome::Success,
                                         None,
                                         usage.as_ref(),
+                                        subj.as_deref(),
                                     )
                                     .await;
                             });
@@ -325,6 +341,7 @@ pub async fn chat_stream(
                         let r_mode = guard.routing_mode;
                         let s_inst = guard.start_instant;
                         let s_epoch = guard.start_epoch_ms;
+                        let subj = guard.subject.clone();
 
                         tokio::spawn(async move {
                             usage_svc
@@ -338,6 +355,7 @@ pub async fn chat_stream(
                                     RequestOutcome::StreamInterrupted,
                                     Some("stream_interrupted".to_string()),
                                     usage.as_ref(),
+                                    subj.as_deref(),
                                 )
                                 .await;
                         });
@@ -364,6 +382,7 @@ pub async fn chat_stream(
                         let r_mode = guard.routing_mode;
                         let s_inst = guard.start_instant;
                         let s_epoch = guard.start_epoch_ms;
+                        let subj = guard.subject.clone();
 
                         tokio::spawn(async move {
                             usage_svc
@@ -377,6 +396,7 @@ pub async fn chat_stream(
                                     RequestOutcome::Success,
                                     None,
                                     usage.as_ref(),
+                                    subj.as_deref(),
                                 )
                                 .await;
                         });

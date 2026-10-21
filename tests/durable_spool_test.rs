@@ -41,6 +41,7 @@ fn sample_record(id: &str) -> UsageRecord {
         total_tokens: Some(40),
         usage_source: UsageSource::Reported,
         record_status: RecordStatus::Final,
+        subject: None,
     }
 }
 

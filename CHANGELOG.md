@@ -2,6 +2,46 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Phase 12: End-to-End Authorization, Resource Ownership, Dynamic PAT Lifecycle, and Secret Hardening
+
+### Implemented & Verified
+- **Resource Ownership & Tenant Isolation (`src/usage/storage.rs`, `src/routes/usage.rs`, `src/routes/chat.rs`):**
+  - Added `subject TEXT` column and indexes (`idx_usage_records_subject`, `idx_usage_records_tenant_start_time`) to `usage_records` via migration v3.
+  - Parameterized all usage queries (`get_summary`, `get_providers`, `get_models`, `get_records`) to strictly enforce caller identity boundaries.
+  - Streaming and buffered chat completion paths extract `AuthPrincipal.subject` and propagate caller identity to usage finalization drop guards.
+- **Insecure Direct Object Reference (IDOR) Defenses (`src/routes/usage.rs`, `src/auth/credential_store.rs`):**
+  - Non-admin callers attempting to access another user's telemetry (`?user_id=...` or `?subject=...`) fail closed with HTTP 403 Forbidden (`FORBIDDEN`).
+  - Requesting, rotating, or revoking a credential owned by another subject returns HTTP 404 Not Found, preventing existence enumeration.
+- **Dynamic Personal Access Token (PAT) Lifecycle Engine (`src/auth/credential_store.rs`, `src/routes/credentials.rs`):**
+  - Implemented SQLite-backed and cache-synchronized `CredentialStore`.
+  - Generates secure random tokens with OS entropy (`ring::rand::SystemRandom`).
+  - Single-exposure token semantics: plaintext token is returned ONCE upon creation (`POST /api/v1/auth/tokens`) or rotation (`POST /api/v1/auth/tokens/{id}/rotate`).
+  - List (`GET /api/v1/auth/tokens`) and inspect (`GET /api/v1/auth/tokens/{id}`) endpoints return masked representations (`pat_1234...ef01`), never exposing plaintext or raw hashes.
+  - Revocation (`DELETE /api/v1/auth/tokens/{id}`) atomically revokes the credential in persistent storage and memory cache.
+  - Privilege escalation defense: callers cannot create tokens granting scopes exceeding their own authorized scopes unless they hold `AuthRole::Admin` or wildcard `*`.
+- **Zero-Leak Secret Wrapper & Masking (`src/security/secret.rs`):**
+  - Implemented `SecretString` protecting secrets with custom `Debug`, `Display`, and `serde::Serialize` implementations that strictly format as `"[REDACTED]"`.
+  - Underlying secret string accessible only via explicit `expose_secret()`.
+  - Constant-time equality comparison via `subtle::ConstantTimeEq`.
+  - Implemented `mask_credential` helper producing safe non-secret identifiers.
+- **Authenticated Encryption at Rest (`src/security/encryption.rs`):**
+  - Implemented `AesGcmCipher` providing AES-256-GCM authenticated encryption using `ring::aead` with 96-bit random nonces and Associated Data (AAD) context binding.
+  - Tampered ciphertext, mismatched AAD, or wrong keys fail authentication safely.
+- **Comprehensive Verification & Test Suite Expansion (`tests/authorization_and_ownership_test.rs`):**
+  - Added 8 end-to-end security regression tests covering:
+    1. Tenant isolation across usage summary, providers, and models.
+    2. IDOR rejection on usage queries with HTTP 403 Forbidden.
+    3. Dynamic PAT lifecycle, single-exposure creation, list masking, and IDOR protection.
+    4. Privilege escalation defense preventing unauthorized scope grant.
+    5. Scope enforcement on credential endpoints rejecting tokens lacking `auth:tokens`.
+    6. `SecretString` zero-leak formatting and JSON serialization.
+    7. AES-256-GCM encryption, decryption, and tamper defense.
+    8. Concurrency safety: atomic revocation leaves zero access window under parallel load.
+  - Total test suite expanded to **333 passing tests** across 18 test suites (89 unit + 244 integration, 0 failures, 1 ignored load benchmark).
+  - All quality gates clean: `cargo fmt --check` clean, `cargo check` clean, `cargo clippy --all-targets --all-features -- -D warnings` clean, `cargo audit -n` clean (0 advisories across 183 dependencies), `gitleaks detect -v` clean (0 leaks), `cargo build --release` clean.
+
+---
+
 ## 2026-10-21 — Phase 11: Production-Grade Security Audit, Remediation, Header Hardening, and Multi-Audience azp Enforcement
 
 ### Audited, Corrected & Verified

@@ -171,6 +171,8 @@ pub struct UsageRecord {
     pub total_tokens: Option<u64>,
     pub usage_source: UsageSource,
     pub record_status: RecordStatus,
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 impl UsageRecord {
@@ -207,6 +209,7 @@ pub struct UsageQueryFilter {
     pub model_id: Option<String>,
     pub outcome: Option<String>,
     pub limit: Option<usize>,
+    pub subject: Option<String>,
 }
 
 impl UsageQueryFilter {
@@ -226,6 +229,11 @@ impl UsageQueryFilter {
 
     pub fn with_model_id(mut self, model_id: impl Into<String>) -> Self {
         self.model_id = Some(model_id.into());
+        self
+    }
+
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
         self
     }
 }

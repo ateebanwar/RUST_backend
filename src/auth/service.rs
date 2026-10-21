@@ -111,6 +111,15 @@ impl AuthService {
         }
     }
 
+    /// Attach a dynamic CredentialStore for runtime PAT lifecycle management.
+    pub fn with_credential_store(
+        mut self,
+        store: Arc<super::credential_store::CredentialStore>,
+    ) -> Self {
+        self.pat_validator = Arc::new(self.pat_validator.as_ref().clone().with_store(store));
+        self
+    }
+
     /// Access the underlying PAT validator.
     pub fn pat_validator(&self) -> &PatValidator {
         &self.pat_validator
@@ -232,6 +241,8 @@ impl AuthService {
             Some("chat")
         } else if normalized.starts_with("/api/v1/usage") || normalized == "/api/v1/quotas" {
             Some("usage:read")
+        } else if normalized.starts_with("/api/v1/auth/tokens") {
+            Some("auth:tokens")
         } else {
             None
         }

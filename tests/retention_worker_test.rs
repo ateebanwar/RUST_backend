@@ -33,6 +33,7 @@ fn test_record(id: &str, start_time_ms: u64) -> UsageRecord {
         total_tokens: Some(30),
         usage_source: UsageSource::Reported,
         record_status: RecordStatus::Final,
+        subject: None,
     }
 }
 

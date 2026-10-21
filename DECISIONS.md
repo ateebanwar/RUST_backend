@@ -329,3 +329,19 @@
   6. *Security Integration & Unit Test Expansion (`tests/authentication_test.rs`, `src/auth/oidc.rs`, `src/auth/service.rs`):* Added Tests 25–29 and 8 unit tests covering multi-audience OIDC with and without `azp`, duplicate and conflicting headers, oversized credentials, non-UTF-8 headers, route scope authorization, and concurrent OIDC/API key request safety. Total tests expanded to **325 passing tests** across 17 test suites (89 unit + 236 integration, 0 failures, 1 ignored benchmark).
 - **Consequences:** Provides complete, standards-compliant, fail-closed multi-client authentication. Verified by 325 automated tests with zero Clippy warnings, zero cargo-audit vulnerabilities, and zero secret leaks. Phase 12 (Authorization and Secret Management) remains strictly on hold.
 
+---
+
+### DEC-021: Phase 12 Implementation: Resource Ownership, Dynamic PAT Lifecycle, and Authenticated Secret Management
+- **Status:** APPROVED
+- **Date:** 2026-10-22
+- **Context:** Phase 12 mandates complete authorization, resource ownership enforcement, secret management, and security hardening across the entire backend. Specific requirements: (1) Resource ownership and tenant isolation on usage telemetry and quota tracking; (2) Insecure direct object reference (IDOR) prevention; (3) Dynamic Personal Access Token (PAT) lifecycle management with single-exposure creation/rotation, masked listings, and immediate revocation; (4) Scope privilege escalation prevention; (5) Authenticated encryption at rest (AES-256-GCM) with AAD binding; (6) Zero-leak secret representations (`SecretString`).
+- **Decisions Made:**
+  1. *Resource Ownership & Tenant Isolation on Usage Telemetry (`src/usage/storage.rs`, `src/routes/usage.rs`, `src/routes/chat.rs`):* Added `subject` column and indexes (`idx_usage_records_subject`, `idx_usage_records_tenant_start_time`) to `usage_records` via migration v3. Usage queries (`get_summary`, `get_providers`, `get_models`, `get_records`) strictly parameterize tenant filtering. Standard `AuthRole::User` callers are forced to their authenticated `principal.subject`. Query attempts targeting another user (`?user_id=...` or `?subject=...`) fail closed with HTTP 403 Forbidden (`code: FORBIDDEN`).
+  2. *Dynamic Credential & PAT Engine (`src/auth/credential_store.rs`, `src/routes/credentials.rs`):* Implemented SQLite-backed `CredentialStore` with memory cache for PAT creation, rotation, revocation, and listing. Tokens are generated via `ring::rand::SystemRandom`, hashed with SHA-256, and never stored in plaintext. Plaintext tokens are exposed strictly ONCE upon creation or rotation. List and inspect endpoints return masked identifiers (`pat_1234...cdef`).
+  3. *IDOR Defenses on Credentials:* Looking up, rotating, or revoking a token owned by another subject returns HTTP 404 Not Found to prevent resource existence enumeration.
+  4. *Privilege Escalation Defense:* Callers creating tokens cannot grant scopes exceeding their own scopes unless they possess `AuthRole::Admin` or wildcard scope `*`.
+  5. *Zero-Leak Secret Abstraction (`src/security/secret.rs`):* `SecretString` implements custom `Debug`, `Display`, and `serde::Serialize` formatting that unconditionally outputs `"[REDACTED]"`. Underlying secret is accessible only via `expose_secret()`.
+  6. *Authenticated Encryption at Rest (`src/security/encryption.rs`):* Implemented `AesGcmCipher` providing AES-256-GCM authenticated encryption using `ring::aead` with 96-bit random nonces and Associated Data (AAD) context binding.
+- **Consequences:** All 333 automated tests pass across 18 test suites with 0 failures, 0 Clippy warnings, 0 cargo audit vulnerabilities, and 0 secret leaks. Phase 12 is fully verified. Phase 13 (Rate limiting / Abuse prevention) remains on hold.
+
+
