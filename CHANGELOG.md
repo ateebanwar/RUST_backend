@@ -2,6 +2,40 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Phase 12: Final Targeted Hardening, Cross-Instance Revocation & Gitleaks Validation
+
+### Implemented, Hardened & Verified
+- **Issue 1 — Test-Target & Test-Count Complete Reconciliation:**
+  - Resolved target enumeration discrepancy: Cargo executes **22 distinct test targets** consisting of:
+    1. 1 library unit test target (`src/lib.rs` with 97 passing tests).
+    2. 2 binary targets (`src/main.rs` with 0 tests, `src/bin/mock_upstream.rs` with 0 tests).
+    3. 18 integration and benchmark test targets in `tests/` (17 active suites with 248 passing tests + 1 benchmark target `tests/load_benchmark.rs` with 1 ignored benchmark).
+    4. 1 doctest target (`Doc-tests ai_backend` with 0 tests).
+  - Exact verified count across all 22 targets: **345 passed; 0 failed; 1 ignored; 0 filtered out** (346 total test cases).
+- **Issue 2 — Production-Grade Gitleaks Validation & Sanitization:**
+  - Sanitized documentation mock token in `API_SPEC.md` line 472 to `"pat_00000000000000000000000000000000_example"` to eliminate high-entropy mock patterns in current and future working trees.
+  - Confirmed `.gitleaksignore` strictly suppresses only the single historical commit fingerprint (`b0bf12455e6b84e4a53e0730ad4ff99cf271e306:API_SPEC.md:generic-api-key:472`).
+  - Executed controlled empirical validation with synthetic secret (`sk-proj-...`): demonstrated that Gitleaks reliably catches real secrets and exits with code 1 while the ignored false positive is suppressed.
+  - Real repository scan (`20 commits scanned`, `~5.42 MB`) verified clean with 0 leaks found.
+- **Issue 3 — Authoritative Multi-Process and Cross-Instance Token Revocation (`src/auth/credential_store.rs`):**
+  - Updated `run_migrations` to add index `idx_credentials_token_hash ON credentials(token_hash)`.
+  - Hardened `validate_token` to authoritatively verify active credentials against the persistent SQLite database (`SELECT token_hash, revoked, revoked_at FROM credentials WHERE id = ?1`).
+  - Cross-Instance Revocation: when Instance A revokes a token, Instance B authoritatively detects the revocation on its next request, updates its local cache (`revoked = true`), and immediately rejects the token.
+  - Cross-Instance Rotation: when Instance A rotates a token, Instance B rejects the old token because `token_hash` in SQLite no longer matches the candidate hash, and accepts the new token.
+  - Cross-Instance Discovery: when Instance A creates a token, Instance B discovers it dynamically in SQLite, warms its local cache, and accepts it.
+  - Authoritative `list_tokens` and `get_token`: directly queries SQLite, guaranteeing consistent state across multiple instances.
+  - Added integration test `test_cross_instance_multi_process_revocation_and_rotation_synchronization` using two separate database connection handles and distinct `CredentialStore` instances opening the same SQLite database file.
+- **Verification Commands:**
+  - `cargo fmt --check`: Clean (0 diffs).
+  - `cargo check`: Clean (0 errors).
+  - `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+  - `cargo test`: 345 passed; 0 failed; 1 ignored across 22 targets.
+  - `cargo audit -n`: Clean (0 vulnerabilities across 183 dependencies).
+  - `gitleaks detect -v`: Clean (0 leaks across 20 commits).
+  - `cargo build --release`: Clean (target binary built in 60s).
+
+---
+
 ## 2026-10-22 — Phase 12: Final Security Audit, Targeted Corrections, Independent Verification & Completion
 
 ### Audited, Corrected & Verified

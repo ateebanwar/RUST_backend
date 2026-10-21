@@ -1104,3 +1104,129 @@ async fn test_concurrent_duplicate_revocations_safety() {
     let meta = store.get_token(&principal, &created.metadata.id).unwrap();
     assert!(meta.revoked);
 }
+
+// =========================================================================
+// 11. CROSS-INSTANCE MULTI-PROCESS REVOCATION & ROTATION SYNCHRONIZATION
+// =========================================================================
+
+#[test]
+fn test_cross_instance_multi_process_revocation_and_rotation_synchronization() {
+    use ai_backend::auth::CredentialStore;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let epoch_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let db_path = std::env::temp_dir().join(format!("ai_backend_cross_instance_{epoch_nanos}.db"));
+
+    // Two distinct OS database handles opening the same underlying SQLite file on disk,
+    // simulating two independent backend processes / serverless instances.
+    let conn_a = Arc::new(Mutex::new(Connection::open(&db_path).unwrap()));
+    let conn_b = Arc::new(Mutex::new(Connection::open(&db_path).unwrap()));
+
+    // Instance A and Instance B each have independent in-memory caches
+    let store_a = CredentialStore::new(conn_a).unwrap();
+    let store_b = CredentialStore::new(conn_b).unwrap();
+
+    let principal = AuthPrincipal::new(
+        "cross_process_user".to_string(),
+        AuthType::PersonalAccessToken,
+        ClientType::Flutter,
+        None,
+        vec![AuthRole::User],
+        vec![
+            "usage:read".to_string(),
+            "chat:write".to_string(),
+            "auth:tokens".to_string(),
+        ],
+    );
+
+    // 1. Instance A creates a new token
+    let token_resp = store_a
+        .create_token(
+            &principal,
+            CreateTokenRequest {
+                name: "Multi-Process Key".to_string(),
+                owner_subject: None,
+                scopes: None,
+                expires_in_secs: None,
+            },
+        )
+        .unwrap();
+
+    // 2. Instance B (which has an empty in-memory cache) receives the token:
+    // It dynamically queries SQLite storage, warms its cache, and validates successfully.
+    let principal_b = store_b.validate_token(&token_resp.token, ClientType::Flutter);
+    assert!(
+        principal_b.is_some(),
+        "Instance B must authoritatively discover and accept tokens created by Instance A"
+    );
+    assert_eq!(principal_b.unwrap().subject, "cross_process_user");
+
+    // 3. Instance A revokes the token
+    store_a
+        .revoke_token(&principal, &token_resp.metadata.id)
+        .unwrap();
+
+    // 4. Instance B receives the revoked token:
+    // Its in-memory cache had it marked active, but its authoritative check against SQLite
+    // detects the revocation committed by Instance A, synchronizes its local cache, and rejects it.
+    let revoked_b = store_b.validate_token(&token_resp.token, ClientType::Flutter);
+    assert!(
+        revoked_b.is_none(),
+        "Instance B must immediately reject tokens revoked by Instance A"
+    );
+
+    // Inspecting token on Instance B reflects revoked status
+    let meta_b = store_b
+        .get_token(&principal, &token_resp.metadata.id)
+        .unwrap();
+    assert!(meta_b.revoked);
+    assert!(meta_b.revoked_at.is_some());
+
+    // 5. Create another token on Instance A to test cross-instance rotation
+    let token2_resp = store_a
+        .create_token(
+            &principal,
+            CreateTokenRequest {
+                name: "Rotation Key".to_string(),
+                owner_subject: None,
+                scopes: None,
+                expires_in_secs: None,
+            },
+        )
+        .unwrap();
+
+    // Validate on Instance B to populate its cache
+    assert!(
+        store_b
+            .validate_token(&token2_resp.token, ClientType::Flutter)
+            .is_some()
+    );
+
+    // Rotate token on Instance A
+    let rotate_resp = store_a
+        .rotate_token(&principal, &token2_resp.metadata.id)
+        .unwrap();
+
+    // Instance B receives old token -> must be rejected immediately
+    assert!(
+        store_b
+            .validate_token(&token2_resp.token, ClientType::Flutter)
+            .is_none(),
+        "Instance B must immediately reject old rotated tokens"
+    );
+
+    // Instance B receives new token -> must be accepted
+    let new_principal_b = store_b.validate_token(&rotate_resp.new_token, ClientType::Flutter);
+    assert!(
+        new_principal_b.is_some(),
+        "Instance B must accept newly rotated token"
+    );
+
+    // Cleanup temporary test database file
+    let _ = std::fs::remove_file(&db_path);
+}

@@ -469,7 +469,7 @@ data: {"status":"completed"}
 Plaintext token is returned exactly ONCE upon creation. Secrets are never persisted in plaintext.
 ```json
 {
-  "token": "pat_1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+  "token": "pat_00000000000000000000000000000000_example",
   "metadata": {
     "id": "cred_019482710182",
     "name": "Developer Laptop Key",
