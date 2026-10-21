@@ -1,4 +1,4 @@
-# DECISIONS.md — Architecture Decision Records (ADR) Log
+# DECISIONS.md â€” Architecture Decision Records (ADR) Log
 
 **Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
 **Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
@@ -28,6 +28,7 @@
 | **DEC-015** | Model-Aware Tokenizer Integration, Capability Hierarchy & Context Admission | **APPROVED** | 2026-10-21 | Tokenizer Architecture & Context Safety |
 | **DEC-016** | Centralized Model-ID-to-Tokenizer Mapping, Truthful Framing Semantics, and Effective Message Context Admission | **APPROVED** | 2026-10-21 | Tokenizer Correctness & Routing Safety |
 | **DEC-017** | Phase 11 Multi-Client Authentication, Google OIDC ID Token Verification, and Constant-Time Credential Validation | **APPROVED** | 2026-10-21 | Authentication & Identity Security |
+| **DEC-018** | Phase 11 Hardening: Query-Parameter Credential Proscription, Route Scope Authorization, and Non-Loopback Bind Protection | **APPROVED** | 2026-10-21 | Authentication & Security Hardening |
 
 ---
 
@@ -153,7 +154,7 @@
      - Readiness (`/api/v1/ready`) reflects operational capacity to serve inference requests. It returns HTTP 200 OK with `status: "ready"` only when at least one operational provider adapter is registered and operational models exist; otherwise, it returns HTTP 503 Service Unavailable with `status: "not_ready"`.
      - Reference models in `ModelRegistry` catalog remain queryable for UI and client preview without corrupting operational readiness metrics.
 - **Selected Option:** Option 3 (Inference Readiness with Strict Decoupling).
-- **Rationale:** Aligns with `API_SPEC.md` §2.2 (`200 OK (if at least one provider is ready) or 503 Service Unavailable`), prevents orchestrators and clients from routing inference requests to instances with zero operational providers, and prevents false operational status while maintaining catalog utility.
+- **Rationale:** Aligns with `API_SPEC.md` Â§2.2 (`200 OK (if at least one provider is ready) or 503 Service Unavailable`), prevents orchestrators and clients from routing inference requests to instances with zero operational providers, and prevents false operational status while maintaining catalog utility.
 - **Consequences:** Systems with zero registered upstream providers correctly report 503 `not_ready` on `/api/v1/ready` while reporting 200 `healthy` on `/api/v1/health`.
 
 ---
@@ -161,14 +162,14 @@
 ### DEC-010: Multi-Criteria Intelligent Model Routing Policy & Scoring Matrix
 - **Status:** APPROVED
 - **Date:** 2026-10-19
-- **Context:** `MASTER_SPEC.md` §6 and Phase 7 require selecting compatible models according to task requirements, capability, latency, reliability, and cost category. The engine must support automatic routing, manual selection, explainable decisions, and deterministic fallback ordering without fabricating telemetry.
+- **Context:** `MASTER_SPEC.md` Â§6 and Phase 7 require selecting compatible models according to task requirements, capability, latency, reliability, and cost category. The engine must support automatic routing, manual selection, explainable decisions, and deterministic fallback ordering without fabricating telemetry.
 - **Options Considered:**
   1. *Static Hardcoded Lookup Table:* Maps each task category directly to a fixed model ID string. Brittle, fails when models are added, removed, or unavailable.
   2. *Live Telemetry Polling with Fabricated Stats:* Attempts dynamic latency and pricing polling; risks fabricating metrics when providers do not expose real-time telemetry.
   3. *Multi-Criteria Scoring Engine with Catalog Introspection & Documented Safe Policy:*
      - Evaluates models dynamically from `ModelRegistry`.
      - Strict modality support is a non-negotiable prerequisite.
-     - Multi-dimensional scoring evaluates capability match (0–50 pts), complexity alignment (0–30 pts), speed/latency tier (0–15 pts), cost tier (0–15 pts), and context capacity (0–10 pts).
+     - Multi-dimensional scoring evaluates capability match (0â€“50 pts), complexity alignment (0â€“30 pts), speed/latency tier (0â€“15 pts), cost tier (0â€“15 pts), and context capacity (0â€“10 pts).
      - Deterministic tie-breaking: cost tier preference, followed by speed tier, context window, and alphabetical `model_id`.
      - In manual mode: validates existence, availability, and modality compatibility; ranks remaining compatible models as fallbacks.
      - When no operational models match: returns canonical HTTP 422 (`UNSUPPORTED_MODALITY`) or HTTP 502 (`UPSTREAM_FAILURE`).
@@ -178,7 +179,7 @@
 ### DEC-011: Real HTTP Provider Adapter, Inference Pipeline Execution, and Bounded Failover Architecture
 - **Status:** APPROVED
 - **Date:** 2026-10-19
-- **Context:** An audit identified that while Phases 1–7 completed foundational interfaces, routing, and classification, live chat completions and streaming endpoints were unmapped (`GAP-001`), the provider adapter was mock-only (`GAP-002`), router-to-provider execution was disconnected (`GAP-003`), fallback failover was unbound (`GAP-005`), request ID propagation and auth were missing (`GAP-006`, `GAP-007`), and provider base URLs were exposed in public JSON responses (`GAP-010`).
+- **Context:** An audit identified that while Phases 1â€“7 completed foundational interfaces, routing, and classification, live chat completions and streaming endpoints were unmapped (`GAP-001`), the provider adapter was mock-only (`GAP-002`), router-to-provider execution was disconnected (`GAP-003`), fallback failover was unbound (`GAP-005`), request ID propagation and auth were missing (`GAP-006`, `GAP-007`), and provider base URLs were exposed in public JSON responses (`GAP-010`).
 - **Options Considered:**
   1. *External Mock Framework (Wiremock / Mockito):* Introduces heavy external JVM or complex crate dependencies that complicate local Windows builds and CI.
   2. *Integrated Pure-Rust Architecture:*
@@ -189,7 +190,7 @@
      - Redact provider `base_url` via `#[serde(skip_serializing)]` from public responses.
      - Implement native in-process ephemeral `tokio::net::TcpListener` HTTP servers for zero-dependency integration testing.
 - **Selected Option:** Option 2 (Integrated Pure-Rust Architecture).
-- **Rationale:** Preserves zero external network leakage during testing, eliminates heavyweight dependencies, maintains small binaries, ensures secret isolation, and provides fully functional end-to-end inference execution conforming strictly to `MASTER_SPEC.md` §6 & §18, `API_SPEC.md` §5 & §6, and `SECURITY.md`.
+- **Rationale:** Preserves zero external network leakage during testing, eliminates heavyweight dependencies, maintains small binaries, ensures secret isolation, and provides fully functional end-to-end inference execution conforming strictly to `MASTER_SPEC.md` Â§6 & Â§18, `API_SPEC.md` Â§5 & Â§6, and `SECURITY.md`.
 - **Consequences:** Endpoints `POST /api/v1/chat/completions` and `POST /api/v1/chat/stream` are fully functional and tested against real HTTP adapters and ephemeral mock servers. Phase 8 (Usage and Quota Tracking) remains strictly on hold.
 
 ---
@@ -208,7 +209,7 @@
      - Zero-allocation SSE chunk slice parsing in `src/providers/openai_compatible.rs`.
      - Elimination of duplicate candidate resolution in `src/routes/chat.rs`.
 - **Selected Option:** Option 2 (Heuristic Estimator with Thread-Safe LRU Caching and Semantic Guardrails).
-- **Rationale:** Zero external dependencies or binary bloat, negligible CPU overhead (<1 µs), prevents costly upstream 400 context overflow rejections, eliminates redundant routing classification, and delivers proven latency/throughput improvements (+112% RPS on completion, 53% latency reduction).
+- **Rationale:** Zero external dependencies or binary bloat, negligible CPU overhead (<1 Âµs), prevents costly upstream 400 context overflow rejections, eliminates redundant routing classification, and delivers proven latency/throughput improvements (+112% RPS on completion, 53% latency reduction).
 - **Consequences:** All chat completion and streaming pipelines automatically validate and filter by context capacity. Usage reporting preserves provider-reported token figures while internal routing relies on deterministic estimates for pre-dispatch gating.
 
 ---
@@ -282,3 +283,17 @@
   5. *Strict Route Protection & Precedence Policy:* Public probes (`/health`, `/ready`) are unconditionally accessible without authentication. All inference (`/chat/*`), model discovery (`/models/*`, `/providers`), routing preview, and operational telemetry (`/usage/*`, `/quotas`) endpoints require authentication. 3-segment JWTs route strictly to OIDC; non-JWT tokens route strictly to PAT/API key validators. Invalid credentials never fall back to weaker authentication.
   6. *Fail-Closed Production Configuration (`src/config.rs`):* In production (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present. Configured keys must be at least 8 characters long.
 - **Consequences:** Provides robust, client-independent authentication with constant-time security and zero credential leakage. Verified by 299 automated tests across 17 test suites with 0 failures, 0 Clippy warnings, and 0 security vulnerabilities. Phase 12 remains strictly on hold.
+
+---
+
+### DEC-018: Phase 11 Hardening: Query-Parameter Credential Proscription, Route Scope Authorization, and Non-Loopback Bind Protection
+- **Status:** APPROVED
+- **Date:** 2026-10-21
+- **Context:** A comprehensive Phase 11 security audit identified operational gaps and hardening requirements: (1) URLs bearing query parameters like `api_key` or `access_token` must be unconditionally rejected to prevent credential leakage into proxy access logs, browser history, and Referer headers; (2) development bypass must never be accessible when binding to non-loopback network interfaces (`0.0.0.0` or public IPs); (3) authenticated principals must be authorized against route-level scopes (`models:read`, `routing:read`, `chat`, `usage:read`) with HTTP 403 Forbidden; (4) OIDC JWKS fetching required a bounded payload ceiling (256 KB), refresh throttling on unknown `kid` (10 seconds), and production HTTPS enforcement; (5) `ConfiguredCredential` debug formatting must redact token hashes to eliminate diagnostic exposure.
+- **Decisions Made:**
+  1. *Unconditional Query-Parameter Credential Rejection (`src/auth/service.rs`):* If a protected request URL contains any credential-bearing query parameter (`api_key`, `apikey`, `access_token`, `token`, `auth_token`, `auth`, `bearer`), it is immediately rejected with HTTP 401 Unauthorized and canonical code `UNAUTHORIZED` before any header-based authentication is attempted.
+  2. *Strict External Bind Protection (`src/config.rs`, `src/auth/service.rs`):* Modified `Config::is_auth_required` and `AuthService::authenticate` so that whenever the backend binds to a non-loopback host interface (`!is_loopback_host()`), authentication is unconditionally required across all protected endpoints regardless of `AUTH_REQUIRED` or `APP_ENV` configuration.
+  3. *Route-Level Scope Authorization Enforcement (`src/auth/service.rs`, `src/auth/middleware.rs`):* Added `required_scope_for_route` and `AuthService::authorize(&principal, path)`. Protected routes map to mandatory scopes: `/api/v1/models` and `/api/v1/providers` require `models:read`; `/api/v1/routing/preview` requires `routing:read`; `/api/v1/chat/*` requires `chat`; `/api/v1/usage/*` and `/api/v1/quotas` require `usage:read`. Requests from principals lacking the required scope are rejected with HTTP 403 Forbidden and canonical code `FORBIDDEN`.
+  4. *Google OIDC & JWKS Hardening (`src/auth/oidc.rs`, `src/config.rs`):* Enforced a 256 KB response body limit on JWKS downloads; added a 10-second refresh throttle on unknown `kid` to mitigate cache-miss network amplification; enforced HTTPS for `GOOGLE_JWKS_URL` in production; and enabled validation for `nbf`, `iat` future sanity, and `azp` client ID verification.
+  5. *Diagnostic Credential Redaction (`src/auth/pat.rs`):* Implemented custom zero-leak `std::fmt::Debug` on `ConfiguredCredential` to redact precomputed token hashes.
+- **Consequences:** All identified security gaps are remediated and verified by 306 automated tests across 17 test suites (including 7 new security integration tests) with 0 failures, 0 Clippy warnings, and 0 security vulnerabilities. Phase 12 remains strictly on hold.

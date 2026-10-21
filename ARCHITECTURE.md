@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — System Architecture & Component Specification
+# ARCHITECTURE.md â€” System Architecture & Component Specification
 
 **Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
 **Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
@@ -155,20 +155,20 @@ Total Score = Capability Score (0..50) + Complexity Alignment Score (0..30)
 - **Minimum Positive Score:** 13 points.
 
 #### C. Component Breakdown
-1. **Capability Alignment (0–50 points):**
+1. **Capability Alignment (0â€“50 points):**
    - Matches classified `TaskCategory` against model `capabilities`. Primary category match adds +50 points. Secondary coding/reasoning matches on coding tasks add up to +20 points.
-2. **Complexity Alignment (0–30 points):**
+2. **Complexity Alignment (0â€“30 points):**
    - **High Complexity:** `advanced` = +30, `balanced` = +10, `fast` = +5.
    - **Medium Complexity:** `balanced` = +25, `advanced` = +20, `fast` = +15.
    - **Low Complexity:** `fast` = +30, `balanced` = +15, others = 0 (penalizes wasteful models on simple queries).
-3. **Speed & Latency Suitability (0–15 points):**
+3. **Speed & Latency Suitability (0â€“15 points):**
    - **Low Complexity:** `fast` = +15, `balanced` = +8, others = 0.
    - **Medium Complexity:** `balanced` = +15, `fast` = +10, others = +10.
    - **High Complexity:** `advanced` = +15, `balanced` = +8, others = +5.
    *(Note: Combined on Low Complexity, a `fast` model receives 30 + 15 = 45 points from complexity and speed dimensions).*
-4. **Cost Tier Preference (0–15 points):**
-   - `free-tier` = +15, `low-cost` = +10, `premium` = +2 (protects user quota/tokens per `MASTER_SPEC.md` §2.9).
-5. **Context & Token Capacity (0–10 points):**
+4. **Cost Tier Preference (0â€“15 points):**
+   - `free-tier` = +15, `low-cost` = +10, `premium` = +2 (protects user quota/tokens per `MASTER_SPEC.md` Â§2.9).
+5. **Context & Token Capacity (0â€“10 points):**
    - For Medium/High complexity tasks, models with context window $\ge 64\text{k}$ receive +5 points; max output tokens $\ge 8\text{k}$ receive +5 points.
 
 #### D. Deterministic Multi-Stage Tie-Breaking
@@ -358,13 +358,13 @@ sequenceDiagram
 ### 7.2 Decision Rules & Invariants
 1. **Transient vs Non-Retryable Error Taxonomy:**
    - **Transient (Retry Eligible):** `ProviderError::Timeout`, `ProviderError::NetworkFailure`, `ProviderError::RateLimited`, and `ProviderError::UpstreamError` with HTTP status 408, 429, 500, 502, 503, 504.
-   - **Non-Retryable (Immediate Short-Circuit):** `ProviderError::AuthenticationFailed`, `ProviderError::InvalidRequest`, `ProviderError::ModelNotFound`, `ProviderError::CapabilityMismatch`, `ProviderError::ProviderDisabled`, `ProviderError::ProviderNotFound`, and HTTP status codes 400–404, 422.
+   - **Non-Retryable (Immediate Short-Circuit):** `ProviderError::AuthenticationFailed`, `ProviderError::InvalidRequest`, `ProviderError::ModelNotFound`, `ProviderError::CapabilityMismatch`, `ProviderError::ProviderDisabled`, `ProviderError::ProviderNotFound`, and HTTP status codes 400â€“404, 422.
 2. **Exponential Backoff with Monotonic Non-Locking Jitter:**
    - Backoff delay formula: $t = \min(\text{initial\_backoff} \times 2^{\text{attempt}-1}, \text{max\_backoff})$.
    - Non-locking pseudo-random jitter combines an atomic sequence counter (`AtomicU64` with Weyl constant `0x9E3779B97F4A7C15`) and monotonic clock nanoseconds (`LazyLock<Instant>`) via SplitMix64 mixing, scaling delay strictly between 75% and 125% with zero lock contention or external dependencies.
    - For deterministic testability, `calculate_backoff_with_jitter` allows tests to specify explicit jitter percentages.
 3. **Retry-After Enforcement (delay-seconds & HTTP-date):**
-   - Implements RFC 9110 §10.2.3 compliant parsing supporting both integer `delay-seconds` (e.g. `120`) and RFC 7231 IMF-fixdate `HTTP-date` (e.g. `Sun, 06 Nov 2026 08:49:37 GMT`).
+   - Implements RFC 9110 Â§10.2.3 compliant parsing supporting both integer `delay-seconds` (e.g. `120`) and RFC 7231 IMF-fixdate `HTTP-date` (e.g. `Sun, 06 Nov 2026 08:49:37 GMT`).
    - Past dates safely clamp to 0 seconds wait without underflow.
    - If `retry_after > max_retry_after_secs`, the policy yields `Duration::MAX`. The execution loop abandons that candidate immediately rather than blocking worker threads, enabling instant failover to secondary providers.
    - Malformed or invalid header values safely return `None` and fall back to standard bounded exponential backoff.
@@ -471,13 +471,16 @@ The hardening backlog items identified during earlier phases have been formally 
 
 ### 10.1 Authentication Ingress & Precedence Topology
 
-All protected requests pass through the unified `auth_middleware` (`src/auth/middleware.rs`), which orchestrates request tracing, Host-header validation, reverse-proxy security, and authentication dispatch:
+All protected requests pass through the unified `auth_middleware` (`src/auth/middleware.rs`), which orchestrates request tracing, Host-header validation, reverse-proxy security, query-credential rejection, authentication dispatch, and route scope authorization:
 
 ```mermaid
 graph TD
     Req[Inbound HTTP Request] --> ProbeCheck{Path == /health or /ready?}
     ProbeCheck -->|Yes| PublicProbe[Bypass Auth -> 200 OK / 503 Ready]
-    ProbeCheck -->|No| HdrInspect[Inspect Authorization & X-API-Key]
+    ProbeCheck -->|No| QueryCheck{Query has api_key / token / auth?}
+
+    QueryCheck -->|Yes| QueryDeny[Reject: HTTP 401 Insecure Query Credential]
+    QueryCheck -->|No| HdrInspect[Inspect Authorization & X-API-Key]
 
     HdrInspect --> CredCheck{Credentials Present?}
     CredCheck -->|Bearer Header| TokenDispatch{Token Structure}
@@ -486,36 +489,43 @@ graph TD
 
     CredCheck -->|X-API-Key Header| PAT
 
-    CredCheck -->|None| EnvCheck{Environment == Production OR Auth Required?}
-    EnvCheck -->|Yes| Deny[Reject: HTTP 401 Unauthorized]
-    EnvCheck -->|No| DevBypass[DevelopmentBypass Principal]
+    CredCheck -->|None| BindCheck{Host != Loopback OR Production OR Auth Required?}
+    BindCheck -->|Yes| Deny[Reject: HTTP 401 Unauthorized]
+    BindCheck -->|No| DevBypass[DevelopmentBypass Principal]
 
-    OIDC -->|Valid Signature, iss, aud, exp| Success[Inject AuthPrincipal into Request Extensions]
+    OIDC -->|Valid Signature, iss, aud, exp, nbf, iat, azp| ScopeCheck
     OIDC -->|Invalid / Expired / Wrong kid| Deny
 
-    PAT -->|SHA-256 Hash Match| Success
+    PAT -->|SHA-256 Hash Match| ScopeCheck
     PAT -->|Mismatch / Empty / Revoked| Deny
+
+    ScopeCheck{Principal has Route Scope?} -->|Yes| Success[Inject AuthPrincipal into Request Extensions]
+    ScopeCheck -->|No| Forbidden[Reject: HTTP 403 Forbidden]
 
     Success --> Downstream[Downstream Route Handlers & Telemetry]
 ```
 
 ### 10.2 Architectural Components & Invariants
-1. **Google OIDC ID Token Validator (`src/auth/oidc.rs`):**
+1. **Unconditional Query-Parameter Credential Proscription (`src/auth/service.rs`):**
+   - In accordance with OWASP API Security and REST security best practices, credentials (`api_key`, `apikey`, `access_token`, `token`, `auth_token`, `auth`, `bearer`) passed in URL query strings are strictly prohibited.
+   - Any protected request containing credential-bearing query parameters is immediately rejected with HTTP 401 `Unauthorized` and canonical code `UNAUTHORIZED` before any header-based fallback can execute, preventing credential leakage in proxy access logs, browser history, and referrer headers.
+2. **Google OIDC ID Token Validator (`src/auth/oidc.rs`):**
    - Parses RS256 JWT tokens using `jsonwebtoken`.
    - Retrieves public RSA keys via the `JwksProvider` abstraction (`HttpJwksProvider` with in-memory caching and 1-hour TTL).
-   - Validates strict standard claims: issuer (`https://accounts.google.com` or `accounts.google.com`), audience (matching configured `google_client_id` or `google_client_ids`), expiration (with 60-second leeway), and non-empty subject.
+   - Validates strict standard claims: issuer (`https://accounts.google.com` or `accounts.google.com`), audience (matching configured `google_client_id` or `google_client_ids`), expiration (with 60-second leeway), non-empty subject, `nbf` (not-before), future `iat` sanity, and `azp` (authorized party) when multiple audiences or client IDs are configured.
+   - Enforces a bounded 256 KB response body limit on JWKS downloads to defend against memory exhaustion and upstream payload amplification.
+   - Employs a 10-second refresh throttle on cache misses caused by unknown key identifiers (`kid`) to prevent cache-miss network request amplification attacks.
    - Supports `MockJwksProvider` enabling deterministic, offline, zero-network unit and integration testing.
-2. **Personal Access Token & API Key Validator (`src/auth/pat.rs`):**
+3. **Personal Access Token & API Key Validator (`src/auth/pat.rs`):**
    - Validates developer PATs (`pat_<64_hex_chars>`) and backend API keys.
    - Precomputes 32-byte SHA-256 digests (`ring::digest`) upon configuration loading.
    - Executes comparisons in constant time via `subtle::ConstantTimeEq`, completely eliminating timing attacks across both token length and value.
-3. **Downstream Identity Propagation (`src/auth/principal.rs`):**
+   - Custom `Debug` implementation on `ConfiguredCredential` securely redacts token hashes to prevent diagnostic log leakage.
+4. **Downstream Identity & Scope Authorization (`src/auth/principal.rs`, `src/auth/service.rs`):**
    - Authenticated identity is encapsulated in `AuthPrincipal` and attached to Axum request extensions.
    - Contains caller `client_type` (`Flutter`, `CustomIde`, `VscodeExtension`, `ApiClient`), `subject`, `auth_type`, `email`, `roles` (`User`, `Admin`, `Service`), and authorized `scopes`.
    - Implements custom `Debug` and `Display` to redact emails and secrets, preventing log leakage.
-4. **Fail-Closed Production Policy (`src/config.rs`):**
-   - When `APP_ENV=production`, startup strictly requires at least one configured credential (`API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID`), preventing accidental unauthenticated production deployments.
-5. **External Bind Protection for Operational Endpoints:**
-   - Whenever the backend binds to non-loopback network interfaces (`host != 127.0.0.1`), operational data endpoints (`/api/v1/usage/*`, `/api/v1/quotas`) unconditionally enforce authentication, preventing exposure of telemetry data over external networks.
-
-
+   - Route-level scope authorization (`AuthService::authorize`) enforces fine-grained access boundaries: `models:read` for model and provider catalogs, `routing:read` for routing preview, `chat` for completion and streaming endpoints, and `usage:read` for usage telemetry and quotas. Principals lacking required scopes receive HTTP 403 `Forbidden`.
+5. **Fail-Closed Production & Non-Loopback Network Boundary (`src/config.rs`, `src/auth/service.rs`):**
+   - In production (`APP_ENV=production`), application startup strictly requires at least one configured credential (`API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID`), preventing accidental unauthenticated production deployments. Production mode strictly mandates HTTPS for `GOOGLE_JWKS_URL`.
+   - Whenever the backend binds to a non-loopback network interface (e.g., `0.0.0.0` or a public IP), authentication is automatically and unconditionally enforced for all protected routes, guaranteeing that development bypass can never expose endpoints across external network interfaces.

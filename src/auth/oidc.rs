@@ -105,6 +105,12 @@ pub struct GoogleClaims {
     /// Issued-at timestamp in seconds since Unix epoch.
     #[serde(default)]
     pub iat: Option<u64>,
+    /// Not-before timestamp in seconds since Unix epoch.
+    #[serde(default)]
+    pub nbf: Option<u64>,
+    /// Authorized party (OAuth client ID of the presenter).
+    #[serde(default)]
+    pub azp: Option<String>,
     /// User's email address.
     #[serde(default)]
     pub email: Option<String>,
@@ -117,6 +123,24 @@ pub struct GoogleClaims {
     /// URL to user's profile picture.
     #[serde(default)]
     pub picture: Option<String>,
+}
+
+impl Default for GoogleClaims {
+    fn default() -> Self {
+        Self {
+            iss: "https://accounts.google.com".to_string(),
+            sub: String::new(),
+            aud: serde_json::Value::Null,
+            exp: 0,
+            iat: None,
+            nbf: None,
+            azp: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            picture: None,
+        }
+    }
 }
 
 impl GoogleClaims {
@@ -177,10 +201,16 @@ pub struct HttpJwksProvider {
     jwks_url: String,
     http_client: reqwest::Client,
     cache: RwLock<Option<CachedKeys>>,
+    last_fetch_attempt: RwLock<Option<Instant>>,
     cache_ttl: Duration,
 }
 
 impl HttpJwksProvider {
+    /// Maximum allowed JWKS response size in bytes (256 KB).
+    pub const MAX_JWKS_RESPONSE_BYTES: usize = 262_144;
+    /// Minimum interval between outbound refresh attempts on unknown kid (10 seconds).
+    pub const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
     /// Create a new HttpJwksProvider with the specified JWKS URL and cache TTL.
     pub fn new(jwks_url: Option<String>, cache_ttl: Option<Duration>) -> Self {
         let http_client = reqwest::Client::builder()
@@ -192,12 +222,18 @@ impl HttpJwksProvider {
             jwks_url: jwks_url.unwrap_or_else(|| DEFAULT_GOOGLE_JWKS_URL.to_string()),
             http_client,
             cache: RwLock::new(None),
+            last_fetch_attempt: RwLock::new(None),
             cache_ttl: cache_ttl.unwrap_or(DEFAULT_JWKS_CACHE_TTL),
         }
     }
 
     /// Fetch keys from the remote JWKS URL and update the cache.
     async fn fetch_and_cache(&self) -> Result<HashMap<String, DecodingKey>, OidcError> {
+        {
+            let mut attempt_lock = self.last_fetch_attempt.write().await;
+            *attempt_lock = Some(Instant::now());
+        }
+
         let response = self
             .http_client
             .get(&self.jwks_url)
@@ -213,9 +249,27 @@ impl HttpJwksProvider {
             )));
         }
 
-        let jwks: JwksResponse = response
-            .json()
+        if let Some(content_length) = response.content_length()
+            && content_length as usize > Self::MAX_JWKS_RESPONSE_BYTES
+        {
+            return Err(OidcError::JwksFetchFailed(format!(
+                "JWKS content-length ({content_length}) exceeds maximum allowed 256 KB"
+            )));
+        }
+
+        let bytes = response
+            .bytes()
             .await
+            .map_err(|err| OidcError::JwksFetchFailed(err.to_string()))?;
+
+        if bytes.len() > Self::MAX_JWKS_RESPONSE_BYTES {
+            return Err(OidcError::JwksFetchFailed(format!(
+                "JWKS response size ({} bytes) exceeds maximum allowed 256 KB",
+                bytes.len()
+            )));
+        }
+
+        let jwks: JwksResponse = serde_json::from_slice(&bytes)
             .map_err(|err| OidcError::JwksFetchFailed(err.to_string()))?;
 
         let mut key_map = HashMap::new();
@@ -257,7 +311,18 @@ impl JwksProvider for HttpJwksProvider {
                 }
             }
 
-            // If not found or expired, refresh from remote
+            // Check refresh throttle: avoid flooding Google if a recent attempt already failed
+            {
+                let attempt_lock = self.last_fetch_attempt.read().await;
+                if let Some(last_attempt) = *attempt_lock
+                    && last_attempt.elapsed() < Self::MIN_REFRESH_INTERVAL
+                {
+                    // Return UnknownKeyId rather than pounding upstream endpoint
+                    return Err(OidcError::UnknownKeyId(kid.to_string()));
+                }
+            }
+
+            // Refresh from remote
             let fresh_keys = self.fetch_and_cache().await?;
             fresh_keys
                 .get(kid)
@@ -364,6 +429,7 @@ impl GoogleOidcValidator {
         validation.set_issuer(GOOGLE_ISSUERS);
         validation.set_required_spec_claims(&["exp", "iss", "sub"]);
         validation.leeway = self.clock_skew_secs;
+        validation.validate_nbf = true;
         // We validate audience explicitly below to support array-based or multi-client aud
         validation.validate_aud = false;
 
@@ -394,13 +460,36 @@ impl GoogleOidcValidator {
             )));
         }
 
-        // 6. Validate subject is non-empty
+        // 6. Validate authorized party (azp) if present
+        if let Some(azp) = &claims.azp
+            && !self.client_ids.contains(azp)
+            && !claims.matches_audience(&self.client_ids)
+        {
+            return Err(OidcError::InvalidAudience(format!(
+                "Token azp '{azp}' does not match configured Google client IDs"
+            )));
+        }
+
+        // 7. Validate issued-at timestamp (iat) is not in the future beyond clock skew
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(iat) = claims.iat
+            && iat > now.saturating_add(self.clock_skew_secs)
+        {
+            return Err(OidcError::InvalidSignature(
+                "Token issued in the future (iat exceeds current time + clock skew)".to_string(),
+            ));
+        }
+
+        // 8. Validate subject is non-empty
         let sub = claims.sub.trim();
         if sub.is_empty() {
             return Err(OidcError::EmptySubject);
         }
 
-        // 7. Construct AuthPrincipal
+        // 9. Construct AuthPrincipal
         Ok(AuthPrincipal::new(
             format!("google:{sub}"),
             AuthType::GoogleOidc,

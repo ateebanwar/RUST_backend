@@ -89,8 +89,13 @@ pub async fn auth_middleware(
 
     // 4. Authenticate request via AuthService
     let path = req.uri().path();
-    match state.auth.authenticate(req.headers(), path).await {
+    let query = req.uri().query();
+    match state.auth.authenticate(req.headers(), path, query).await {
         Ok(Some(principal)) => {
+            // 5. Authorize request against route required scope
+            if let Err(authz_err) = crate::auth::AuthService::authorize(&principal, path) {
+                return authz_err.to_response_with_id(&request_id_str);
+            }
             req.extensions_mut().insert(principal);
         }
         Ok(None) => {

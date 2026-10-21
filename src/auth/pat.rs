@@ -69,6 +69,19 @@ pub struct ConfiguredCredential {
     pub auth_type: AuthType,
 }
 
+impl std::fmt::Debug for ConfiguredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfiguredCredential")
+            .field("key_id", &self.key_id)
+            .field("subject", &self.subject)
+            .field("token_hash", &"[REDACTED]")
+            .field("roles", &self.roles)
+            .field("scopes", &self.scopes)
+            .field("auth_type", &self.auth_type)
+            .finish()
+    }
+}
+
 impl ConfiguredCredential {
     /// Create a new configured API key descriptor from plaintext key string.
     pub fn from_api_key(key: &str, key_id: impl Into<String>) -> Self {

@@ -2,6 +2,52 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-21 — Phase 11: Security Audit Remediation, Query Credential Rejection, Scope Authorization, and Non-Loopback Bind Protection
+
+### Audited, Corrected & Verified
+- **Unconditional Query-Parameter Credential Proscription (`src/auth/service.rs`, `src/auth/middleware.rs`):**
+  - Addressed confirmed security gap: prevented sensitive credentials from appearing in URL query strings (`api_key`, `apikey`, `access_token`, `token`, `auth_token`, `auth`, `bearer`).
+  - Implemented `AuthService::contains_credential_query`: protected endpoints immediately reject query-parameter credentials with HTTP 401 `Unauthorized` and canonical code `UNAUTHORIZED` prior to checking headers.
+  - Mitigates credential leakage into web server logs, proxy access logs, browser history, and HTTP `Referer` headers.
+- **Strict Non-Loopback Network Bind Protection (`src/config.rs`, `src/auth/service.rs`):**
+  - Resolved external interface exposure risk: updated `Config::is_auth_required` and `AuthService::authenticate` to unconditionally enforce authentication whenever the server binds to a non-loopback host interface (`!is_loopback_host()`, such as `0.0.0.0` or public IPs).
+  - Guarantees that unauthenticated development bypass can never expose endpoints across external network interfaces, even if `AUTH_REQUIRED=false` or `APP_ENV=development`.
+- **Route-Level Scope Authorization Enforcement (`src/auth/service.rs`, `src/auth/middleware.rs`):**
+  - Implemented `AuthService::required_scope_for_route` and `AuthService::authorize(&principal, path)`.
+  - Mapped route paths to mandatory scopes:
+    - `/api/v1/models` and `/api/v1/providers` require `models:read`
+    - `/api/v1/routing/preview` requires `routing:read`
+    - `/api/v1/chat/*` requires `chat`
+    - `/api/v1/usage/*` and `/api/v1/quotas` require `usage:read`
+  - Rejects under-scoped callers with HTTP 403 `Forbidden` and canonical error code `FORBIDDEN`.
+- **Google OIDC ID Token & JWKS Hardening (`src/auth/oidc.rs`, `src/config.rs`):**
+  - Added bounded 256 KB response body limit (`MAX_JWKS_RESPONSE_BYTES = 262_144`) on JWKS downloads to defend against upstream payload amplification and memory exhaustion.
+  - Implemented a 10-second refresh throttle on unknown key identifiers (`kid`) to prevent cache-miss network request amplification attacks.
+  - Enforced HTTPS for `GOOGLE_JWKS_URL` in production environments (`APP_ENV=production`).
+  - Added claim validation for `nbf` (not-before), future `iat` sanity check, and `azp` (authorized party) verification against configured Google Client IDs.
+- **Diagnostic Secret Redaction (`src/auth/pat.rs`):**
+  - Implemented custom `std::fmt::Debug` on `ConfiguredCredential` to securely redact precomputed token hashes (`"[REDACTED_HASH]"`).
+- **Comprehensive Integration Test Expansion (`tests/authentication_test.rs`):**
+  - Added Test 13: Query-parameter credential rejection (`api_key`, `access_token`, `token` in URL query string rejected with 401).
+  - Added Test 14: Route-level scope authorization (insufficient scope returns HTTP 403 Forbidden).
+  - Added Test 15: External bind protection (`0.0.0.0` rejects unauthenticated requests even in development mode).
+  - Added Test 16: Client-type header isolation (spoofed `X-Client-Type` cannot grant admin privileges).
+  - Added Test 17: Production HTTPS JWKS URL validation (insecure HTTP URL rejected in production).
+  - Added Test 18: Non-loopback host `is_auth_required` configuration check.
+  - Added Test 19: Trailing slash public probe path normalization (`/health/`, `/ready/`).
+  - Integration suite expanded to 19 comprehensive tests; full backend test suite increased to **306 passing tests** (81 unit + 225 integration across 17 test suites, 0 failures, 1 ignored load benchmark).
+
+### Verification
+- `cargo fmt --check`: Passed with exit code 0.
+- `cargo check`: Passed with exit code 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
+- `cargo test`: **306 automated tests passing** across 17 test suites with 0 failures, 0 errors, 1 ignored (controlled benchmark).
+- `cargo audit -n`: Passed with exit code 0 (1,348 advisories checked, 183 dependencies scanned).
+- `cargo build --release`: Passed with exit code 0.
+- Phase 12 (Authorization & Secret Management) remains strictly on hold.
+
+---
+
 ## 2026-10-21 — Phase 11: Authentication & Authorization Complete & Verified
 
 ### Implemented & Verified

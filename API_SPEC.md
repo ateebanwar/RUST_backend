@@ -39,6 +39,10 @@ All endpoints (except public probes `/api/v1/health` and `/api/v1/ready`) requir
 
 > [!IMPORTANT]
 > **Strict Precedence & Zero Fallback Rule:** If an incoming request provides credentials (e.g. an expired Google ID token or invalid API key), it is rejected with HTTP 401 Unauthorized immediately. Invalid credentials never fall back to another authentication mechanism or developer bypass.
+>
+> **Query Parameter Credential Prohibition:** Credentials must NEVER be transmitted in URL query parameters (`?api_key=...`, `?access_token=...`, etc.). Inbound requests containing credentials in query parameters are strictly rejected with HTTP 401 Unauthorized.
+>
+> **Route Scope Authorization:** Authenticated principals must possess the required scope documented in the Route Protection Matrix above (`models:read`, `routing:read`, `chat`, `usage:read`). Principals lacking the required scope receive HTTP 403 Forbidden with canonical code `FORBIDDEN`.
 
 ### 1.2 Standardized JSON Data Types & Formatting Rules
 - **Timestamps:** ISO 8601 / RFC 3339 UTC strings with trailing `Z` (e.g. `2026-10-19T17:00:00Z`).

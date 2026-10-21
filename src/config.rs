@@ -465,6 +465,7 @@ impl AppConfig {
             return explicit;
         }
         self.environment == Environment::Production
+            || !self.is_loopback_host()
             || self.api_key.is_some()
             || !self.api_keys.is_empty()
             || self.google_client_id.is_some()
@@ -544,24 +545,34 @@ impl AppConfig {
             });
         }
 
-        // Fail-closed production enforcement: production must have at least one valid authentication credential
-        if self.environment == Environment::Production {
-            let has_key = self.api_key.as_ref().is_some_and(|k| !k.trim().is_empty())
-                || self.api_keys.iter().any(|k| !k.trim().is_empty());
-            let has_google = self
-                .google_client_id
-                .as_ref()
-                .is_some_and(|id| !id.trim().is_empty())
-                || self
-                    .google_client_ids
-                    .iter()
-                    .any(|id| !id.trim().is_empty());
+        // Fail-closed production and external-bind enforcement
+        let has_key = self.api_key.as_ref().is_some_and(|k| !k.trim().is_empty())
+            || self.api_keys.iter().any(|k| !k.trim().is_empty());
+        let has_google = self
+            .google_client_id
+            .as_ref()
+            .is_some_and(|id| !id.trim().is_empty())
+            || self
+                .google_client_ids
+                .iter()
+                .any(|id| !id.trim().is_empty());
 
+        if self.environment == Environment::Production {
             if !has_key && !has_google {
                 return Err(ConfigError::InvalidValue {
                     key: "APP_ENV",
                     value: "production".to_string(),
                     reason: "Production environment requires at least one valid API_KEY, API_KEYS, or GOOGLE_CLIENT_ID configured for authentication",
+                });
+            }
+
+            if let Some(ref jwks_url) = self.google_jwks_url
+                && !jwks_url.starts_with("https://")
+            {
+                return Err(ConfigError::InvalidValue {
+                    key: "GOOGLE_JWKS_URL",
+                    value: jwks_url.clone(),
+                    reason: "GOOGLE_JWKS_URL must use HTTPS protocol in production",
                 });
             }
         }

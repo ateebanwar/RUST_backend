@@ -16,8 +16,8 @@
 //! 13. Zero secrets or partial matches are leaked in errors or diagnostic outputs.
 
 use ai_backend::auth::{
-    AuthPrincipal, AuthRole, AuthService, AuthType, ClientType, GoogleClaims, MockJwksProvider,
-    PatValidator, generate_secure_pat,
+    AuthPrincipal, AuthRole, AuthService, AuthType, ClientType, ConfiguredCredential, GoogleClaims,
+    GoogleOidcValidator, MockJwksProvider, PatValidator, generate_secure_pat,
 };
 use ai_backend::config::{AppConfig, ConfigError, Environment};
 use ai_backend::{AppState, create_app};
@@ -340,6 +340,8 @@ async fn test_google_oidc_valid_token_authentication() {
         aud: json!(TEST_CLIENT_ID),
         exp: now + 3600, // Valid for 1 hour
         iat: Some(now),
+        nbf: None,
+        azp: None,
         email: Some("engineer@flutter.app".to_string()),
         email_verified: Some(true),
         name: Some("Lead Mobile Engineer".to_string()),
@@ -408,6 +410,8 @@ async fn test_google_oidc_rejection_edge_cases() {
         aud: json!(TEST_CLIENT_ID),
         exp: now + 3600,
         iat: Some(now),
+        nbf: None,
+        azp: None,
         email: Some("user@evil.com".to_string()),
         email_verified: Some(true),
         name: None,
@@ -430,6 +434,8 @@ async fn test_google_oidc_rejection_edge_cases() {
         aud: json!("unauthorized-client.apps.googleusercontent.com"),
         exp: now + 3600,
         iat: Some(now),
+        nbf: None,
+        azp: None,
         email: None,
         email_verified: None,
         name: None,
@@ -452,6 +458,8 @@ async fn test_google_oidc_rejection_edge_cases() {
         aud: json!(TEST_CLIENT_ID),
         exp: now - 3600, // expired 1 hour ago
         iat: Some(now - 7200),
+        nbf: None,
+        azp: None,
         email: None,
         email_verified: None,
         name: None,
@@ -474,6 +482,8 @@ async fn test_google_oidc_rejection_edge_cases() {
         aud: json!(TEST_CLIENT_ID),
         exp: now + 3600,
         iat: Some(now),
+        nbf: None,
+        azp: None,
         email: None,
         email_verified: None,
         name: None,
@@ -665,4 +675,278 @@ fn test_auth_principal_and_config_secret_isolation() {
     let debug_principal = format!("{principal:?}");
     assert!(!debug_principal.contains("sensitive_user@example.com"));
     assert!(debug_principal.contains("[REDACTED]"));
+}
+
+// =========================================================================
+// 13. QUERY PARAMETER CREDENTIAL REJECTION TESTS (SECTION 5 MANDATE)
+// =========================================================================
+
+#[tokio::test]
+async fn test_query_parameter_credentials_strictly_rejected() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("test_valid_api_key_8899".to_string());
+    // Even if auth_required is explicitly false (development bypass on loopback),
+    // query parameter credentials MUST be rejected!
+    config.auth_required = Some(false);
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    let query_credential_urls = [
+        format!("{base_url}/api/v1/models?api_key=test_valid_api_key_8899"),
+        format!("{base_url}/api/v1/models?apikey=test_valid_api_key_8899"),
+        format!("{base_url}/api/v1/models?access_token=some_token_xyz"),
+        format!("{base_url}/api/v1/models?token=some_token_xyz"),
+        format!("{base_url}/api/v1/models?auth_token=some_token_xyz"),
+        format!("{base_url}/api/v1/models?bearer=some_token_xyz"),
+    ];
+
+    for url in query_credential_urls {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Query credential in '{url}' must be rejected with HTTP 401"
+        );
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("query parameters"),
+            "Error message should explain that query credentials are prohibited"
+        );
+    }
+}
+
+// =========================================================================
+// 14. ROUTE SCOPE AUTHORIZATION ENFORCEMENT TESTS (SECTION 9 MANDATE)
+// =========================================================================
+
+#[tokio::test]
+async fn test_route_scope_authorization_enforcement() {
+    let mut config = AppConfig::default_local();
+    config.auth_required = Some(true);
+
+    // Create a PAT with ONLY models:read scope
+    let models_only_pat = "pat_models_read_only_abcdef1234567890abcdef1234567890abcdef12345678";
+    let cred = ConfiguredCredential::from_pat(
+        models_only_pat,
+        "dev_models_auditor",
+        None,
+        vec![AuthRole::User],
+        vec!["models:read".to_string()],
+    );
+
+    let mut pat_validator = PatValidator::new();
+    pat_validator.add_credential(cred);
+
+    let auth_service = Arc::new(AuthService::with_components(
+        Arc::new(config.clone()),
+        Arc::new(pat_validator),
+        Arc::new(GoogleOidcValidator::new(
+            Arc::new(MockJwksProvider::new()),
+            vec![],
+        )),
+    ));
+
+    let state = AppState::new(Arc::new(config)).with_auth_service(auth_service);
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // 1. Permitted: GET /api/v1/models requires models:read
+    let resp_ok = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("Authorization", format!("Bearer {models_only_pat}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_ok.status(),
+        reqwest::StatusCode::OK,
+        "Principal with models:read scope must access /api/v1/models"
+    );
+
+    // 2. Forbidden: POST /api/v1/chat/completions requires chat scope
+    let resp_chat_forbidden = client
+        .post(format!("{base_url}/api/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {models_only_pat}"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_chat_forbidden.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "Principal without chat scope must be rejected with HTTP 403 on chat route"
+    );
+    let chat_body: serde_json::Value = resp_chat_forbidden.json().await.unwrap();
+    assert_eq!(chat_body["error"]["code"], "FORBIDDEN");
+    assert!(
+        chat_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("lacks required scope 'chat'")
+    );
+
+    // 3. Forbidden: POST /api/v1/routing/preview requires routing:read scope
+    let resp_routing_forbidden = client
+        .post(format!("{base_url}/api/v1/routing/preview"))
+        .header("Authorization", format!("Bearer {models_only_pat}"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"prompt":"test"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_routing_forbidden.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "Principal without routing:read scope must be rejected with HTTP 403 on routing preview"
+    );
+    let routing_body: serde_json::Value = resp_routing_forbidden.json().await.unwrap();
+    assert_eq!(routing_body["error"]["code"], "FORBIDDEN");
+
+    // 4. Forbidden: GET /api/v1/usage/summary requires usage:read scope
+    let resp_usage_forbidden = client
+        .get(format!("{base_url}/api/v1/usage/summary"))
+        .header("Authorization", format!("Bearer {models_only_pat}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_usage_forbidden.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "Principal without usage:read scope must be rejected with HTTP 403 on usage endpoint"
+    );
+}
+
+// =========================================================================
+// 15. EXTERNAL BIND & CLIENT TYPE PRIVILEGE ISOLATION (SECTION 6 & 9)
+// =========================================================================
+
+#[tokio::test]
+async fn test_non_loopback_external_bind_blocks_all_protected_routes() {
+    let mut config = AppConfig::default_local();
+    // Simulate non-loopback external host (e.g. 0.0.0.0)
+    config.host = "0.0.0.0".to_string();
+    config.api_key = Some("configured_key_for_external_bind".to_string());
+    config.auth_required = Some(false); // even if auth_required is false!
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // Verify all protected endpoints reject unauthenticated access when host is non-loopback
+    let protected_paths = [
+        "/api/v1/models",
+        "/api/v1/providers",
+        "/api/v1/usage/summary",
+        "/api/v1/quotas",
+    ];
+
+    for path in protected_paths {
+        let resp = client
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Non-loopback bind must reject unauthenticated requests to '{path}'"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_client_type_header_cannot_grant_privileges() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("test_primary_api_key_12345".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // Passing X-Client-Type alone without credentials must still be rejected
+    let resp = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("X-Client-Type", "flutter")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp_ide = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("X-Client-Type", "custom-ide")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_ide.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+// =========================================================================
+// 16. CONFIGURATION CONSTRAINTS & PUBLIC PROBE TRAILING SLASH
+// =========================================================================
+
+#[test]
+fn test_config_non_loopback_host_enforces_auth_required() {
+    let mut config = AppConfig::default_local();
+    config.host = "0.0.0.0".to_string();
+    config.api_key = None;
+    config.api_keys = vec![];
+    config.google_client_id = None;
+    config.google_client_ids = vec![];
+
+    // Non-loopback host automatically makes auth required even without explicit auth_required
+    assert!(config.is_auth_required());
+    assert!(!config.is_loopback_host());
+}
+
+#[test]
+fn test_config_production_requires_https_google_jwks_url() {
+    let mut config = AppConfig::default_local();
+    config.environment = Environment::Production;
+    config.api_key = Some("valid_production_key_12345".to_string());
+    config.google_jwks_url = Some("http://insecure-jwks.example.com/certs".to_string());
+
+    let err = config.validate().unwrap_err();
+    match err {
+        ConfigError::InvalidValue { key, reason, .. } => {
+            assert_eq!(key, "GOOGLE_JWKS_URL");
+            assert!(reason.contains("HTTPS protocol in production"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_public_probes_support_trailing_slashes() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("valid_secret_key_12345".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // Verify trailing slash variants of public probes bypass authentication
+    let resp_health = client
+        .get(format!("{base_url}/api/v1/health/"))
+        .send()
+        .await
+        .unwrap();
+    // In Axum, whether 200 or 404, it must NOT return 401 Unauthorized
+    assert_ne!(resp_health.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp_ready = client
+        .get(format!("{base_url}/api/v1/ready/"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp_ready.status(), reqwest::StatusCode::UNAUTHORIZED);
 }

@@ -119,32 +119,104 @@ impl AuthService {
 
     /// Determine if an incoming route path is an unauthenticated public probe.
     pub fn is_public_probe(path: &str) -> bool {
-        path == "/api/v1/health" || path == "/api/v1/ready"
+        let normalized = path.trim_end_matches('/');
+        normalized == "/api/v1/health" || normalized == "/api/v1/ready"
     }
 
     /// Determine if an incoming route path is operational telemetry data.
     pub fn is_operational_data(path: &str) -> bool {
-        path.starts_with("/api/v1/usage") || path == "/api/v1/quotas"
+        let normalized = path.trim_end_matches('/');
+        normalized.starts_with("/api/v1/usage") || normalized == "/api/v1/quotas"
+    }
+
+    /// Check whether a query string contains credential-bearing parameters.
+    pub fn contains_credential_query(query: Option<&str>) -> bool {
+        let Some(q) = query else {
+            return false;
+        };
+        for pair in q.split('&') {
+            let key = pair
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if key == "api_key"
+                || key == "apikey"
+                || key == "access_token"
+                || key == "token"
+                || key == "auth_token"
+                || key == "auth"
+                || key == "bearer"
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Resolve the required authorization scope for an incoming route path per API_SPEC.md §1.1.
+    pub fn required_scope_for_route(path: &str) -> Option<&'static str> {
+        let normalized = path.trim_end_matches('/');
+        if normalized == "/api/v1/health" || normalized == "/api/v1/ready" {
+            None
+        } else if normalized == "/api/v1/models"
+            || normalized.starts_with("/api/v1/models/")
+            || normalized == "/api/v1/providers"
+        {
+            Some("models:read")
+        } else if normalized == "/api/v1/routing/preview" {
+            Some("routing:read")
+        } else if normalized == "/api/v1/chat/completions" || normalized == "/api/v1/chat/stream" {
+            Some("chat")
+        } else if normalized.starts_with("/api/v1/usage") || normalized == "/api/v1/quotas" {
+            Some("usage:read")
+        } else {
+            None
+        }
+    }
+
+    /// Verify that an authenticated principal has permission to access the specified route.
+    pub fn authorize(principal: &AuthPrincipal, path: &str) -> Result<(), AppError> {
+        if let Some(required_scope) = Self::required_scope_for_route(path)
+            && !principal.has_scope(required_scope)
+        {
+            return Err(AppError::Forbidden(format!(
+                "Principal '{}' lacks required scope '{required_scope}' for route '{path}'",
+                principal.subject
+            )));
+        }
+        Ok(())
     }
 
     /// Authenticate an incoming HTTP request.
     ///
-    /// Evaluates headers against configured validators according to approved precedence:
+    /// Evaluates headers and query strings against configured validators according to approved precedence:
     /// 1. Public probes (`/health`, `/ready`) bypass authentication.
-    /// 2. If credentials are provided (Bearer token or `X-API-Key`):
+    /// 2. If credentials are submitted via query parameters, strictly rejected with 401 Unauthorized.
+    /// 3. If credentials are provided (Bearer token or `X-API-Key`):
     ///    - 3-segment JWTs are routed strictly to the Google OIDC validator.
     ///    - Non-JWT tokens or `X-API-Key` headers are routed strictly to the PAT/API Key validator.
     ///    - Invalid credentials NEVER fall back to another authentication method.
-    /// 3. If no credentials are provided:
+    /// 4. If no credentials are provided:
+    ///    - On non-loopback network interfaces, strictly rejected with 401 Unauthorized for all protected routes.
     ///    - In Production, strictly rejected with 401 Unauthorized.
-    ///    - On external interfaces for operational data, strictly rejected with 401 Unauthorized.
-    ///    - In Development/Test, only permitted if authentication is not required.
+    ///    - In Development/Test, only permitted on loopback if authentication is not required.
     pub async fn authenticate(
         &self,
         headers: &HeaderMap,
         path: &str,
+        query: Option<&str>,
     ) -> Result<Option<AuthPrincipal>, AppError> {
-        // 1. Public probes are intentionally unauthenticated
+        // 1. Inbound query credential rejection: credentials MUST NOT be accepted in URL query parameters
+        if Self::contains_credential_query(query) {
+            return Err(AppError::Unauthorized(
+                "Authentication credentials must not be passed in URL query parameters. Use request headers instead."
+                    .to_string(),
+            ));
+        }
+
+        // 2. Public probes are intentionally unauthenticated
         if Self::is_public_probe(path) {
             return Ok(None);
         }
@@ -228,14 +300,13 @@ impl AuthService {
             };
         }
 
-        // 3. No credentials provided: evaluate policy and environment
-        let is_operational = Self::is_operational_data(path);
+        // 3. No credentials provided: evaluate policy, bind interface, and environment
         let external_bind = !self.config.is_loopback_host();
 
-        // Operational data on external interface must always be authenticated
-        if is_operational && external_bind {
+        // On non-loopback network interfaces, unauthenticated access is strictly prohibited for all protected routes
+        if external_bind {
             return Err(AppError::Unauthorized(
-                "Authentication required: operational telemetry is protected on external interfaces"
+                "Authentication required: unauthenticated access is prohibited on non-loopback network interfaces"
                     .to_string(),
             ));
         }
@@ -254,7 +325,7 @@ impl AuthService {
             ));
         }
 
-        // Permitted local development unauthenticated bypass
+        // Permitted local development unauthenticated bypass strictly on loopback
         Ok(Some(AuthPrincipal::development_bypass(client_type)))
     }
 }

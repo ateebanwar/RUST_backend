@@ -21,24 +21,29 @@
 1. **Mobile Users (Flutter):**
     - User identity authenticated via Google Sign-In OIDC ID tokens passed in `Authorization: Bearer <google_id_token>`.
     - The backend cryptographically validates RS256 token signatures against Google's public JSON Web Key Sets (JWKS) via `jsonwebtoken`.
-    - Strictly checks `iss` (`https://accounts.google.com` or `accounts.google.com`), `aud` (configured Google Client ID(s)), expiration timestamp (`exp` with 60-second RFC 7519 leeway), and non-empty subject (`sub`).
-    - JWKS keys are cached in memory with a 1-hour TTL and bounded 5-second fetch timeout (`HttpJwksProvider`). Deterministic offline testing is guaranteed via `MockJwksProvider` without live Google network access.
+    - Strictly checks `iss` (`https://accounts.google.com` or `accounts.google.com`), `aud` (configured Google Client ID(s)), expiration timestamp (`exp` with 60-second RFC 7519 leeway), issued-at (`iat`), not-before (`nbf`), authorized party (`azp`), and non-empty subject (`sub`).
+    - JWKS keys are cached in memory with a 1-hour TTL, bounded 5-second fetch timeout (`HttpJwksProvider`), strict 256 KB response body limit, and 10-second refresh throttling on unknown `kid` to prevent upstream cache-miss flooding. Deterministic offline testing is guaranteed via `MockJwksProvider` without live Google network access.
     - Client-asserted user IDs are never trusted without cryptographic token validation.
  2. **Developer & IDE Clients (Custom IDE, VS Code Extension, CLI):**
     - Authenticated via Personal Access Tokens (PATs) (`pat_<64_hex_chars>`) or configured backend API keys passed in `Authorization: Bearer <pat>` or `X-API-Key: <key>`.
     - Keys are stored in memory as SHA-256 hashes (`ring::digest`) and verified using constant-time comparison (`subtle::ConstantTimeEq`), eliminating length- and character-timing side channels.
- 3. **Identity Propagation & Role Authorization:**
+    - `ConfiguredCredential` implements zero-leak `Debug` formatting redacting key hashes as `[REDACTED]`.
+ 3. **Identity Propagation & Route Scope Authorization:**
     - Every authenticated request injects a strongly-typed `AuthPrincipal` into Axum request extensions, carrying `subject`, `auth_type` (`GoogleOidc`, `PersonalAccessToken`, `ApiKey`, `DevelopmentBypass`), `client_type` (`Flutter`, `CustomIde`, `VscodeExtension`, `ApiClient`), `email`, `roles` (`User`, `Admin`, `Service`), and `scopes`.
-    - Route handlers verify principal permissions and scopes prior to executing sensitive operations.
- 4. **Strict Precedence & Zero Fallback:**
+    - Ingress middleware verifies that the principal possesses the documented scope for the target endpoint: `models:read` for model & provider discovery, `routing:read` for routing preview, `chat` for chat completions and streaming, and `usage:read` for usage and quotas. Requests lacking the required scope are denied with HTTP 403 Forbidden.
+    - Caller `X-Client-Type` headers are audit labels only and strictly never grant roles, scopes, or privileges.
+ 4. **Query Parameter Credential Prohibition:**
+    - Credentials must NEVER be accepted through URL query parameters (e.g. `?api_key=...`, `?access_token=...`).
+    - Inbound requests containing credentials in query parameters are unconditionally rejected with HTTP 401 Unauthorized, instructing clients to use standard request headers. Query credentials never grant development bypass or fall back to other authentication methods.
+ 5. **Strict Precedence & Zero Fallback:**
     - Incoming 3-segment JWTs are routed strictly to the Google OIDC validator.
     - Non-JWT tokens and `X-API-Key` headers are routed strictly to the PAT/API Key validator.
     - An invalid credential never receives weaker fallback authentication or developer bypass.
- 5. **Fail-Closed Production Configuration:**
-    - In production mode (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present.
-    - Operational telemetry endpoints (`/api/v1/usage/*`, `/api/v1/quotas`) unconditionally require authentication whenever the server binds to a non-loopback host interface.
+ 6. **Fail-Closed Production & External Bind Security:**
+    - In production mode (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present, or if `GOOGLE_JWKS_URL` does not use HTTPS.
+    - Unauthenticated development bypass is strictly restricted to loopback network interfaces (`127.0.0.1`, `localhost`, `::1`). Binding to any non-loopback network interface (`HOST=0.0.0.0` or public IP) unconditionally enforces authentication across ALL protected routes.
 
----
+-----
 
 ## 3. Request Hardening & Abuse Prevention
 
