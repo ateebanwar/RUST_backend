@@ -321,6 +321,13 @@ impl JwksProvider for HttpJwksProvider {
                 if let Some(last_attempt) = *attempt_lock
                     && last_attempt.elapsed() < Self::MIN_REFRESH_INTERVAL
                 {
+                    // Re-check read cache: another concurrent task might have refreshed the cache just now
+                    let read_lock = self.cache.read().await;
+                    if let Some(cached) = &*read_lock
+                        && let Some(key) = cached.keys.get(kid)
+                    {
+                        return Ok(key.clone());
+                    }
                     // Return UnknownKeyId rather than pounding upstream endpoint
                     return Err(OidcError::UnknownKeyId(kid.to_string()));
                 }
@@ -465,6 +472,20 @@ impl GoogleOidcValidator {
             )));
         }
 
+        // Multi-audience verification: OpenID Connect Core 1.0 §3.1.3.7
+        // "If the ID Token contains multiple audiences, the Client MUST verify that an azp Claim is present."
+        let is_multi_audience = match &claims.aud {
+            serde_json::Value::Array(arr) => arr.len() > 1,
+            _ => false,
+        };
+
+        if is_multi_audience && claims.azp.is_none() {
+            return Err(OidcError::InvalidAudience(
+                "Token with multiple audiences must contain an authorized party (azp) claim"
+                    .to_string(),
+            ));
+        }
+
         // 6. Validate authorized party (azp) if present: must match one of the configured client IDs
         if let Some(azp) = &claims.azp
             && !self.client_ids.contains(azp)
@@ -507,5 +528,76 @@ impl GoogleOidcValidator {
                 "usage:read".to_string(),
             ],
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_claims_matches_audience_string_and_array() {
+        let allowed = vec!["client-123.google.com".to_string()];
+
+        let claims_str = GoogleClaims {
+            iss: "https://accounts.google.com".to_string(),
+            sub: "sub1".to_string(),
+            aud: serde_json::Value::String("client-123.google.com".to_string()),
+            exp: 1000,
+            iat: None,
+            nbf: None,
+            azp: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            picture: None,
+        };
+        assert!(claims_str.matches_audience(&allowed));
+
+        let claims_wrong = GoogleClaims {
+            iss: "https://accounts.google.com".to_string(),
+            sub: "sub1".to_string(),
+            aud: serde_json::Value::String("other.google.com".to_string()),
+            exp: 1000,
+            iat: None,
+            nbf: None,
+            azp: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            picture: None,
+        };
+        assert!(!claims_wrong.matches_audience(&allowed));
+
+        let claims_arr = GoogleClaims {
+            iss: "https://accounts.google.com".to_string(),
+            sub: "sub1".to_string(),
+            aud: serde_json::json!(["other.google.com", "client-123.google.com"]),
+            exp: 1000,
+            iat: None,
+            nbf: None,
+            azp: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            picture: None,
+        };
+        assert!(claims_arr.matches_audience(&allowed));
+    }
+
+    #[test]
+    fn test_jwks_provider_constants() {
+        assert_eq!(HttpJwksProvider::MAX_JWKS_RESPONSE_BYTES, 262_144);
+        assert_eq!(
+            HttpJwksProvider::MIN_REFRESH_INTERVAL,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn test_validator_unconfigured_client_ids() {
+        let mock = Arc::new(MockJwksProvider::new());
+        let validator = GoogleOidcValidator::new(mock, vec![]);
+        assert!(!validator.is_configured());
     }
 }

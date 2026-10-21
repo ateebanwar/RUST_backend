@@ -2,6 +2,32 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-21 — Phase 11: Production-Grade Security Audit, Remediation, Header Hardening, and Multi-Audience azp Enforcement
+
+### Audited, Corrected & Verified
+- **OpenID Connect Core 1.0 Multi-Audience `azp` Enforcement (`src/auth/oidc.rs`):**
+  - Enforced OIDC Core 1.0 §3.1.3.7 rule 3: tokens containing multiple audiences (`claims.aud` as an array with > 1 elements) MUST contain an authorized party (`azp`) claim.
+  - Tokens missing `azp` under multi-audience configurations are immediately rejected with `OidcError::InvalidAudience`.
+- **JWKS Concurrency Cache Re-check on Throttle (`src/auth/oidc.rs`):**
+  - In `HttpJwksProvider::get_decoding_key`, re-checks `self.cache.read().await` when the 10-second unknown-`kid` throttle is active before returning `Err(OidcError::UnknownKeyId)`.
+  - Safely handles concurrent in-flight requests during legitimate Google key rotations without false-negative rejections.
+- **Header Parsing Security & Conflicting Scheme Defense (`src/auth/service.rs`):**
+  - Prohibited duplicate `Authorization` headers (`headers.get_all("authorization").iter().count() > 1`) and duplicate `X-API-Key` headers (`headers.get_all("x-api-key").iter().count() > 1`), returning HTTP 401 `Unauthorized`.
+  - Prohibited simultaneous conflicting credential headers (both `Authorization` and `X-API-Key` present), returning HTTP 401 `Unauthorized` to prevent ambiguous or contradictory identity resolution.
+  - Hardened header value decoding to validate UTF-8 encoding, failing closed with HTTP 401 on non-UTF-8 bytes rather than silently losing the header.
+- **Credential Length Bounding & Resource Exhaustion Defense (`src/auth/service.rs`):**
+  - Established `AuthService::MAX_CREDENTIAL_LEN = 8192` (8 KiB) ceiling on Bearer tokens and API keys.
+  - Protects token parsing, hashing, and string allocation against memory exhaustion and regex/parsing Denial of Service attacks.
+- **Comprehensive Verification & Test Suite Expansion (`tests/authentication_test.rs`, `src/auth/oidc.rs`, `src/auth/service.rs`):**
+  - Added Test 25: Multi-audience OIDC token requiring `azp`.
+  - Added Test 26: Duplicate and conflicting header rejection.
+  - Added Test 27: Oversized credential rejection (>8192 bytes for both Bearer and API keys).
+  - Added Test 28: Non-UTF-8 header rejection.
+  - Added 8 unit tests in `src/auth/oidc.rs` and `src/auth/service.rs` validating audience matching, JWKS provider constants, unconfigured client IDs, route scope resolution, and query credential detection.
+  - Total automated tests increased to **324 passing tests** across 17 test suites (89 unit + 235 integration across 16 integration binaries, 0 failures, 1 ignored load benchmark).
+  - Full quality gates: `cargo fmt --check` clean, `cargo check` clean, `cargo clippy --all-targets --all-features -- -D warnings` clean, `cargo audit -n` clean (0 advisories across 183 crates), `gitleaks detect -v` clean (0 leaks), `cargo build --release` passing.
+
+
 ## 2026-10-21 — Forensic Security Remediation: Query Percent-Decoding, OIDC azp Validation, Streaming JWKS Limits, and Configuration Precedence
 
 ### Audited, Corrected & Verified

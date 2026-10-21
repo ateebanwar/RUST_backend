@@ -20,6 +20,10 @@ pub struct AuthService {
 }
 
 impl AuthService {
+    /// Maximum permitted length of an individual credential string (8 KiB)
+    /// to bound memory allocation and parsing overhead under malicious payloads.
+    pub const MAX_CREDENTIAL_LEN: usize = 8192;
+
     /// Create a new AuthService from application configuration.
     pub fn new(config: Arc<AppConfig>) -> Self {
         // Collect all configured API keys
@@ -278,23 +282,59 @@ impl AuthService {
             return Ok(None);
         }
 
-        // Parse client type header (defaults to ApiClient)
+        // 3. Prohibit duplicate authorization or api-key headers
+        if headers.get_all("authorization").iter().count() > 1 {
+            return Err(AppError::Unauthorized(
+                "Duplicate Authorization headers are prohibited".to_string(),
+            ));
+        }
+        if headers.get_all("x-api-key").iter().count() > 1 {
+            return Err(AppError::Unauthorized(
+                "Duplicate X-API-Key headers are prohibited".to_string(),
+            ));
+        }
+
+        // 4. Prohibit conflicting simultaneous credentials (both Authorization and X-API-Key provided)
+        let has_auth = headers.contains_key("authorization");
+        let has_key = headers.contains_key("x-api-key");
+        if has_auth && has_key {
+            return Err(AppError::Unauthorized(
+                "Conflicting authentication credentials: both Authorization and X-API-Key headers were provided"
+                    .to_string(),
+            ));
+        }
+
+        // 5. Parse client type header (defaults to ApiClient)
         let client_type = headers
             .get("x-client-type")
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.parse::<ClientType>().ok())
             .unwrap_or(ClientType::ApiClient);
 
-        // Extract credentials
-        let auth_header = headers
-            .get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.trim());
+        // 6. Extract credentials safely, validating UTF-8 encoding
+        let auth_header = match headers.get("authorization") {
+            Some(val) => {
+                let s = val.to_str().map_err(|_| {
+                    AppError::Unauthorized(
+                        "Invalid non-UTF-8 characters in Authorization header".to_string(),
+                    )
+                })?;
+                Some(s.trim())
+            }
+            None => None,
+        };
 
-        let api_key_header = headers
-            .get("x-api-key")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.trim());
+        let api_key_header = match headers.get("x-api-key") {
+            Some(val) => {
+                let s = val.to_str().map_err(|_| {
+                    AppError::Unauthorized(
+                        "Invalid non-UTF-8 characters in X-API-Key header".to_string(),
+                    )
+                })?;
+                Some(s.trim())
+            }
+            None => None,
+        };
 
         // Check for empty or malformed authorization headers
         if let Some(auth_str) = auth_header {
@@ -314,6 +354,12 @@ impl AuthService {
             if token.is_empty() {
                 return Err(AppError::Unauthorized(
                     "Bearer token cannot be empty or whitespace".to_string(),
+                ));
+            }
+
+            if token.len() > Self::MAX_CREDENTIAL_LEN {
+                return Err(AppError::Unauthorized(
+                    "Bearer token exceeds maximum permitted length of 8192 bytes".to_string(),
                 ));
             }
 
@@ -346,6 +392,12 @@ impl AuthService {
             if key.is_empty() {
                 return Err(AppError::Unauthorized(
                     "X-API-Key header cannot be empty or whitespace".to_string(),
+                ));
+            }
+
+            if key.len() > Self::MAX_CREDENTIAL_LEN {
+                return Err(AppError::Unauthorized(
+                    "X-API-Key exceeds maximum permitted length of 8192 bytes".to_string(),
                 ));
             }
 
@@ -384,5 +436,113 @@ impl AuthService {
 
         // Permitted local development unauthenticated bypass strictly on loopback
         Ok(Some(AuthPrincipal::development_bypass(client_type)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::principal::AuthRole;
+
+    #[test]
+    fn test_public_probe_identification() {
+        assert!(AuthService::is_public_probe("/api/v1/health"));
+        assert!(AuthService::is_public_probe("/api/v1/health/"));
+        assert!(AuthService::is_public_probe("/api/v1/ready"));
+        assert!(AuthService::is_public_probe("/api/v1/ready/"));
+        assert!(!AuthService::is_public_probe("/api/v1/models"));
+        assert!(!AuthService::is_public_probe("/api/v1/chat/completions"));
+    }
+
+    #[test]
+    fn test_operational_data_identification() {
+        assert!(AuthService::is_operational_data("/api/v1/usage/summary"));
+        assert!(AuthService::is_operational_data("/api/v1/quotas"));
+        assert!(!AuthService::is_operational_data("/api/v1/models"));
+    }
+
+    #[test]
+    fn test_route_scope_resolution() {
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/health"),
+            None
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/models"),
+            Some("models:read")
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/models/gpt-4o"),
+            Some("models:read")
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/providers"),
+            Some("models:read")
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/routing/preview"),
+            Some("routing:read")
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/chat/completions"),
+            Some("chat")
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/chat/stream"),
+            Some("chat")
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/usage/summary"),
+            Some("usage:read")
+        );
+        assert_eq!(
+            AuthService::required_scope_for_route("/api/v1/quotas"),
+            Some("usage:read")
+        );
+    }
+
+    #[test]
+    fn test_percent_decode_and_credential_query_detection() {
+        assert!(AuthService::contains_credential_query(Some(
+            "api_key=secret123"
+        )));
+        assert!(AuthService::contains_credential_query(Some("token=xyz")));
+        assert!(AuthService::contains_credential_query(Some(
+            "access_token=xyz"
+        )));
+        assert!(AuthService::contains_credential_query(Some(
+            "%61%70%69%5f%6b%65%79=123"
+        )));
+        assert!(AuthService::contains_credential_query(Some(
+            "foo=bar&api_key=123"
+        )));
+        assert!(!AuthService::contains_credential_query(Some(
+            "model=gpt-4o&stream=true"
+        )));
+        assert!(!AuthService::contains_credential_query(None));
+    }
+
+    #[test]
+    fn test_authorize_scope_enforcement() {
+        let principal_chat_only = AuthPrincipal::new(
+            "user:123",
+            crate::auth::AuthType::ApiKey,
+            ClientType::ApiClient,
+            None,
+            vec![AuthRole::User],
+            vec!["chat".to_string()],
+        );
+
+        // Allowed on chat route
+        assert!(AuthService::authorize(&principal_chat_only, "/api/v1/chat/completions").is_ok());
+
+        // Denied on models route
+        let err = AuthService::authorize(&principal_chat_only, "/api/v1/models").unwrap_err();
+        match err {
+            AppError::Forbidden(msg) => {
+                assert!(msg.contains("lacks required scope 'models:read'"));
+            }
+            other => panic!("Expected Forbidden, got {other:?}"),
+        }
     }
 }

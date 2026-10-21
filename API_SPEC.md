@@ -40,11 +40,13 @@ All endpoints (except public probes `/api/v1/health` and `/api/v1/ready`) requir
 > [!IMPORTANT]
 > **Strict Precedence & Zero Fallback Rule:** If an incoming request provides credentials (e.g. an expired Google ID token or invalid API key), it is rejected with HTTP 401 Unauthorized immediately. Invalid credentials never fall back to another authentication mechanism or developer bypass.
 >
+> **Duplicate & Conflicting Headers Proscription:** Multiple `Authorization` or `X-API-Key` headers are strictly prohibited and return HTTP 401 Unauthorized. Supplying conflicting simultaneous authentication schemes (both `Authorization` and `X-API-Key` provided) is rejected with HTTP 401 Unauthorized. Credential headers must be valid UTF-8 and are subject to an enforced length ceiling of 8,192 bytes (8 KiB) to prevent memory exhaustion and DoS.
+>
 > **Query Parameter Credential Prohibition:** Credentials must NEVER be transmitted in URL query parameters (`?api_key=...`, `?access_token=...`, `?api-key=...`, `?bearer=...`, etc.). Query strings are automatically percent-decoded to prevent evasion attacks; inbound requests containing credentials in query parameters are strictly rejected with HTTP 401 Unauthorized.
 >
 > **Route Scope Authorization:** Authenticated principals must possess the required scope documented in the Route Protection Matrix above (`models:read`, `routing:read`, `chat`, `usage:read`). Principals lacking the required scope receive HTTP 403 Forbidden with canonical code `FORBIDDEN`.
 >
-> **Google OIDC Claims Invariant:** Google ID tokens must contain valid `iss`, `aud`, and `exp` claims. If the token contains an `azp` (Authorized Party) claim, the `azp` value MUST match one of the configured Google client IDs. Insecure or mismatched `azp` claims are rejected with HTTP 401 Unauthorized.
+> **Google OIDC Claims & Multi-Audience Invariants:** Google ID tokens must contain valid `iss`, `aud`, and `exp` claims. Per OpenID Connect Core 1.0 §3.1.3.7, if an ID token contains multiple audiences in an array, an `azp` (Authorized Party) claim MUST be present. If `azp` is present, it MUST match one of the configured Google client IDs. Insecure, missing, or mismatched `azp` claims are rejected with HTTP 401 Unauthorized.
 
 ### 1.2 Standardized JSON Data Types & Formatting Rules
 - **Timestamps:** ISO 8601 / RFC 3339 UTC strings with trailing `Z` (e.g. `2026-10-19T17:00:00Z`).

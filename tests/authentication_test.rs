@@ -1151,3 +1151,294 @@ fn test_config_is_auth_required_precedence_in_production_and_external_bind() {
         "Development on loopback with explicit false must return false"
     );
 }
+
+#[tokio::test]
+async fn test_google_oidc_multi_audience_requires_azp() {
+    let mut mock_jwks = MockJwksProvider::new();
+    let decoding_key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_KEY_PEM.as_bytes())
+        .expect("Valid RSA public key");
+    mock_jwks.add_key(TEST_KID, decoding_key);
+
+    let validator = GoogleOidcValidator::new(
+        Arc::new(mock_jwks),
+        vec![
+            TEST_CLIENT_ID.to_string(),
+            "second-authorized-client.apps.googleusercontent.com".to_string(),
+        ],
+    );
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Token has multiple audiences in an array, but NO azp claim!
+    let mut claims = GoogleClaims {
+        iss: "https://accounts.google.com".to_string(),
+        sub: "multi_aud_user_12345".to_string(),
+        aud: serde_json::json!([
+            TEST_CLIENT_ID,
+            "second-authorized-client.apps.googleusercontent.com"
+        ]),
+        exp: now + 3600,
+        iat: Some(now - 10),
+        nbf: Some(now - 10),
+        azp: None, // Missing azp on multi-audience token per OIDC Core 1.0 §3.1.3.7
+        email: Some("user@example.com".to_string()),
+        email_verified: Some(true),
+        name: Some("Multi Audience User".to_string()),
+        picture: None,
+    };
+
+    let token = create_test_jwt(&claims, Some(TEST_KID), TEST_RSA_PRIVATE_KEY_PEM)
+        .expect("Signed test JWT");
+
+    let result = validator.validate(&token, ClientType::Flutter).await;
+    assert!(
+        result.is_err(),
+        "OIDC Core 1.0 requires azp when ID token contains multiple audiences"
+    );
+
+    let err = result.unwrap_err();
+    match err {
+        ai_backend::auth::OidcError::InvalidAudience(msg) => {
+            assert!(
+                msg.contains("multiple audiences must contain an authorized party (azp)"),
+                "Expected rejection message for missing azp on multi-audience token: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidAudience error, got: {other:?}"),
+    }
+
+    // Now supply valid matching azp: must succeed!
+    claims.azp = Some(TEST_CLIENT_ID.to_string());
+    let valid_token = create_test_jwt(&claims, Some(TEST_KID), TEST_RSA_PRIVATE_KEY_PEM)
+        .expect("Signed test JWT");
+
+    let valid_result = validator.validate(&valid_token, ClientType::Flutter).await;
+    assert!(
+        valid_result.is_ok(),
+        "Token with multiple audiences and matching azp must be accepted"
+    );
+}
+
+#[tokio::test]
+async fn test_duplicate_and_conflicting_headers_prohibited() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("header_security_test_key_123".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // 1. Duplicate Authorization headers
+    let resp_dup_auth = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("Authorization", "Bearer header_security_test_key_123")
+        .header("Authorization", "Bearer conflicting_key_456")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp_dup_auth.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Duplicate Authorization headers must be rejected"
+    );
+    let body: Value = resp_dup_auth.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+
+    // 2. Duplicate X-API-Key headers (HTTP layer sanitizes message via defense-in-depth)
+    let resp_dup_key = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("X-API-Key", "header_security_test_key_123")
+        .header("X-API-Key", "conflicting_key_456")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp_dup_key.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Duplicate X-API-Key headers must be rejected"
+    );
+    let body_key: Value = resp_dup_key.json().await.unwrap();
+    assert_eq!(body_key["error"]["code"], "UNAUTHORIZED");
+
+    // 3. Conflicting simultaneous credentials (both Authorization and X-API-Key)
+    let resp_conflict = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("Authorization", "Bearer header_security_test_key_123")
+        .header("X-API-Key", "header_security_test_key_123")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp_conflict.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Simultaneous Authorization and X-API-Key must be rejected"
+    );
+    let body_conflict: Value = resp_conflict.json().await.unwrap();
+    assert_eq!(body_conflict["error"]["code"], "UNAUTHORIZED");
+
+    // 4. Direct AuthService unit validation to verify exact diagnostic errors
+    let auth_service = AuthService::new(Arc::new(AppConfig::default_local()));
+
+    // Verify duplicate Authorization error
+    let mut h_dup_auth = axum::http::HeaderMap::new();
+    h_dup_auth.append("authorization", "Bearer token1".parse().unwrap());
+    h_dup_auth.append("authorization", "Bearer token2".parse().unwrap());
+    let err_dup_auth = auth_service
+        .authenticate(&h_dup_auth, "/api/v1/models", None)
+        .await
+        .unwrap_err();
+    match err_dup_auth {
+        ai_backend::errors::AppError::Unauthorized(msg) => {
+            assert_eq!(msg, "Duplicate Authorization headers are prohibited");
+        }
+        other => panic!("Expected Unauthorized, got {other:?}"),
+    }
+
+    // Verify duplicate X-API-Key error
+    let mut h_dup_key = axum::http::HeaderMap::new();
+    h_dup_key.append("x-api-key", "key1".parse().unwrap());
+    h_dup_key.append("x-api-key", "key2".parse().unwrap());
+    let err_dup_key = auth_service
+        .authenticate(&h_dup_key, "/api/v1/models", None)
+        .await
+        .unwrap_err();
+    match err_dup_key {
+        ai_backend::errors::AppError::Unauthorized(msg) => {
+            assert_eq!(msg, "Duplicate X-API-Key headers are prohibited");
+        }
+        other => panic!("Expected Unauthorized, got {other:?}"),
+    }
+
+    // Verify conflicting simultaneous credentials error
+    let mut h_conflict = axum::http::HeaderMap::new();
+    h_conflict.insert("authorization", "Bearer token1".parse().unwrap());
+    h_conflict.insert("x-api-key", "key1".parse().unwrap());
+    let err_conflict = auth_service
+        .authenticate(&h_conflict, "/api/v1/models", None)
+        .await
+        .unwrap_err();
+    match err_conflict {
+        ai_backend::errors::AppError::Unauthorized(msg) => {
+            assert!(msg.contains("Conflicting authentication credentials"));
+        }
+        other => panic!("Expected Unauthorized, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_oversized_credentials_rejected() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("valid_key_oversized_test_123".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // 1. Oversized Bearer token (> 8192 bytes)
+    let huge_token = "A".repeat(8193);
+    let resp_huge_token = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("Authorization", format!("Bearer {huge_token}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp_huge_token.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Bearer token exceeding 8192 bytes must be rejected with 401"
+    );
+    let body_token: Value = resp_huge_token.json().await.unwrap();
+    assert_eq!(body_token["error"]["code"], "UNAUTHORIZED");
+
+    // 2. Oversized X-API-Key (> 8192 bytes)
+    let huge_key = "K".repeat(8193);
+    let resp_huge_key = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("X-API-Key", huge_key)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp_huge_key.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "X-API-Key exceeding 8192 bytes must be rejected with 401"
+    );
+    let body_key: Value = resp_huge_key.json().await.unwrap();
+    assert_eq!(body_key["error"]["code"], "UNAUTHORIZED");
+
+    // 3. Direct AuthService unit check for exact diagnostic strings
+    let auth_service = AuthService::new(Arc::new(AppConfig::default_local()));
+
+    let mut h_huge_token = axum::http::HeaderMap::new();
+    let bearer_huge = format!("Bearer {}", "A".repeat(8193));
+    h_huge_token.insert("authorization", bearer_huge.parse().unwrap());
+    let err_token = auth_service
+        .authenticate(&h_huge_token, "/api/v1/models", None)
+        .await
+        .unwrap_err();
+    match err_token {
+        ai_backend::errors::AppError::Unauthorized(msg) => {
+            assert!(msg.contains("8192 bytes"));
+        }
+        other => panic!("Expected Unauthorized, got {other:?}"),
+    }
+
+    let mut h_huge_key = axum::http::HeaderMap::new();
+    h_huge_key.insert("x-api-key", "K".repeat(8193).parse().unwrap());
+    let err_key = auth_service
+        .authenticate(&h_huge_key, "/api/v1/models", None)
+        .await
+        .unwrap_err();
+    match err_key {
+        ai_backend::errors::AppError::Unauthorized(msg) => {
+            assert!(msg.contains("8192 bytes"));
+        }
+        other => panic!("Expected Unauthorized, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_utf8_header_rejected() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("valid_key_utf8_test_123".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // Non-ASCII, non-UTF-8 bytes (0x80, 0x81) in Authorization header
+    let invalid_bytes_header = reqwest::header::HeaderValue::from_bytes(b"Bearer \x80\x81\x82")
+        .expect("Valid HTTP bytes representation");
+
+    let resp = client
+        .get(format!("{base_url}/api/v1/models"))
+        .header("Authorization", invalid_bytes_header)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Non-UTF-8 Authorization header must be rejected"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid non-UTF-8 characters in Authorization header"),
+        "Expected error message for non-UTF-8 header: {body:?}"
+    );
+}
