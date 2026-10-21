@@ -84,7 +84,7 @@
   - **Effective Message Compaction Consistency:** `resolve_candidates` evaluates compacted effective messages matching provider dispatch payload, eliminating admission discrepancies.
   - **Output Limit Discrimination:** Auto-routing differentiates max output capacity violations from context window exhaustion, returning explicit informative errors.
   - **Comprehensive Verification:** 279 automated tests passing across 16 test suites (`tests/model_aware_tokenization_and_admission_test.rs` covering 19 categories including reference fixtures and mapping matrix); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean; `gitleaks detect -v` clean. Phase 11 remains strictly on hold.
-- [x] **Phase 11 — Authentication & Authorization (COMPLETE, PRODUCTION-AUDITED, REMEDIATED & VERIFIED):**
+- [x] **Phase 11 — Authentication (COMPLETE, PRODUCTION-AUDITED, REMEDIATED & VERIFIED):**
   - **Multi-Client Authentication Subsystem (`src/auth/`):** Unified authentication service decoupled from specific frontends, serving Flutter mobile applications, Custom AI IDEs, VS Code / editor extensions, and automated API consumers.
   - **Query-Parameter Credential Proscription (`src/auth/service.rs`):** Immediate rejection (HTTP 401 Unauthorized, canonical `UNAUTHORIZED` code) of any protected request passing credentials (`api_key`, `access_token`, etc.) in URL query parameters. URL query parameters are percent-decoded to completely eliminate percent-encoding evasion attacks.
   - **Non-Loopback Bind Exposure Defense (`src/config.rs`, `src/auth/service.rs`):** Automatic and unconditional enforcement of authentication across all protected endpoints whenever binding to external interfaces (`!is_loopback_host()`), preventing accidental exposure in development mode.
@@ -95,7 +95,7 @@
   - **Request Identity & Authorization Propagation (`src/auth/principal.rs`):** Strongly-typed `AuthPrincipal` inserted into Axum request extensions containing `subject`, `auth_type`, `client_type` (parsed from `X-Client-Type`), `email`, `roles` (`User`, `Admin`, `Service`), and authorized `scopes`. Zero-leak `Debug` and `Display` formatting redacting emails and credentials.
   - **Strict Precedence & Zero Fallback:** 3-segment JWT tokens route strictly to OIDC; non-JWT tokens and `X-API-Key` headers route strictly to PAT/API key validators. Invalid credentials never fall back to weaker authentication or developer bypass.
   - **Fail-Closed Production Configuration (`src/config.rs`):** Production mode (`APP_ENV=production`) fails closed at startup with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is configured, if `GOOGLE_JWKS_URL` does not use HTTPS, or if `AUTH_REQUIRED=false` is configured.
-  - **Comprehensive Test Coverage & Verification:** **324 automated tests passing** across 17 test suites (89 unit + 235 integration across 16 integration binaries, plus 1 ignored benchmark, including 28 security integration tests in `tests/authentication_test.rs`); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing. Phase 12 remains strictly on hold.
+  - **Comprehensive Test Coverage & Verification:** **325 automated tests passing** across 17 test suites (89 unit + 236 integration across 16 integration binaries, plus 1 ignored benchmark, including 29 security integration tests in `tests/authentication_test.rs`); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing. Phase 12 remains strictly on hold.
 
 ---
 
@@ -115,8 +115,8 @@
 | **8** | **Quota & Usage Tracking** | **COMPLETE** | Phase 7B | Persistent SQLite store, token accounting, quota awareness, read-only analytics APIs | 170 tests pass, clippy clean, zero warnings | Verified Complete |
 | **9** | **Failover & Reliability** | **COMPLETE** | Phase 8 | Bounded retries, exponential backoff, loop prevention, manual routing invariant, pre vs mid-stream handling | 196 tests pass, clippy clean, zero warnings | Verified Complete |
 | **10** | **Token Optimization & Operational Hardening** | **COMPLETE** | Phase 9 | Model-aware estimation, conservative compaction, context gating, proxy security, durable usage queue | 220 tests pass, clippy clean, zero warnings, release load tested | Verified Complete |
-| **11** | **Authentication** | **COMPLETE** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE), query rejection, route scopes | All tests pass (312 tests), clippy clean, zero warnings | Approved by User |
-| **12** | **Authorization & Secret Management** | **NEXT ELIGIBLE PHASE** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Eligible to Begin |
+| **11** | **Authentication** | **COMPLETE** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE), query rejection, route scopes | All tests pass (325 tests), clippy clean, zero warnings | Approved by User |
+| **12** | **Authorization and Secret Management** | **NEXT ELIGIBLE PHASE** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Eligible to Begin |
 | **13** | **Abuse Prevention** | **NOT STARTED** | Phase 12 | Inbound body size limits, rate limiting, connection timeouts | Fuzzing & request flood tests | Pending Approval |
 | **14** | **Security Hardening** | **NOT STARTED** | Phase 13 | SSRF IP allowlisting, dependency audit, security regression suite | `cargo audit`, SSRF block tests | Pending Approval |
 | **15** | **Google Drive Integration** | **NOT STARTED** | Phase 14 | OAuth token exchange, `drive.appdata` scope client, Drive I/O | Mock Google Drive API tests | Pending Approval |
@@ -130,8 +130,8 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Phase 11 Formally Closed & Verified:** All mandatory acceptance criteria (OIDC verification, constant-time PAT/API keys, fail-closed production config, identity propagation, route matrix enforcement) are fully verified and passing.
-2. **Phase 12 (Authorization & Secret Management) Is Next Eligible Phase:** Phase 12 remains unstarted and strictly on hold until separate explicit user authorization. No Phase 12 code has been implemented.
+1. **Phase 11 Formally Closed & Verified:** All mandatory acceptance criteria (OIDC verification, constant-time PAT/API keys, fail-closed production config, identity propagation, route matrix enforcement, concurrent JWKS handling) are fully verified and passing.
+2. **Phase 12 (Authorization and Secret Management) Is Next Eligible Phase:** Phase 12 remains unstarted and strictly on hold until separate explicit user authorization. No Phase 12 code has been implemented.
 3. **Repository State Protected:** Secrets, local SQLite databases (`data/usage.db`), and compiled binaries (`target/`) are strictly excluded from version control with zero credential leakage.
 
 

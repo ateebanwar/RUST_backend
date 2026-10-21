@@ -23,8 +23,9 @@ All notable project changes, architectural decisions, and document synchronizati
   - Added Test 26: Duplicate and conflicting header rejection.
   - Added Test 27: Oversized credential rejection (>8192 bytes for both Bearer and API keys).
   - Added Test 28: Non-UTF-8 header rejection.
+  - Added Test 29: Concurrent OIDC, unknown-kid, and API-key request safety under concurrent task execution (`tokio::task::JoinSet`).
   - Added 8 unit tests in `src/auth/oidc.rs` and `src/auth/service.rs` validating audience matching, JWKS provider constants, unconfigured client IDs, route scope resolution, and query credential detection.
-  - Total automated tests increased to **324 passing tests** across 17 test suites (89 unit + 235 integration across 16 integration binaries, 0 failures, 1 ignored load benchmark).
+  - Total automated tests increased to **325 passing tests** across 17 test suites (89 unit + 236 integration across 16 integration binaries, 0 failures, 1 ignored load benchmark).
   - Full quality gates: `cargo fmt --check` clean, `cargo check` clean, `cargo clippy --all-targets --all-features -- -D warnings` clean, `cargo audit -n` clean (0 advisories across 183 crates), `gitleaks detect -v` clean (0 leaks), `cargo build --release` passing.
 
 

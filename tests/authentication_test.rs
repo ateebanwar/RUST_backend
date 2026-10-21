@@ -1442,3 +1442,139 @@ async fn test_invalid_utf8_header_rejected() {
         "Expected error message for non-UTF-8 header: {body:?}"
     );
 }
+
+#[tokio::test]
+async fn test_concurrent_oidc_authentication_and_jwks_concurrency() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut mock_jwks = MockJwksProvider::new();
+    let decoding_key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_KEY_PEM.as_bytes()).unwrap();
+    mock_jwks.add_key(TEST_KID, decoding_key);
+
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("concurrent_api_key_test_99".to_string());
+    config.auth_required = Some(true);
+    let config = Arc::new(config);
+
+    let auth_service = Arc::new(AuthService::with_mock_jwks(
+        config.clone(),
+        Arc::new(mock_jwks),
+        vec![TEST_CLIENT_ID.to_string()],
+    ));
+
+    let state = AppState::new(config).with_auth_service(auth_service);
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+
+    // 1. Valid OIDC claims
+    let valid_claims = GoogleClaims {
+        iss: "https://accounts.google.com".to_string(),
+        sub: "concurrent_user_001".to_string(),
+        aud: json!(TEST_CLIENT_ID),
+        exp: now + 3600,
+        iat: Some(now - 10),
+        nbf: Some(now - 10),
+        azp: Some(TEST_CLIENT_ID.to_string()),
+        email: Some("concurrent@example.com".to_string()),
+        email_verified: Some(true),
+        name: Some("Concurrent User".to_string()),
+        picture: None,
+    };
+    let valid_oidc_token =
+        create_test_jwt(&valid_claims, Some(TEST_KID), TEST_RSA_PRIVATE_KEY_PEM).unwrap();
+
+    // 2. Unknown kid OIDC claims (triggers unknown kid path)
+    let unknown_kid_token = create_test_jwt(
+        &valid_claims,
+        Some("unknown_rotated_kid"),
+        TEST_RSA_PRIVATE_KEY_PEM,
+    )
+    .unwrap();
+
+    // Launch 30 concurrent requests (10 valid OIDC, 10 unknown kid, 10 API key)
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for i in 0..30 {
+        let base_url = base_url.clone();
+        let valid_oidc = valid_oidc_token.clone();
+        let unknown_oidc = unknown_kid_token.clone();
+
+        join_set.spawn(async move {
+            let client = reqwest::Client::new();
+            let case_type = i % 3;
+            let resp = match case_type {
+                0 => {
+                    // Valid OIDC token
+                    client
+                        .get(format!("{base_url}/api/v1/models"))
+                        .header("Authorization", format!("Bearer {valid_oidc}"))
+                        .header("X-Client-Type", "flutter")
+                        .send()
+                        .await
+                        .expect("Valid OIDC request failed to execute")
+                }
+                1 => {
+                    // Unknown kid OIDC token
+                    client
+                        .get(format!("{base_url}/api/v1/models"))
+                        .header("Authorization", format!("Bearer {unknown_oidc}"))
+                        .header("X-Client-Type", "flutter")
+                        .send()
+                        .await
+                        .expect("Unknown kid request failed to execute")
+                }
+                _ => {
+                    // Valid API key
+                    client
+                        .get(format!("{base_url}/api/v1/models"))
+                        .header("X-API-Key", "concurrent_api_key_test_99")
+                        .header("X-Client-Type", "custom-ide")
+                        .send()
+                        .await
+                        .expect("API key request failed to execute")
+                }
+            };
+            (case_type, resp.status())
+        });
+    }
+
+    let mut valid_oidc_count = 0;
+    let mut unknown_kid_count = 0;
+    let mut api_key_count = 0;
+
+    while let Some(res) = join_set.join_next().await {
+        let (case_type, status) = res.expect("Concurrent task panicked");
+        match case_type {
+            0 => {
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "Concurrent valid OIDC token must succeed with 200 OK"
+                );
+                valid_oidc_count += 1;
+            }
+            1 => {
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    "Concurrent unknown-kid token must fail closed with 401 Unauthorized"
+                );
+                unknown_kid_count += 1;
+            }
+            _ => {
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "Concurrent valid API key must succeed with 200 OK"
+                );
+                api_key_count += 1;
+            }
+        }
+    }
+
+    assert_eq!(valid_oidc_count, 10);
+    assert_eq!(unknown_kid_count, 10);
+    assert_eq!(api_key_count, 10);
+}
