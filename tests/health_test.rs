@@ -177,6 +177,7 @@ fn test_valid_configuration_accepted() {
         usage_cleanup_batch_size: 1000,
         usage_spool_path: "data/usage_spool.log".to_string(),
         usage_max_spool_bytes: 10 * 1024 * 1024,
+        ..AppConfig::default_local()
     };
     assert!(config.validate().is_ok());
 }

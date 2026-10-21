@@ -80,22 +80,65 @@ pub async fn auth_middleware(
         None => false,
     };
 
-    if !is_trusted_peer {
+    let client_ip = if is_trusted_peer {
+        if let Some(forwarded_for) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|h| h.to_str().ok())
+        {
+            forwarded_for
+                .split(',')
+                .next()
+                .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+                .or(peer_ip)
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        } else {
+            peer_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        }
+    } else {
         req.headers_mut().remove("x-forwarded-for");
         req.headers_mut().remove("forwarded");
         req.headers_mut().remove("x-forwarded-proto");
         req.headers_mut().remove("x-forwarded-host");
+        peer_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    };
+
+    let path = req.uri().path().to_string();
+    let category = crate::security::RateLimitRouteCategory::from_path(&path);
+
+    // 4. Concurrency Overload Safeguard (Request Permit)
+    let _request_permit = if category != crate::security::RateLimitRouteCategory::Exempt {
+        match state.rate_limiter.acquire_request_permit() {
+            Ok(permit) => Some(permit),
+            Err(rej) => {
+                return rej.to_app_error().to_response_with_id(&request_id_str);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 5. Unauthenticated IP-Level Rate Limiting
+    let ip_key = crate::security::RateLimitKey::Ip(client_ip);
+    if let Err(rej) = state.rate_limiter.check_admission(&ip_key, category) {
+        return rej.to_app_error().to_response_with_id(&request_id_str);
     }
 
-    // 4. Authenticate request via AuthService
-    let path = req.uri().path();
+    // 6. Authenticate request via AuthService
     let query = req.uri().query();
-    match state.auth.authenticate(req.headers(), path, query).await {
+    match state.auth.authenticate(req.headers(), &path, query).await {
         Ok(Some(principal)) => {
-            // 5. Authorize request against route required scope
-            if let Err(authz_err) = crate::auth::AuthService::authorize(&principal, path) {
+            // 7. Authorize request against route required scope
+            if let Err(authz_err) = crate::auth::AuthService::authorize(&principal, &path) {
                 return authz_err.to_response_with_id(&request_id_str);
             }
+
+            // 8. Authenticated Principal-Level Rate Limiting
+            let principal_key = crate::security::RateLimitKey::Principal(principal.subject.clone());
+            if let Err(rej) = state.rate_limiter.check_admission(&principal_key, category) {
+                return rej.to_app_error().to_response_with_id(&request_id_str);
+            }
+
             req.extensions_mut().insert(principal);
         }
         Ok(None) => {

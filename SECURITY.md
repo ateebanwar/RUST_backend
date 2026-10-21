@@ -55,21 +55,34 @@
 2. **Execution Timeouts:**
    - All inbound requests are governed by strict timeouts.
    - All external HTTP calls to AI providers are bounded by a maximum 10-second client timeout, preventing hanging microVM instances.
-3. **Token Bucket Rate Limiting:**
-   - Rate limiting is enforced per authenticated user identity and per client IP address to prevent denial of wallet and quota depletion.
+3. **Multi-Dimensional Token Bucket Rate Limiting:**
+   - Monotonic pure Rust token bucket implementation operating with microsecond precision and zero wall-clock drift risk.
+   - Keyed along two independent dimensions: Identity (`RateLimitKey::Ip` before authentication, `RateLimitKey::Principal` after authentication) and Route Category (`General`, `ChatInference`, `Authentication`).
+   - Generous personal/family defaults: `IP: 100 burst / 20 req/s`, `Principal: 200 burst / 50 req/s`, `Chat: 60 burst / 15 req/s`, `Auth: 40 burst / 10 req/s`.
+   - Clear distinction between abuse protection (request arrival rate) and usage quotas: no artificial daily/monthly request limits or token allowances exist.
+   - Process-local concurrency limits: `RequestPermit` bounds total in-flight requests (`max_concurrent_requests: 200`) and `StreamPermit` bounds active SSE inference streams (`max_concurrent_streams: 50`) with automatic RAII permit release across all normal completions, client cancellations, timeouts, errors, and panics.
+   - Bounded memory footprint: periodic TTL / LRU pruning (`entry_ttl: 15m`, `max_entries: 10,000`) prevents memory exhaustion under high-cardinality spoofed IP traffic.
+   - Canonical HTTP 429 response formatting with stable JSON envelope and calculated RFC 9110 `Retry-After` header.
+   - Trusted-proxy client IP derivation: `X-Forwarded-For` and `Forwarded` headers are stripped unless the direct network peer matches an explicitly configured trusted proxy CIDR block.
 
 ---
 
-## 4. SSRF Defense & Egress Allowlisting
+## 4. SSRF Defense, Egress Allowlisting & Connection Pinning
 
-To prevent Server-Side Request Forgery (SSRF) and cloud metadata exfiltration:
-1. **Dynamic URL Prohibition:** Provider endpoint URLs must be defined strictly in server-side configuration, never accepted from user-submitted request payloads.
-2. **Address Validation:** Any outbound HTTP client must validate resolved IP addresses and immediately reject:
+To prevent Server-Side Request Forgery (SSRF), cloud metadata exfiltration, and internal network traversal:
+1. **Dynamic URL Prohibition:** Provider and JWKS endpoint URLs must be defined strictly in server-side configuration, never accepted from user-submitted request payloads.
+2. **Comprehensive Address Validation (`classify_ip`):** Any outbound destination hostname or IP is evaluated against comprehensive IPv4 and IPv6 blocklists:
    - IPv4 Private Addresses (RFC 1918: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
    - Loopback Addresses (`127.0.0.0/8`, `::1`)
-   - Link-Local & Cloud Metadata (`169.254.0.0/16`)
-   - Broadcast and multicast addresses.
-3. **Strict Protocol Allowlist:** Outbound connections must strictly use `https://`. Insecure schemes (`http://`, `file://`, `ftp://`, `gopher://`) are banned.
+   - Link-Local Addresses (RFC 3927: `169.254.0.0/16`, `fe80::/10`)
+   - Cloud Instance Metadata Endpoints (`169.254.169.254`, `[fd00:ec2::254]`)
+   - IPv4-Mapped IPv6 Representations (`::ffff:127.0.0.1`, `::ffff:169.254.169.254`, etc.)
+   - IPv6 Unique-Local Addresses (`fc00::/7`)
+   - Multicast, broadcast, unspecified, and reserved special-purpose ranges.
+3. **DNS Rebinding Prevention via Connection Pinning:** Hostnames are resolved asynchronously, all returned socket addresses are validated against the egress policy, and HTTP connections are pinned to the validated addresses using `reqwest::ClientBuilder::resolve_to_addrs`, eliminating time-of-check-to-time-of-use (TOCTOU) DNS rebinding vulnerabilities while preserving TLS certificate hostname verification and SNI.
+4. **Outbound Redirect Disabling:** Outbound HTTP redirect following is strictly disabled (`reqwest::redirect::Policy::none()`) on provider adapters and JWKS HTTP clients, preventing redirect-based bypasses to private or link-local endpoints.
+5. **Authorized Local Inference Gating:** Local inference endpoints are permitted only when explicitly enabled (`LOCAL_INFERENCE_ENABLED=true`) and strictly matching configured base URLs (`LOCAL_INFERENCE_BASE_URL`), preventing untrusted clients from probing arbitrary internal ports or services.
+6. **Strict Protocol Allowlist:** Remote external provider endpoints must strictly use `https://`. Insecure schemes (`http://`, `file://`, `ftp://`, `gopher://`) and URLs with userinfo credentials are unconditionally rejected.
 
 ---
 

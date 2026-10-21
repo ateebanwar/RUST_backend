@@ -56,6 +56,8 @@ pub struct AppState {
     pub inference: Arc<InferenceService>,
     pub usage: Arc<UsageService>,
     pub quota: Arc<QuotaService>,
+    pub rate_limiter: Arc<crate::security::RateLimiter>,
+    pub destination_policy: Arc<crate::security::OutboundDestinationPolicy>,
     pub start_time: std::time::Instant,
 }
 
@@ -114,6 +116,11 @@ impl AppState {
             }
         }
 
+        let rate_limiter = Arc::new(crate::security::RateLimiter::new(
+            config.rate_limiter_config(),
+        ));
+        let destination_policy = Arc::new(config.outbound_destination_policy());
+
         // Register Groq adapter if GROQ_API_KEY is configured
         if let Some(groq_key) = &config.groq_api_key {
             let groq_fast_model = config
@@ -139,6 +146,7 @@ impl AppState {
                 )
                 .with_rate_limit_tier("free-tier-standard")
                 .with_quota_service(quota.clone())
+                .with_destination_policy(destination_policy.clone())
                 .with_model_wire_map({
                     let mut map = std::collections::HashMap::new();
                     map.insert("fast-chat-v1".to_string(), groq_fast_model.clone());
@@ -177,6 +185,7 @@ impl AppState {
                 )
                 .with_rate_limit_tier("standard-tier")
                 .with_quota_service(quota.clone())
+                .with_destination_policy(destination_policy.clone())
                 .with_model_wire_map({
                     let mut map = std::collections::HashMap::new();
                     map.insert(
@@ -210,6 +219,8 @@ impl AppState {
             inference,
             usage,
             quota,
+            rate_limiter,
+            destination_policy,
             start_time: std::time::Instant::now(),
         }
     }
@@ -238,6 +249,11 @@ impl AppState {
             )
             .with_quota_service(quota.clone()),
         );
+        let rate_limiter = Arc::new(crate::security::RateLimiter::new(
+            config.rate_limiter_config(),
+        ));
+        let destination_policy = Arc::new(config.outbound_destination_policy());
+
         Self {
             config,
             auth,
@@ -248,6 +264,8 @@ impl AppState {
             inference,
             usage,
             quota,
+            rate_limiter,
+            destination_policy,
             start_time: std::time::Instant::now(),
         }
     }
@@ -276,6 +294,11 @@ impl AppState {
             )
             .with_quota_service(quota.clone()),
         );
+        let rate_limiter = Arc::new(crate::security::RateLimiter::new(
+            config.rate_limiter_config(),
+        ));
+        let destination_policy = Arc::new(config.outbound_destination_policy());
+
         Self {
             config,
             auth,
@@ -286,6 +309,8 @@ impl AppState {
             inference,
             usage,
             quota,
+            rate_limiter,
+            destination_policy,
             start_time: std::time::Instant::now(),
         }
     }
@@ -313,6 +338,11 @@ impl AppState {
             )
             .with_quota_service(quota.clone()),
         );
+        let rate_limiter = Arc::new(crate::security::RateLimiter::new(
+            config.rate_limiter_config(),
+        ));
+        let destination_policy = Arc::new(config.outbound_destination_policy());
+
         Self {
             config,
             auth,
@@ -323,6 +353,8 @@ impl AppState {
             inference,
             usage,
             quota,
+            rate_limiter,
+            destination_policy,
             start_time: std::time::Instant::now(),
         }
     }
@@ -336,6 +368,21 @@ impl AppState {
     /// Builder helper to replace CredentialStore.
     pub fn with_credentials(mut self, credentials: Arc<crate::auth::CredentialStore>) -> Self {
         self.credentials = credentials;
+        self
+    }
+
+    /// Builder helper to replace RateLimiter.
+    pub fn with_rate_limiter(mut self, rate_limiter: Arc<crate::security::RateLimiter>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    /// Builder helper to replace OutboundDestinationPolicy.
+    pub fn with_destination_policy(
+        mut self,
+        destination_policy: Arc<crate::security::OutboundDestinationPolicy>,
+    ) -> Self {
+        self.destination_policy = destination_policy;
         self
     }
 }

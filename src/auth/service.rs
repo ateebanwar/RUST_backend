@@ -58,7 +58,11 @@ impl AuthService {
             }
         }
 
-        let jwks_provider = Arc::new(HttpJwksProvider::new(config.google_jwks_url.clone(), None));
+        let destination_policy = Arc::new(config.outbound_destination_policy());
+        let jwks_provider = Arc::new(
+            HttpJwksProvider::new(config.google_jwks_url.clone(), None)
+                .with_destination_policy(destination_policy),
+        );
         let oidc_validator = Arc::new(GoogleOidcValidator::new(jwks_provider, client_ids));
 
         Self {

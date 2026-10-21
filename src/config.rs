@@ -141,6 +141,44 @@ pub struct AppConfig {
     pub usage_spool_path: String,
     /// Maximum capacity ceiling in bytes for independent usage spool (loaded from USAGE_MAX_SPOOL_BYTES, default 10MB).
     pub usage_max_spool_bytes: u64,
+
+    // --- Phase 13: Abuse Prevention and Rate Limiting ---
+    /// Whether rate limiting and abuse controls are actively enforced (loaded from RATE_LIMIT_ENABLED, default true).
+    pub rate_limit_enabled: bool,
+    /// Unauthenticated IP burst limit (loaded from RATE_LIMIT_IP_BURST, default 60).
+    pub rate_limit_ip_burst: u32,
+    /// Unauthenticated IP sustained refill rate in req/s (loaded from RATE_LIMIT_IP_RATE, default 10.0).
+    pub rate_limit_ip_rate: f64,
+    /// Authenticated principal general burst limit (loaded from RATE_LIMIT_PRINCIPAL_BURST, default 120).
+    pub rate_limit_principal_burst: u32,
+    /// Authenticated principal general sustained refill rate in req/s (loaded from RATE_LIMIT_PRINCIPAL_RATE, default 20.0).
+    pub rate_limit_principal_rate: f64,
+    /// Chat inference burst limit per principal (loaded from RATE_LIMIT_CHAT_BURST, default 30).
+    pub rate_limit_chat_burst: u32,
+    /// Chat inference sustained refill rate in req/s (loaded from RATE_LIMIT_CHAT_RATE, default 5.0).
+    pub rate_limit_chat_rate: f64,
+    /// Sensitive credential management burst limit per principal (loaded from RATE_LIMIT_AUTH_BURST, default 10).
+    pub rate_limit_auth_burst: u32,
+    /// Sensitive credential management sustained refill rate in req/s (loaded from RATE_LIMIT_AUTH_RATE, default 2.0).
+    pub rate_limit_auth_rate: f64,
+    /// Maximum global in-flight HTTP requests before temporary overload rejection (loaded from MAX_CONCURRENT_REQUESTS, default 100).
+    pub max_concurrent_requests: usize,
+    /// Maximum simultaneous active streaming connections (loaded from MAX_CONCURRENT_STREAMS, default 20).
+    pub max_concurrent_streams: usize,
+
+    // --- Phase 14: SSRF and Outbound Network Protection ---
+    /// Whether SSRF protections are actively enforced (loaded from SSRF_PROTECTION_ENABLED, default true).
+    pub ssrf_protection_enabled: bool,
+    /// Explicitly allowlisted outbound hostnames and wildcards (loaded from ALLOWED_OUTBOUND_HOSTS).
+    pub allowed_outbound_hosts: Vec<String>,
+    /// Whether explicitly configured local inference is permitted (loaded from ALLOW_LOCAL_INFERENCE, default false).
+    pub allow_local_inference: bool,
+    /// Explicit base URL for authorized local inference (loaded from LOCAL_INFERENCE_BASE_URL).
+    pub local_inference_base_url: Option<String>,
+    /// Maximum allowed HTTP redirects (loaded from MAX_OUTBOUND_REDIRECTS, default 0).
+    pub max_outbound_redirects: usize,
+    /// Connect timeout for outbound requests in seconds (loaded from OUTBOUND_CONNECT_TIMEOUT_SECS, default 5).
+    pub outbound_connect_timeout_secs: u64,
 }
 
 impl AppConfig {
@@ -178,6 +216,31 @@ impl AppConfig {
             usage_cleanup_batch_size: 1000,
             usage_spool_path: "data/usage_spool.log".to_string(),
             usage_max_spool_bytes: 10 * 1024 * 1024, // 10 MB default ceiling
+            rate_limit_enabled: true,
+            rate_limit_ip_burst: 100,
+            rate_limit_ip_rate: 20.0,
+            rate_limit_principal_burst: 200,
+            rate_limit_principal_rate: 50.0,
+            rate_limit_chat_burst: 60,
+            rate_limit_chat_rate: 15.0,
+            rate_limit_auth_burst: 40,
+            rate_limit_auth_rate: 10.0,
+            max_concurrent_requests: 200,
+            max_concurrent_streams: 50,
+            ssrf_protection_enabled: true,
+            allowed_outbound_hosts: vec![
+                "api.groq.com".to_string(),
+                "openrouter.ai".to_string(),
+                "api.openai.com".to_string(),
+                "www.googleapis.com".to_string(),
+                "accounts.google.com".to_string(),
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+            ],
+            allow_local_inference: false,
+            local_inference_base_url: None,
+            max_outbound_redirects: 0,
+            outbound_connect_timeout_secs: 5,
         }
     }
 
@@ -432,6 +495,106 @@ impl AppConfig {
             config.usage_max_spool_bytes = bytes;
         }
 
+        if let Some(rle) = get_var("RATE_LIMIT_ENABLED").and_then(|r| r.trim().parse::<bool>().ok())
+        {
+            config.rate_limit_enabled = rle;
+        }
+
+        if let Some(burst) =
+            get_var("RATE_LIMIT_IP_BURST").and_then(|r| r.trim().parse::<u32>().ok())
+        {
+            config.rate_limit_ip_burst = burst;
+        }
+
+        if let Some(rate) = get_var("RATE_LIMIT_IP_RATE").and_then(|r| r.trim().parse::<f64>().ok())
+        {
+            config.rate_limit_ip_rate = rate;
+        }
+
+        if let Some(burst) =
+            get_var("RATE_LIMIT_PRINCIPAL_BURST").and_then(|r| r.trim().parse::<u32>().ok())
+        {
+            config.rate_limit_principal_burst = burst;
+        }
+
+        if let Some(rate) =
+            get_var("RATE_LIMIT_PRINCIPAL_RATE").and_then(|r| r.trim().parse::<f64>().ok())
+        {
+            config.rate_limit_principal_rate = rate;
+        }
+
+        if let Some(burst) =
+            get_var("RATE_LIMIT_CHAT_BURST").and_then(|r| r.trim().parse::<u32>().ok())
+        {
+            config.rate_limit_chat_burst = burst;
+        }
+
+        if let Some(rate) =
+            get_var("RATE_LIMIT_CHAT_RATE").and_then(|r| r.trim().parse::<f64>().ok())
+        {
+            config.rate_limit_chat_rate = rate;
+        }
+
+        if let Some(burst) =
+            get_var("RATE_LIMIT_AUTH_BURST").and_then(|r| r.trim().parse::<u32>().ok())
+        {
+            config.rate_limit_auth_burst = burst;
+        }
+
+        if let Some(rate) =
+            get_var("RATE_LIMIT_AUTH_RATE").and_then(|r| r.trim().parse::<f64>().ok())
+        {
+            config.rate_limit_auth_rate = rate;
+        }
+
+        if let Some(mcr) =
+            get_var("MAX_CONCURRENT_REQUESTS").and_then(|r| r.trim().parse::<usize>().ok())
+        {
+            config.max_concurrent_requests = mcr;
+        }
+
+        if let Some(mcs) =
+            get_var("MAX_CONCURRENT_STREAMS").and_then(|r| r.trim().parse::<usize>().ok())
+        {
+            config.max_concurrent_streams = mcs;
+        }
+
+        if let Some(ssrf) =
+            get_var("SSRF_PROTECTION_ENABLED").and_then(|r| r.trim().parse::<bool>().ok())
+        {
+            config.ssrf_protection_enabled = ssrf;
+        }
+
+        if let Some(hosts) = get_var("ALLOWED_OUTBOUND_HOSTS") {
+            config.allowed_outbound_hosts = hosts
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Some(ali) =
+            get_var("ALLOW_LOCAL_INFERENCE").and_then(|r| r.trim().parse::<bool>().ok())
+        {
+            config.allow_local_inference = ali;
+        }
+
+        if let Some(url) = get_var("LOCAL_INFERENCE_BASE_URL") {
+            config.local_inference_base_url = Some(url);
+        }
+
+        if let Some(red) =
+            get_var("MAX_OUTBOUND_REDIRECTS").and_then(|r| r.trim().parse::<usize>().ok())
+        {
+            config.max_outbound_redirects = red;
+        }
+
+        if let Some(timeout) =
+            get_var("OUTBOUND_CONNECT_TIMEOUT_SECS").and_then(|r| r.trim().parse::<u64>().ok())
+        {
+            config.outbound_connect_timeout_secs = timeout;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -444,6 +607,35 @@ impl AppConfig {
     /// Create a HostValidator from configured allowed hosts.
     pub fn host_validator(&self) -> crate::security::HostValidator {
         crate::security::HostValidator::new(&self.allowed_hosts)
+    }
+
+    /// Create RateLimiterConfig from application configuration.
+    pub fn rate_limiter_config(&self) -> crate::security::RateLimiterConfig {
+        crate::security::RateLimiterConfig {
+            enabled: self.rate_limit_enabled,
+            ip_burst: self.rate_limit_ip_burst,
+            ip_rate_per_sec: self.rate_limit_ip_rate,
+            principal_burst: self.rate_limit_principal_burst,
+            principal_rate_per_sec: self.rate_limit_principal_rate,
+            chat_burst: self.rate_limit_chat_burst,
+            chat_rate_per_sec: self.rate_limit_chat_rate,
+            auth_burst: self.rate_limit_auth_burst,
+            auth_rate_per_sec: self.rate_limit_auth_rate,
+            max_concurrent_requests: self.max_concurrent_requests,
+            max_concurrent_streams: self.max_concurrent_streams,
+            max_entries: 10_000,
+            entry_ttl: std::time::Duration::from_secs(300),
+        }
+    }
+
+    /// Create OutboundDestinationPolicy from application configuration.
+    pub fn outbound_destination_policy(&self) -> crate::security::OutboundDestinationPolicy {
+        crate::security::OutboundDestinationPolicy::default_secure()
+            .with_allowed_hosts(self.allowed_outbound_hosts.clone())
+            .with_local_inference(
+                self.allow_local_inference,
+                self.local_inference_base_url.clone(),
+            )
     }
 
     /// Create RetryPolicy from current application configuration.
@@ -710,6 +902,111 @@ impl AppConfig {
             });
         }
 
+        // --- Phase 13: Rate limiting validation ---
+        if self.rate_limit_ip_burst == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_IP_BURST",
+                value: "0".to_string(),
+                reason: "RATE_LIMIT_IP_BURST must be greater than 0",
+            });
+        }
+        if self.rate_limit_ip_rate <= 0.0 || !self.rate_limit_ip_rate.is_finite() {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_IP_RATE",
+                value: self.rate_limit_ip_rate.to_string(),
+                reason: "RATE_LIMIT_IP_RATE must be positive finite number",
+            });
+        }
+        if self.rate_limit_principal_burst == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_PRINCIPAL_BURST",
+                value: "0".to_string(),
+                reason: "RATE_LIMIT_PRINCIPAL_BURST must be greater than 0",
+            });
+        }
+        if self.rate_limit_principal_rate <= 0.0 || !self.rate_limit_principal_rate.is_finite() {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_PRINCIPAL_RATE",
+                value: self.rate_limit_principal_rate.to_string(),
+                reason: "RATE_LIMIT_PRINCIPAL_RATE must be positive finite number",
+            });
+        }
+        if self.rate_limit_chat_burst == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_CHAT_BURST",
+                value: "0".to_string(),
+                reason: "RATE_LIMIT_CHAT_BURST must be greater than 0",
+            });
+        }
+        if self.rate_limit_chat_rate <= 0.0 || !self.rate_limit_chat_rate.is_finite() {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_CHAT_RATE",
+                value: self.rate_limit_chat_rate.to_string(),
+                reason: "RATE_LIMIT_CHAT_RATE must be positive finite number",
+            });
+        }
+        if self.rate_limit_auth_burst == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_AUTH_BURST",
+                value: "0".to_string(),
+                reason: "RATE_LIMIT_AUTH_BURST must be greater than 0",
+            });
+        }
+        if self.rate_limit_auth_rate <= 0.0 || !self.rate_limit_auth_rate.is_finite() {
+            return Err(ConfigError::InvalidValue {
+                key: "RATE_LIMIT_AUTH_RATE",
+                value: self.rate_limit_auth_rate.to_string(),
+                reason: "RATE_LIMIT_AUTH_RATE must be positive finite number",
+            });
+        }
+        if self.max_concurrent_requests == 0 || self.max_concurrent_requests > 100_000 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAX_CONCURRENT_REQUESTS",
+                value: self.max_concurrent_requests.to_string(),
+                reason: "MAX_CONCURRENT_REQUESTS must be between 1 and 100,000",
+            });
+        }
+        if self.max_concurrent_streams == 0 || self.max_concurrent_streams > 10_000 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAX_CONCURRENT_STREAMS",
+                value: self.max_concurrent_streams.to_string(),
+                reason: "MAX_CONCURRENT_STREAMS must be between 1 and 10,000",
+            });
+        }
+
+        // --- Phase 14: SSRF validation ---
+        if self.max_outbound_redirects > 10 {
+            return Err(ConfigError::InvalidValue {
+                key: "MAX_OUTBOUND_REDIRECTS",
+                value: self.max_outbound_redirects.to_string(),
+                reason: "MAX_OUTBOUND_REDIRECTS must not exceed 10",
+            });
+        }
+        if self.outbound_connect_timeout_secs == 0 || self.outbound_connect_timeout_secs > 60 {
+            return Err(ConfigError::InvalidValue {
+                key: "OUTBOUND_CONNECT_TIMEOUT_SECS",
+                value: self.outbound_connect_timeout_secs.to_string(),
+                reason: "OUTBOUND_CONNECT_TIMEOUT_SECS must be between 1 and 60 seconds",
+            });
+        }
+        if self.allow_local_inference {
+            if let Some(ref base_url) = self.local_inference_base_url {
+                if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+                    return Err(ConfigError::InvalidValue {
+                        key: "LOCAL_INFERENCE_BASE_URL",
+                        value: base_url.clone(),
+                        reason: "LOCAL_INFERENCE_BASE_URL must begin with http:// or https://",
+                    });
+                }
+            } else {
+                return Err(ConfigError::InvalidValue {
+                    key: "LOCAL_INFERENCE_BASE_URL",
+                    value: "None".to_string(),
+                    reason: "LOCAL_INFERENCE_BASE_URL must be specified when ALLOW_LOCAL_INFERENCE is true",
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -767,6 +1064,29 @@ impl fmt::Debug for AppConfig {
             .field("usage_cleanup_batch_size", &self.usage_cleanup_batch_size)
             .field("usage_spool_path", &self.usage_spool_path)
             .field("usage_max_spool_bytes", &self.usage_max_spool_bytes)
+            .field("rate_limit_enabled", &self.rate_limit_enabled)
+            .field("rate_limit_ip_burst", &self.rate_limit_ip_burst)
+            .field("rate_limit_ip_rate", &self.rate_limit_ip_rate)
+            .field(
+                "rate_limit_principal_burst",
+                &self.rate_limit_principal_burst,
+            )
+            .field("rate_limit_principal_rate", &self.rate_limit_principal_rate)
+            .field("rate_limit_chat_burst", &self.rate_limit_chat_burst)
+            .field("rate_limit_chat_rate", &self.rate_limit_chat_rate)
+            .field("rate_limit_auth_burst", &self.rate_limit_auth_burst)
+            .field("rate_limit_auth_rate", &self.rate_limit_auth_rate)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("max_concurrent_streams", &self.max_concurrent_streams)
+            .field("ssrf_protection_enabled", &self.ssrf_protection_enabled)
+            .field("allowed_outbound_hosts", &self.allowed_outbound_hosts)
+            .field("allow_local_inference", &self.allow_local_inference)
+            .field("local_inference_base_url", &self.local_inference_base_url)
+            .field("max_outbound_redirects", &self.max_outbound_redirects)
+            .field(
+                "outbound_connect_timeout_secs",
+                &self.outbound_connect_timeout_secs,
+            )
             .finish()
     }
 }

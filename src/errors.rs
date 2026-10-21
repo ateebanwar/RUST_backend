@@ -167,6 +167,16 @@ impl AppError {
             resp.headers_mut()
                 .insert(header::HeaderName::from_static("x-request-id"), hval);
         }
+
+        if let Self::RateLimited {
+            retry_after_secs: Some(secs),
+            ..
+        } = self
+        {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(*secs));
+        }
+
         resp
     }
 }
@@ -175,12 +185,23 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.http_status();
         let envelope = self.to_envelope("req_auto");
-        (
+        let mut resp = (
             status,
             [(header::CONTENT_TYPE, "application/json")],
             Json(envelope),
         )
-            .into_response()
+            .into_response();
+
+        if let Self::RateLimited {
+            retry_after_secs: Some(secs),
+            ..
+        } = &self
+        {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(*secs));
+        }
+
+        resp
     }
 }
 

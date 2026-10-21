@@ -75,7 +75,6 @@ pub fn is_non_retryable_error(err: &ProviderError) -> bool {
         ProviderError::CapabilityMismatch(_) => true,
         ProviderError::ProviderDisabled(_) => true,
         ProviderError::ProviderNotFound(_) => true,
-        ProviderError::QuotaExhausted(_) => true,
         ProviderError::UpstreamError { status_code, .. } => {
             // Client errors other than 408 / 429 are strictly non-retryable
             (400..=499).contains(status_code) && *status_code != 408 && *status_code != 429

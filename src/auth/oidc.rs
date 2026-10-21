@@ -203,6 +203,7 @@ pub struct HttpJwksProvider {
     cache: RwLock<Option<CachedKeys>>,
     last_fetch_attempt: RwLock<Option<Instant>>,
     cache_ttl: Duration,
+    destination_policy: Option<std::sync::Arc<crate::security::OutboundDestinationPolicy>>,
 }
 
 impl HttpJwksProvider {
@@ -224,7 +225,17 @@ impl HttpJwksProvider {
             cache: RwLock::new(None),
             last_fetch_attempt: RwLock::new(None),
             cache_ttl: cache_ttl.unwrap_or(DEFAULT_JWKS_CACHE_TTL),
+            destination_policy: None,
         }
+    }
+
+    /// Builder method to attach an OutboundDestinationPolicy for SSRF protection.
+    pub fn with_destination_policy(
+        mut self,
+        policy: std::sync::Arc<crate::security::OutboundDestinationPolicy>,
+    ) -> Self {
+        self.destination_policy = Some(policy);
+        self
     }
 
     /// Fetch keys from the remote JWKS URL and update the cache.
@@ -234,8 +245,27 @@ impl HttpJwksProvider {
             *attempt_lock = Some(Instant::now());
         }
 
-        let mut response = self
-            .http_client
+        let client_to_use = if let Some(policy) = &self.destination_policy {
+            let dest = policy.validate_url(&self.jwks_url).map_err(|e| {
+                OidcError::JwksFetchFailed(format!("JWKS destination rejected by SSRF policy: {e}"))
+            })?;
+            if policy.enabled {
+                let conn = policy.resolve_and_pin(&dest).await.map_err(|e| {
+                    OidcError::JwksFetchFailed(format!("JWKS DNS/SSRF resolution rejected: {e}"))
+                })?;
+                policy.create_pinned_client(&conn).map_err(|e| {
+                    OidcError::JwksFetchFailed(format!(
+                        "Failed to build SSRF-safe pinned client: {e}"
+                    ))
+                })?
+            } else {
+                self.http_client.clone()
+            }
+        } else {
+            self.http_client.clone()
+        };
+
+        let mut response = client_to_use
             .get(&self.jwks_url)
             .send()
             .await

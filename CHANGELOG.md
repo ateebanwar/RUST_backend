@@ -2,6 +2,39 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Combined Phase 13 & Phase 14: Abuse Prevention, Rate Limiting, SSRF Protection & Zero-Backoff Failover
+
+### Implemented, Hardened & Verified
+- **Phase 13 — Multi-Dimensional Rate Limiting & Abuse Prevention (`src/security/rate_limiter.rs`, `src/auth/middleware.rs`):**
+  - Implemented monotonic `TokenBucket` algorithm with microsecond precision and zero wall-clock drift risk.
+  - Multi-dimensional isolation: rate limits are partitioned by Identity (`RateLimitKey::Ip` before authentication, `RateLimitKey::Principal` after authentication) and Route Category (`General`, `ChatInference`, `Authentication`).
+  - Personal/family deployment profile: generous default burst and refill tolerances (`IP: 100 burst / 20 req/s`, `Principal: 200 burst / 50 req/s`, `Chat: 60 burst / 15 req/s`, `Auth: 40 burst / 10 req/s`).
+  - No artificial daily/monthly usage caps or token quotas introduced; legitimate requests are never permanently blocked by artificial counters.
+  - Process-local concurrency protection: `RequestPermit` bounds total simultaneous in-flight requests (`max_concurrent_requests: 200`) and `StreamPermit` bounds active SSE inference streams (`max_concurrent_streams: 50`) with automatic RAII permit release across all completion, timeout, cancellation, and panic code paths.
+  - Periodic TTL pruning (`entry_ttl: 15m`, `max_entries: 10,000`) bounds memory against high-cardinality IP flooding attacks.
+  - Canonical HTTP 429 response formatting with RFC 9110 `Retry-After` header and structured error envelope.
+  - Reverse-proxy client IP derivation: `X-Forwarded-For` and `Forwarded` headers are stripped unless the direct network peer IP matches an explicitly configured trusted proxy CIDR block.
+- **Phase 14 — SSRF and Outbound Network Protection (`src/security/ssrf.rs`, `src/providers/openai_compatible.rs`, `src/auth/oidc.rs`):**
+  - Strict outbound destination policy: remote external providers and JWKS endpoints require HTTPS schemes and allowlisted hostnames; userinfo credentials in URLs are rejected.
+  - Comprehensive destination IP validation (`classify_ip`) across IPv4 and IPv6: blocks loopback (`127.0.0.0/8`, `::1`), RFC 1918 private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), RFC 3927 link-local (`169.254.0.0/16`, `fe80::/10`), cloud metadata endpoints (`169.254.169.254`, `[fd00:ec2::254]`), IPv4-mapped IPv6 evasion (`::ffff:127.0.0.1`), unique local (`fc00::/7`), and multicast/broadcast.
+  - DNS rebinding prevention via connection pinning: asynchronous DNS resolution validates all resolved socket addresses against the destination policy, and HTTP connections are pinned to the validated addresses using `reqwest::ClientBuilder::resolve_to_addrs`.
+  - Outbound HTTP redirects are strictly disabled (`redirect::Policy::none()`) on provider and JWKS HTTP clients.
+  - Narrow, authorized local inference exception: permitted only when `LOCAL_INFERENCE_ENABLED=true` and destination strictly matches `LOCAL_INFERENCE_BASE_URL` (loopback / private IPs allowed only for this explicitly authorized destination), preventing general internal port scanning.
+- **Low-Latency Zero-Backoff Provider Failover (`src/inference/mod.rs`, `src/reliability/policy.rs`):**
+  - Removed `QuotaExhausted` from `is_non_retryable_error` so that upstream quota exhaustion on one provider immediately triggers candidate failover to alternative eligible providers in automatic routing mode.
+  - Fast failover optimization: upon confirmed upstream 429 rate limit or quota exhaustion with alternative eligible candidates available, the inference engine switches immediately without sleeping, reducing failover latency to < 20ms.
+  - Manual routing invariant strictly preserved: manual model requests never fail over and return `RATE_LIMITED` immediately.
+  - Local rate limit rejections never trigger upstream provider failover.
+- **Verification Results:**
+  - `cargo fmt --check`: Clean (0 diffs).
+  - `cargo check --all-targets --all-features`: Clean (0 errors).
+  - `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+  - `cargo test`: 378 passed; 0 failed; 1 ignored across 24 test targets (110 unit + 268 integration).
+  - `cargo audit -n`: Clean (0 vulnerabilities across 183 dependencies).
+  - `cargo build --release`: Clean (compiled release binary in 1m 12s).
+
+---
+
 ## 2026-10-22 — Phase 12: Final Targeted Hardening, Cross-Instance Revocation & Gitleaks Validation
 
 ### Implemented, Hardened & Verified

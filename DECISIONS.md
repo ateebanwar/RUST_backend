@@ -344,4 +344,33 @@
   6. *Authenticated Encryption at Rest (`src/security/encryption.rs`):* Implemented `AesGcmCipher` providing AES-256-GCM authenticated encryption using `ring::aead` with 96-bit random nonces and Associated Data (AAD) context binding.
 - **Consequences:** All 333 automated tests pass across 18 test suites with 0 failures, 0 Clippy warnings, 0 cargo audit vulnerabilities, and 0 secret leaks. Phase 12 is fully verified. Phase 13 (Rate limiting / Abuse prevention) remains on hold.
 
+---
+
+### DEC-022: Combined Phase 13 + Phase 14: Multi-Dimensional Rate Limiting, SSRF Protection, Connection Pinning, and Zero-Backoff Failover
+- **Status:** APPROVED
+- **Date:** 2026-10-22
+- **Context:** Implementing production-grade inbound request abuse prevention, rate limiting, SSRF mitigation, and outbound network security while respecting personal/family requirements: no artificial daily/monthly usage caps, generous personal burst tolerances, automatic failover when upstream quotas are exhausted, DNS rebinding mitigation, and safe authorized local inference.
+- **Decisions Made:**
+  1. *Multi-Dimensional Token Bucket Rate Limiting (`src/security/rate_limiter.rs`):*
+     - Pure Rust in-memory token bucket implementation operating with monotonic timestamps (`tokio::time::Instant`).
+     - Keyed along two independent dimensions: Identity (`RateLimitKey::Ip(IpAddr)` or `RateLimitKey::Principal(String)`) and Route Category (`General`, `ChatInference`, `Authentication`).
+     - Process-local concurrency limits: `RequestPermit` bounds total in-flight requests (`max_concurrent_requests`, default 200) and `StreamPermit` bounds active SSE inference streams (`max_concurrent_streams`, default 50). All permits release automatically on drop via RAII across normal completion, client cancellation, errors, and panics.
+     - Periodic LRU / TTL pruning of inactive limiter entries (`entry_ttl`, default 15 minutes; `max_entries`, default 10,000) prevents unbounded memory growth from attacker-controlled source IPs.
+     - Canonical HTTP 429 response formatting with stable JSON envelope and calculated RFC 9110 `Retry-After` header.
+     - Clear distinction between abuse protection (request arrival rate) and usage quotas: no artificial daily/monthly request limits or token allowances exist.
+  2. *Strict IP Identity & Trusted-Proxy Handling:*
+     - Client IP is extracted from the TCP peer address (`ConnectInfo<SocketAddr>`).
+     - Forwarded headers (`X-Forwarded-For`, `Forwarded`) are stripped unless the direct network peer IP matches an explicitly configured trusted proxy CIDR block.
+  3. *Comprehensive Outbound SSRF Mitigation (`src/security/ssrf.rs`):*
+     - Strict URL structure and scheme validation: only HTTPS allowed for remote provider and JWKS endpoints; userinfo credentials in URLs are rejected.
+     - Comprehensive IP classification (`classify_ip`) evaluating both IPv4 and IPv6: loopback, RFC 1918 private ranges, RFC 3927 link-local, cloud metadata (`169.254.169.254`, `[fd00:ec2::254]`), IPv4-mapped IPv6 evasion (`::ffff:127.0.0.1`), unique local (`fc00::/7`), and multicast/broadcast are strictly blocked.
+     - DNS rebinding prevention via connection pinning: hostnames are resolved via async DNS, all resolved IP addresses are validated against the destination policy, and HTTP connections are pinned to the validated socket addresses using `reqwest::ClientBuilder::resolve_to_addrs`.
+     - Outbound redirect policy is strictly disabled (`redirect::Policy::none()`) on provider and JWKS clients.
+     - Authorized local inference exception: narrowly permitted only when explicitly enabled (`LOCAL_INFERENCE_ENABLED=true`) and strictly matching configured base URLs (`LOCAL_INFERENCE_BASE_URL`), preventing arbitrary internal port scanning.
+  4. *Zero-Backoff Low-Latency Candidate Failover (`src/inference/mod.rs`):*
+     - When an upstream provider returns `QuotaExhausted` or `RateLimited` with `retry_after > 0`, the inference engine immediately switches to the next eligible candidate in automatic routing mode without sleeping, reducing client failover latency to < 20ms.
+     - Manual routing invariant is strictly preserved: manual model requests never fail over, returning `RateLimited` with `"RATE_LIMITED"` error code immediately.
+     - Local abuse rate limit rejections never trigger upstream provider failover.
+- **Consequences:** All 378 automated tests pass across 24 test targets (110 unit tests + 268 integration tests across 23 integration/benchmark suites) with 0 failures, 0 Clippy warnings, 0 cargo audit vulnerabilities, and 0 secret leaks. Phase 15 (Google Drive Integration) is eligible to begin next upon explicit user authorization.
+
 

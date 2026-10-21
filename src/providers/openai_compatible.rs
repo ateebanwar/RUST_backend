@@ -105,6 +105,7 @@ pub struct OpenAiCompatibleAdapter {
     static_models: Vec<ModelMetadata>,
     model_wire_map: HashMap<String, String>,
     quota_service: Option<std::sync::Arc<crate::quota::QuotaService>>,
+    destination_policy: Option<std::sync::Arc<crate::security::OutboundDestinationPolicy>>,
 }
 
 impl OpenAiCompatibleAdapter {
@@ -130,12 +131,22 @@ impl OpenAiCompatibleAdapter {
             static_models: Vec::new(),
             model_wire_map: HashMap::new(),
             quota_service: None,
+            destination_policy: None,
         }
     }
 
     /// Builder method to provide a custom HTTP client (useful for mock server testing).
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self
+    }
+
+    /// Builder method to attach an OutboundDestinationPolicy for SSRF protection.
+    pub fn with_destination_policy(
+        mut self,
+        policy: std::sync::Arc<crate::security::OutboundDestinationPolicy>,
+    ) -> Self {
+        self.destination_policy = Some(policy);
         self
     }
 
@@ -242,8 +253,31 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 stream_options: None,
             };
 
-            let mut request_builder = self
-                .client
+            let client_to_use = if let Some(policy) = &self.destination_policy {
+                let validated = policy.validate_url(&url).map_err(|e| {
+                    ProviderError::InvalidRequest(format!(
+                        "Destination URL rejected by SSRF policy: {e}"
+                    ))
+                })?;
+                if policy.enabled {
+                    let conn = policy.resolve_and_pin(&validated).await.map_err(|e| {
+                        ProviderError::NetworkFailure(format!(
+                            "Destination DNS/SSRF resolution rejected: {e}"
+                        ))
+                    })?;
+                    policy.create_pinned_client(&conn).map_err(|e| {
+                        ProviderError::NetworkFailure(format!(
+                            "Failed to build SSRF-safe pinned client: {e}"
+                        ))
+                    })?
+                } else {
+                    self.client.clone()
+                }
+            } else {
+                self.client.clone()
+            };
+
+            let mut request_builder = client_to_use
                 .post(&url)
                 .bearer_auth(api_key)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -378,8 +412,31 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
                 }),
             };
 
-            let mut request_builder = self
-                .client
+            let client_to_use = if let Some(policy) = &self.destination_policy {
+                let validated = policy.validate_url(&url).map_err(|e| {
+                    ProviderError::InvalidRequest(format!(
+                        "Destination URL rejected by SSRF policy: {e}"
+                    ))
+                })?;
+                if policy.enabled {
+                    let conn = policy.resolve_and_pin(&validated).await.map_err(|e| {
+                        ProviderError::NetworkFailure(format!(
+                            "Destination DNS/SSRF resolution rejected: {e}"
+                        ))
+                    })?;
+                    policy.create_pinned_client(&conn).map_err(|e| {
+                        ProviderError::NetworkFailure(format!(
+                            "Failed to build SSRF-safe pinned client: {e}"
+                        ))
+                    })?
+                } else {
+                    self.client.clone()
+                }
+            } else {
+                self.client.clone()
+            };
+
+            let mut request_builder = client_to_use
                 .post(&url)
                 .bearer_auth(api_key)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")

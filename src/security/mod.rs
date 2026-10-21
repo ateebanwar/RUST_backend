@@ -2,10 +2,20 @@
 //!
 //! Conforms to MASTER_SPEC.md §13 & §14, ARCHITECTURE.md §2, and THREAT_MODEL.md.
 pub mod encryption;
+pub mod rate_limiter;
 pub mod secret;
+pub mod ssrf;
 
 pub use encryption::{AesGcmCipher, EncryptionError};
+pub use rate_limiter::{
+    RateLimitKey, RateLimitRejection, RateLimitRouteCategory, RateLimiter, RateLimiterConfig,
+    RequestPermit, StreamPermit, TokenBucket,
+};
 pub use secret::{SecretString, mask_credential};
+pub use ssrf::{
+    IpClassification, OutboundDestinationPolicy, SsrfError, ValidatedConnection,
+    ValidatedDestination, classify_ip,
+};
 
 use std::net::IpAddr;
 

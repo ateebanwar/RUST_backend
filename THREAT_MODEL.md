@@ -45,19 +45,24 @@
 - **Residual Risk:** Low.
 - **Verification Method:** Automated unit tests asserting that formatting `AppConfig` or `ProviderConfig` with `{:?}` never reveals raw keys; static secret scanning in CI.
 
-### T-02: Server-Side Request Forgery (SSRF) via Dynamic Provider URLs
+### T-02: Server-Side Request Forgery (SSRF) & Metadata Exfiltration
 - **STRIDE Category:** Elevation of Privilege / Information Disclosure
-- **Attack Scenario:** An attacker supplies a malicious provider URL pointing to cloud metadata services (`http://169.254.169.254`), loopback (`127.0.0.1`), or internal network IPs.
+- **Attack Scenario:** An attacker supplies a malicious provider URL pointing to cloud metadata services (`http://169.254.169.254`), loopback (`127.0.0.1`, `::1`), or internal network IPs, or exploits DNS rebinding TOCTOU gaps between validation and HTTP connection.
 - **Likelihood:** Medium | **Impact:** Critical | **Risk:** High
 - **Mitigations:**
-  1. Provider URLs must come from trusted, server-side configuration, never from user request payloads.
-  2. Implement an outbound address validator that resolves DNS and blocks:
+  1. Provider and JWKS URLs must come from trusted, server-side configuration, never from user request payloads.
+  2. Implement an outbound address validator (`classify_ip`) that resolves DNS and blocks:
      - IPv4 private ranges (RFC 1918: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
      - Loopback (`127.0.0.0/8`, `::1`)
-     - Link-local and cloud metadata (`169.254.0.0/16`)
+     - Link-local and cloud metadata (`169.254.0.0/16`, `[fd00:ec2::254]`)
+     - IPv4-mapped IPv6 representations (`::ffff:127.0.0.1`)
+     - IPv6 unique-local (`fc00::/7`), multicast, broadcast, and unspecified ranges.
      - Non-HTTPS schemes (`file://`, `gopher://`, `http://`).
+  3. Prevent DNS rebinding via socket connection pinning (`reqwest::resolve_to_addrs`), binding HTTP connections directly to validated IP addresses while preserving TLS certificate hostname verification and SNI.
+  4. Strictly disable outbound HTTP redirects (`redirect::Policy::none()`) on provider and JWKS HTTP clients.
+  5. Authorized local inference is permitted only when explicitly enabled (`LOCAL_INFERENCE_ENABLED=true`) and strictly matching configured base URLs (`LOCAL_INFERENCE_BASE_URL`), preventing internal port scanning.
 - **Residual Risk:** Very Low.
-- **Verification Method:** Test suite submitting IP addresses in private/link-local ranges to the URL validator and asserting immediate rejection.
+- **Verification Method:** Test suite `tests/ssrf_protection_test.rs` submitting private, link-local, metadata, IPv4-mapped, and unauthorized destinations, asserting immediate rejection before connection.
 
 ### T-03: Prompt Injection & Untrusted LLM Content Execution
 - **STRIDE Category:** Tampering / Elevation of Privilege
@@ -83,15 +88,17 @@
 
 ### T-05: Denial of Wallet / Quota Exhaustion through Request Flooding
 - **STRIDE Category:** Denial of Service
-- **Attack Scenario:** Attacker floods `/api/v1/chat/completions` or image-generation endpoints to exhaust free-tier provider allocations or incur billing charges.
+- **Attack Scenario:** Attacker floods `/api/v1/chat/completions`, authentication, or discovery endpoints to exhaust backend sockets, CPU, or provider quota allocations.
 - **Likelihood:** High | **Impact:** High | **Risk:** High
 - **Mitigations:**
-  1. Enforce token bucket rate limiting per authenticated user and per IP.
-  2. Require valid authentication for all AI execution endpoints.
-  3. Restrict expensive operations (image/video generation) to lower rate-limit tiers than simple text queries.
-  4. Implement bounded retry budgets (max 1 retry, zero retries on non-idempotent media endpoints).
+  1. Enforce multi-dimensional token bucket rate limiting partitioned by Identity (IP before auth, Principal after auth) and Route Category (`General`, `ChatInference`, `Authentication`).
+  2. Generous personal/family defaults preserve legitimate usage without introducing artificial daily or monthly token quotas.
+  3. In-flight request concurrency ceiling (`RequestPermit`, default 200) and active streaming concurrency ceiling (`StreamPermit`, default 50) with automatic RAII permit release across all normal completions, cancellations, errors, and panics.
+  4. Periodic LRU/TTL pruning of inactive limiter entries (`entry_ttl: 15m`, `max_entries: 10,000`) prevents memory exhaustion under spoofed high-cardinality IP traffic.
+  5. Fast failover without backoff delays when upstream providers return 429 or quota exhaustion and alternative operational candidates exist.
+  6. Return canonical HTTP 429 responses with accurate RFC 9110 `Retry-After` headers.
 - **Residual Risk:** Low.
-- **Verification Method:** Load testing simulating 100 rapid requests from a single client and verifying HTTP 429 Too Many Requests response after threshold.
+- **Verification Method:** Test suite `tests/abuse_prevention_test.rs` verifying burst tolerance, token refill, per-IP and per-principal isolation, concurrency permits, and streaming cleanup; `tests/failover_latency_test.rs` verifying fast zero-backoff failover on quota exhaustion.
 
 ### T-06: Google Drive OAuth Token Theft or Abuse
 - **STRIDE Category:** Information Disclosure / Elevation of Privilege

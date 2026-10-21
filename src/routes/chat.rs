@@ -125,6 +125,7 @@ struct StreamFinalizationGuard {
     start_epoch_ms: u64,
     latest_usage: Arc<std::sync::Mutex<Option<UsageMetadata>>>,
     subject: Option<String>,
+    _stream_permit: Option<crate::security::StreamPermit>,
 }
 
 impl Drop for StreamFinalizationGuard {
@@ -199,6 +200,13 @@ pub async fn chat_stream(
 
     let caller_subject = principal.as_ref().map(|p| p.0.subject.clone());
 
+    let stream_permit = match state.rate_limiter.acquire_stream_permit() {
+        Ok(permit) => permit,
+        Err(rej) => {
+            return Err(rej.to_app_error().to_response_with_id(&req_id));
+        }
+    };
+
     payload.stream = true;
 
     let stream_res = match state.inference.execute_stream(&payload).await {
@@ -266,6 +274,7 @@ pub async fn chat_stream(
         start_epoch_ms,
         latest_usage: Arc::new(std::sync::Mutex::new(None)),
         subject: caller_subject,
+        _stream_permit: Some(stream_permit),
     });
 
     let initial_state = SseStreamState::SendRouting {

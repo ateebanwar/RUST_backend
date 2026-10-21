@@ -552,6 +552,40 @@ impl InferenceService {
 
                         last_error = Some(provider_err.clone());
 
+                        // Fast failover optimization: In automatic routing mode, if the upstream candidate
+                        // hits confirmed rate limiting or quota exhaustion and an eligible alternative candidate with
+                        // an operational registered provider remains, abandon this candidate immediately and switch candidates.
+                        let has_alternative_candidate =
+                            !req.routing_mode.eq_ignore_ascii_case("manual")
+                                && resolution
+                                    .ordered_candidates
+                                    .iter()
+                                    .take(max_candidates)
+                                    .any(|c| {
+                                        c.model_id != candidate.model_id
+                                            && !failed_model_ids.contains(&c.model_id)
+                                            && self.providers.get(&c.provider_id).is_ok()
+                                    });
+
+                        let should_fast_failover = has_alternative_candidate
+                            && match &provider_err {
+                                ProviderError::QuotaExhausted(_) => true,
+                                ProviderError::RateLimited { retry_after_secs } => {
+                                    // If Retry-After is > 0, immediate failover to ready candidate avoids unnecessary client latency
+                                    retry_after_secs.map(|s| s > 0).unwrap_or(false)
+                                }
+                                _ => false,
+                            };
+
+                        if should_fast_failover {
+                            info!(
+                                provider_id = candidate.provider_id.as_str(),
+                                model_id = candidate.model_id.as_str(),
+                                "Upstream rate-limit/quota hit with positive delay; performing fast failover to next eligible candidate"
+                            );
+                            break;
+                        }
+
                         if crate::reliability::is_transient_error(&provider_err)
                             && retry_idx < policy.max_retries_per_candidate
                         {
@@ -718,6 +752,40 @@ impl InferenceService {
                         }
 
                         last_error = Some(provider_err.clone());
+
+                        // Fast failover optimization: In automatic routing mode, if the upstream candidate
+                        // hits confirmed rate limiting or quota exhaustion and an eligible alternative candidate with
+                        // an operational registered provider remains, abandon this candidate immediately and switch candidates.
+                        let has_alternative_candidate =
+                            !req.routing_mode.eq_ignore_ascii_case("manual")
+                                && resolution
+                                    .ordered_candidates
+                                    .iter()
+                                    .take(max_candidates)
+                                    .any(|c| {
+                                        c.model_id != candidate.model_id
+                                            && !failed_model_ids.contains(&c.model_id)
+                                            && self.providers.get(&c.provider_id).is_ok()
+                                    });
+
+                        let should_fast_failover = has_alternative_candidate
+                            && match &provider_err {
+                                ProviderError::QuotaExhausted(_) => true,
+                                ProviderError::RateLimited { retry_after_secs } => {
+                                    // If Retry-After is > 0, immediate failover to ready candidate avoids unnecessary client latency
+                                    retry_after_secs.map(|s| s > 0).unwrap_or(false)
+                                }
+                                _ => false,
+                            };
+
+                        if should_fast_failover {
+                            info!(
+                                provider_id = candidate.provider_id.as_str(),
+                                model_id = candidate.model_id.as_str(),
+                                "Upstream rate-limit/quota hit with positive delay; performing fast failover to next eligible candidate"
+                            );
+                            break;
+                        }
 
                         if crate::reliability::is_transient_error(&provider_err)
                             && retry_idx < policy.max_retries_per_candidate
