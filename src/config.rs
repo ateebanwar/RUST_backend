@@ -103,6 +103,16 @@ pub struct AppConfig {
     pub gemini_api_key: Option<String>,
     /// Backend API key for authenticating protected routes (loaded from API_KEY).
     pub api_key: Option<String>,
+    /// List of configured backend API keys (loaded from API_KEYS).
+    pub api_keys: Vec<String>,
+    /// Google OAuth 2.0 Client ID for Google Sign-In verification (loaded from GOOGLE_CLIENT_ID).
+    pub google_client_id: Option<String>,
+    /// Additional allowed Google OAuth 2.0 Client IDs (loaded from GOOGLE_CLIENT_IDS).
+    pub google_client_ids: Vec<String>,
+    /// Custom Google public JWKS discovery URL override (loaded from GOOGLE_JWKS_URL).
+    pub google_jwks_url: Option<String>,
+    /// Explicit override for requiring authentication in non-production (loaded from AUTH_REQUIRED).
+    pub auth_required: Option<bool>,
     /// Path to persistent SQLite database for usage tracking (loaded from DATABASE_PATH).
     pub database_path: String,
     /// Usage history retention window in days (loaded from USAGE_RETENTION_DAYS).
@@ -149,6 +159,11 @@ impl AppConfig {
             openrouter_api_key: None,
             gemini_api_key: None,
             api_key: None,
+            api_keys: Vec::new(),
+            google_client_id: None,
+            google_client_ids: Vec::new(),
+            google_jwks_url: None,
+            auth_required: None,
             database_path: "data/usage.db".to_string(),
             usage_retention_days: None,
             max_retries: 1,
@@ -309,6 +324,35 @@ impl AppConfig {
             config.api_key = Some(key);
         }
 
+        if let Some(keys) = get_var("API_KEYS") {
+            config.api_keys = keys
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Some(id) = get_var("GOOGLE_CLIENT_ID") {
+            config.google_client_id = Some(id);
+        }
+
+        if let Some(ids) = get_var("GOOGLE_CLIENT_IDS") {
+            config.google_client_ids = ids
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Some(jwks_url) = get_var("GOOGLE_JWKS_URL") {
+            config.google_jwks_url = Some(jwks_url);
+        }
+
+        if let Some(auth_req) = get_var("AUTH_REQUIRED").and_then(|r| r.trim().parse::<bool>().ok())
+        {
+            config.auth_required = Some(auth_req);
+        }
+
         if let Some(db) = get_var("DATABASE_PATH") {
             config.database_path = db;
         }
@@ -417,7 +461,14 @@ impl AppConfig {
     /// Check if API authentication is required on protected routes.
     /// In production, authentication is strictly mandatory.
     pub fn is_auth_required(&self) -> bool {
-        self.environment == Environment::Production || self.api_key.is_some()
+        if let Some(explicit) = self.auth_required {
+            return explicit;
+        }
+        self.environment == Environment::Production
+            || self.api_key.is_some()
+            || !self.api_keys.is_empty()
+            || self.google_client_id.is_some()
+            || !self.google_client_ids.is_empty()
     }
 
     /// Check if the configured host bind address is loopback (accessible only locally).
@@ -432,20 +483,27 @@ impl AppConfig {
         }
     }
 
-    /// Constant-time validation of an incoming API key against configured key.
+    /// Constant-time validation of an incoming API key against configured keys.
     /// In production without an API key configured, authentication always fails.
     pub fn validate_api_key(&self, candidate: &str) -> bool {
-        if let Some(expected) = &self.api_key {
-            let cand_bytes = candidate.as_bytes();
-            let exp_bytes = expected.as_bytes();
-            if cand_bytes.len() != exp_bytes.len() {
-                return false;
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let has_configured_keys = self.api_key.is_some() || !self.api_keys.is_empty();
+        if has_configured_keys {
+            if let Some(expected) = &self.api_key
+                && crate::auth::pat::constant_time_compare_str(trimmed, expected)
+            {
+                return true;
             }
-            let mut diff = 0u8;
-            for (a, b) in cand_bytes.iter().zip(exp_bytes.iter()) {
-                diff |= a ^ b;
+            for expected in &self.api_keys {
+                if crate::auth::pat::constant_time_compare_str(trimmed, expected) {
+                    return true;
+                }
             }
-            diff == 0
+            false
         } else {
             // In non-production environments without an API key configured, auth is bypassed for dev
             self.environment != Environment::Production
@@ -486,12 +544,44 @@ impl AppConfig {
             });
         }
 
+        // Fail-closed production enforcement: production must have at least one valid authentication credential
+        if self.environment == Environment::Production {
+            let has_key = self.api_key.as_ref().is_some_and(|k| !k.trim().is_empty())
+                || self.api_keys.iter().any(|k| !k.trim().is_empty());
+            let has_google = self
+                .google_client_id
+                .as_ref()
+                .is_some_and(|id| !id.trim().is_empty())
+                || self
+                    .google_client_ids
+                    .iter()
+                    .any(|id| !id.trim().is_empty());
+
+            if !has_key && !has_google {
+                return Err(ConfigError::InvalidValue {
+                    key: "APP_ENV",
+                    value: "production".to_string(),
+                    reason: "Production environment requires at least one valid API_KEY, API_KEYS, or GOOGLE_CLIENT_ID configured for authentication",
+                });
+            }
+        }
+
         if self.api_key.as_ref().is_some_and(|k| k.len() < 8) {
             return Err(ConfigError::InvalidValue {
                 key: "API_KEY",
                 value: "[REDACTED]".to_string(),
                 reason: "API_KEY must be at least 8 characters long",
             });
+        }
+
+        for key in &self.api_keys {
+            if key.len() < 8 {
+                return Err(ConfigError::InvalidValue {
+                    key: "API_KEYS",
+                    value: "[REDACTED]".to_string(),
+                    reason: "Configured API keys in API_KEYS must be at least 8 characters long",
+                });
+            }
         }
 
         if self.usage_retention_days == Some(0) {
@@ -621,6 +711,14 @@ impl fmt::Debug for AppConfig {
                 &self.gemini_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "api_keys",
+                &format!("[REDACTED ({} keys)]", self.api_keys.len()),
+            )
+            .field("google_client_id", &self.google_client_id)
+            .field("google_client_ids", &self.google_client_ids)
+            .field("google_jwks_url", &self.google_jwks_url)
+            .field("auth_required", &self.auth_required)
             .field("database_path", &self.database_path)
             .field("usage_retention_days", &self.usage_retention_days)
             .field("max_retries", &self.max_retries)
@@ -779,5 +877,45 @@ mod tests {
         assert_eq!(map.get("WITH_EQUALS").unwrap(), "part1=part2");
         assert_eq!(map.get("UNQUOTED_WITH_COMMENT").unwrap(), "my_value");
         assert!(!map.contains_key("NO_EQUAL_SIGN_LINE"));
+    }
+
+    #[test]
+    fn test_production_fails_closed_without_auth_credentials() {
+        let mut config = AppConfig::default_local();
+        config.environment = Environment::Production;
+        config.api_key = None;
+        config.api_keys.clear();
+        config.google_client_id = None;
+        config.google_client_ids.clear();
+
+        let err = config.validate().unwrap_err();
+        match err {
+            ConfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "APP_ENV");
+                assert!(reason.contains("requires at least one valid API_KEY"));
+            }
+        }
+
+        // Passes with an API key
+        config.api_key = Some("super_secure_production_key_123".to_string());
+        assert!(config.validate().is_ok());
+
+        // Passes with Google Client ID
+        config.api_key = None;
+        config.google_client_id = Some("123456789-abc.apps.googleusercontent.com".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_short_api_keys_in_list_rejected() {
+        let mut config = AppConfig::default_local();
+        config.api_keys = vec!["short".to_string()];
+        let err = config.validate().unwrap_err();
+        match err {
+            ConfigError::InvalidValue { key, reason, .. } => {
+                assert_eq!(key, "API_KEYS");
+                assert!(reason.contains("at least 8 characters"));
+            }
+        }
     }
 }

@@ -465,4 +465,57 @@ The hardening backlog items identified during earlier phases have been formally 
    - *Status:* **IMPLEMENTED & VERIFIED**.
    - *Architecture:* Out-of-band persistent retry queue (`usage_retry_queue` in SQLite) guarantees zero telemetry loss during transient database saturation. Records are retried using bounded exponential backoff (up to 300s); exhausted retries (5 attempts) or poison payloads transition safely to dead-letter status, preserving user inference semantics and accounting auditability.
 
+---
+
+## 10. Multi-Client Authentication Subsystem (Phase 11 Implementation)
+
+### 10.1 Authentication Ingress & Precedence Topology
+
+All protected requests pass through the unified `auth_middleware` (`src/auth/middleware.rs`), which orchestrates request tracing, Host-header validation, reverse-proxy security, and authentication dispatch:
+
+```mermaid
+graph TD
+    Req[Inbound HTTP Request] --> ProbeCheck{Path == /health or /ready?}
+    ProbeCheck -->|Yes| PublicProbe[Bypass Auth -> 200 OK / 503 Ready]
+    ProbeCheck -->|No| HdrInspect[Inspect Authorization & X-API-Key]
+
+    HdrInspect --> CredCheck{Credentials Present?}
+    CredCheck -->|Bearer Header| TokenDispatch{Token Structure}
+    TokenDispatch -->|3-Segment JWT| OIDC[GoogleOidcValidator: RS256 JWKS]
+    TokenDispatch -->|PAT / API Key| PAT[PatValidator: Constant-Time SHA-256]
+
+    CredCheck -->|X-API-Key Header| PAT
+
+    CredCheck -->|None| EnvCheck{Environment == Production OR Auth Required?}
+    EnvCheck -->|Yes| Deny[Reject: HTTP 401 Unauthorized]
+    EnvCheck -->|No| DevBypass[DevelopmentBypass Principal]
+
+    OIDC -->|Valid Signature, iss, aud, exp| Success[Inject AuthPrincipal into Request Extensions]
+    OIDC -->|Invalid / Expired / Wrong kid| Deny
+
+    PAT -->|SHA-256 Hash Match| Success
+    PAT -->|Mismatch / Empty / Revoked| Deny
+
+    Success --> Downstream[Downstream Route Handlers & Telemetry]
+```
+
+### 10.2 Architectural Components & Invariants
+1. **Google OIDC ID Token Validator (`src/auth/oidc.rs`):**
+   - Parses RS256 JWT tokens using `jsonwebtoken`.
+   - Retrieves public RSA keys via the `JwksProvider` abstraction (`HttpJwksProvider` with in-memory caching and 1-hour TTL).
+   - Validates strict standard claims: issuer (`https://accounts.google.com` or `accounts.google.com`), audience (matching configured `google_client_id` or `google_client_ids`), expiration (with 60-second leeway), and non-empty subject.
+   - Supports `MockJwksProvider` enabling deterministic, offline, zero-network unit and integration testing.
+2. **Personal Access Token & API Key Validator (`src/auth/pat.rs`):**
+   - Validates developer PATs (`pat_<64_hex_chars>`) and backend API keys.
+   - Precomputes 32-byte SHA-256 digests (`ring::digest`) upon configuration loading.
+   - Executes comparisons in constant time via `subtle::ConstantTimeEq`, completely eliminating timing attacks across both token length and value.
+3. **Downstream Identity Propagation (`src/auth/principal.rs`):**
+   - Authenticated identity is encapsulated in `AuthPrincipal` and attached to Axum request extensions.
+   - Contains caller `client_type` (`Flutter`, `CustomIde`, `VscodeExtension`, `ApiClient`), `subject`, `auth_type`, `email`, `roles` (`User`, `Admin`, `Service`), and authorized `scopes`.
+   - Implements custom `Debug` and `Display` to redact emails and secrets, preventing log leakage.
+4. **Fail-Closed Production Policy (`src/config.rs`):**
+   - When `APP_ENV=production`, startup strictly requires at least one configured credential (`API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID`), preventing accidental unauthenticated production deployments.
+5. **External Bind Protection for Operational Endpoints:**
+   - Whenever the backend binds to non-loopback network interfaces (`host != 127.0.0.1`), operational data endpoints (`/api/v1/usage/*`, `/api/v1/quotas`) unconditionally enforce authentication, preventing exposure of telemetry data over external networks.
+
 

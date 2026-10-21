@@ -2,7 +2,81 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
-## 2026-10-21 — End-to-End Model-Aware Tokenization & Context-Window Admission Safety
+## 2026-10-21 — Phase 11: Authentication & Authorization Complete & Verified
+
+### Implemented & Verified
+- **Multi-Client Authentication Subsystem (`src/auth/`):**
+  - Implemented decoupled, client-independent authentication service supporting Flutter mobile applications, Custom AI IDEs, VS Code editor extensions, and automated API consumers.
+  - **Google Sign-In OIDC ID Token Verification (`src/auth/oidc.rs`):**
+    - Cryptographic RS256 JWT signature verification against Google's public JSON Web Key Sets (JWKS) via `jsonwebtoken`.
+    - Strict validation of standard claims: `iss` (`https://accounts.google.com` or `accounts.google.com`), `aud` against configured Google Client IDs, expiration timestamp (`exp` with 60-second RFC 7519 leeway), and non-empty subject (`sub`).
+    - In-memory JWKS key caching with 1-hour TTL and bounded 5-second fetch timeout (`HttpJwksProvider`).
+    - Deterministic offline testability via `MockJwksProvider` supporting mock RSA keypairs with zero live external network dependencies.
+  - **Constant-Time Personal Access Token & API Key Verification (`src/auth/pat.rs`):**
+    - Cryptographically secure token verification using 32-byte SHA-256 digests (`ring::digest`) and constant-time equality checks (`subtle::ConstantTimeEq`).
+    - Eliminates character- and length-dependent timing side channels across candidate tokens.
+    - Secure PAT generation helper generating `pat_<64_hex_chars>` using OS secure random entropy (`ring::rand::SystemRandom`).
+  - **Request Identity & Authorization Propagation (`src/auth/principal.rs`):**
+    - Strongly-typed `AuthPrincipal` inserted into Axum request extensions, carrying `subject`, `auth_type` (`GoogleOidc`, `PersonalAccessToken`, `ApiKey`, `DevelopmentBypass`), `client_type` (`Flutter`, `CustomIde`, `VscodeExtension`, `ApiClient`), `email`, `roles` (`User`, `Admin`, `Service`), and authorized `scopes`.
+    - Zero-leak `Debug` and `Display` implementations that redact email addresses and sensitive secrets.
+  - **Strict Precedence & Zero-Fallback Rule (`src/auth/service.rs`):**
+    - 3-segment JWT tokens route strictly to the Google OIDC validator.
+    - Non-JWT tokens and `X-API-Key` headers route strictly to PAT/API key validators.
+    - Invalid or expired credentials immediately return HTTP 401 Unauthorized and NEVER fall back to weaker authentication or developer bypass.
+  - **Unified Authentication Middleware (`src/auth/middleware.rs`):**
+    - Single consolidated Axum middleware enforcing request ID correlation (`X-Request-ID`), Host header validation (`ALLOWED_HOSTS`), reverse-proxy spoofing defenses (`TRUSTED_PROXIES`), and identity injection.
+  - **Fail-Closed Production Safety (`src/config.rs`):**
+    - In production mode (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present.
+    - Enforced minimum 8-character length on all configured API keys.
+  - **External Bind Protection for Operational Telemetry:**
+    - Usage and quota endpoints (`/api/v1/usage/*`, `/api/v1/quotas`) unconditionally require authentication whenever the server binds to a non-loopback host interface.
+
+### Verification Results
+- `cargo fmt --check`: Passed with exit code 0.
+- `cargo check`: Passed with exit code 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
+- `cargo test`: **299 automated tests passing** across 17 test suites with 0 failures, 0 errors, 1 ignored (controlled benchmark).
+- `cargo audit -n`: Passed with exit code 0 (1,348 advisories checked, 183 dependencies scanned).
+- `cargo build --release`: Passed with exit code 0.
+- Phase 12 (Authorization & Secret Management) remains strictly on hold.
+
+---
+
+## 2026-10-21 — Comprehensive Token Estimation Audit, Tokenizer Correction & Production Readiness
+
+### Audited, Corrected & Verified
+- **Centralized Model-to-Tokenizer Mapping (`src/inference/tokens.rs`):**
+  - Eliminated dangerous broad substring matching (`.contains("gpt")`, `.contains("o1")`, etc.) which falsely mapped unrelated models (`auto1`, `echo1`, `audio3`, `my-custom-gpt`) and misclassified newer OpenAI models (`gpt-4.1`, `gpt-4.5`, `gpt-5` as `cl100k` and `o4-mini` as generic).
+  - Implemented authoritative mapping engine `resolve_model_tokenizer(model_id, registry)` incorporating verified evidence from OpenAI's `tiktoken/model.py`:
+    - `o200k_base` verified: `o1`, `o3`, `o4-mini`, `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.5`, `gpt-5`, `chatgpt-4o-latest`, and prefixes `o1-`, `o3-`, `o4-mini-`, `gpt-4.1-`, `gpt-4.5-`, `gpt-5-`, `ft:gpt-4o`.
+    - `cl100k_base` verified: `gpt-4`, `gpt-4-turbo`, `gpt-3.5-turbo`, and prefixes `gpt-4-`, `gpt-3.5-turbo-`, `ft:gpt-4`, `ft:gpt-3.5-turbo`.
+    - Calibrated non-BPE prefixes: `llama-`, `mistral-`, `gemma-`, `qwen-`, `deepseek-`.
+    - Explicit reference aliases: `fast-chat-v1` -> `Llama`, `deep-reasoner-v1` -> `DeepSeek`, `balanced-assistant-v1` -> `Mistral`.
+    - Namespace stripping: safely processes `openai/*`, `groq/*`, `openrouter/*`.
+    - Safe fallback: unknown models and negative substring lookalikes strictly resolve to `MappingKind::Unknown` and `TokenizerFamily::Generic`.
+- **Truthful Exactness Semantics (`src/inference/tokens.rs`):**
+  - Strictly separated exact raw-text BPE tokenization from multi-message chat estimation.
+  - Raw-text BPE tokenization (`estimate_text_detailed`) sets `is_exact = true`, `method = ExactTokenizer`, and `raw_text_exact = Some(true)`.
+  - Multi-message chat requests (`estimate_chat_detailed`, `estimate_request_context_safe`) set `is_exact = false`, `method = EstimatedChatFraming`, and `raw_text_exact = Some(true)` because message delimiters (+3 per message, +3 assistant primer, +12 schema overhead) are heuristic framing conventions, not exact wire tokenization.
+- **Effective-Message Consistency & Output Token Validation (`src/inference/mod.rs`):**
+  - Reconciled prompt compaction with candidate admission: `resolve_candidates` now evaluates effective compacted messages (`effective_messages`) rather than raw messages, ensuring that admission checks and dispatched payloads are identical.
+  - Differentiated output-token limit violation from context-window exhaustion in auto-routing: if requested `max_tokens` exceeds all available models' `max_output_tokens`, it returns a specific error (`Requested max_tokens ({requested}) exceeds maximum output token limit of all available operational models ({max})`) rather than incorrectly claiming context window exhaustion.
+- **Comprehensive Reference & Regression Test Matrix (`tests/model_aware_tokenization_and_admission_test.rs`):**
+  - Added Category 16: Table-driven model-mapping matrix covering all catalog models, investigated next-gen OpenAI models, and negative lookalikes.
+  - Added Category 17: Reference tokenizer test suite verifying exact `cl100k_base` and `o200k_base` counts against official `tiktoken` provenance across English, Rust code, Python code, JSON, long identifiers, Urdu script (demonstrating 52 -> 22 token reduction in o200k), emojis, and punctuation.
+  - Added Category 18: Auto-routing candidate admission and output limit discrimination tests.
+  - Added Category 19: Message optimization consistency in candidate admission and routing.
+  - Test suite count increased to **279 passing tests** (16 test suites, 0 failures, 1 ignored load benchmark).
+
+### Verification
+- `cargo fmt --check`: Passed with exit code 0.
+- `cargo check`: Passed with exit code 0.
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed with 0 warnings (exit code 0).
+- `cargo test`: **279 automated tests passing** across 16 test suites with 0 failures, 0 errors, 1 ignored (controlled benchmark).
+- `cargo audit -n`: Passed with exit code 0 (1,348 advisories checked, 170 dependencies scanned).
+- `gitleaks detect -v`: Passed with exit code 0 (12 commits scanned, 0 leaks found).
+
+---
 
 ### Added & Hardened
 - **Native Offline BPE Tokenizer Integration (`tiktoken-rs`):**

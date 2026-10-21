@@ -2,6 +2,7 @@
 //!
 //! A high-performance, security-focused AI model aggregation backend in Rust.
 
+pub mod auth;
 pub mod config;
 pub mod errors;
 pub mod inference;
@@ -16,12 +17,14 @@ pub mod security;
 pub mod usage;
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use auth::{
+    AuthPrincipal, AuthRole, AuthService, AuthType, ClientType, GoogleClaims, GoogleOidcValidator,
+    HttpJwksProvider, JwksProvider, MockJwksProvider, PatValidator, auth_middleware,
+};
 pub use config::AppConfig;
 pub use errors::AppError;
 pub use inference::{ChatCompletionRequest, InferenceService};
@@ -36,8 +39,6 @@ pub use router::{
 };
 pub use usage::{UsageRecord, UsageService, UsageStorage};
 
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 /// Wrapper for tracing request IDs across extensions and handlers.
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
@@ -46,6 +47,7 @@ pub struct RequestId(pub String);
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
+    pub auth: Arc<AuthService>,
     pub registry: Arc<ModelRegistry>,
     pub providers: Arc<ProviderRegistry>,
     pub router: Arc<ModelRouter>,
@@ -57,6 +59,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Arc<AppConfig>) -> Self {
+        let auth = Arc::new(AuthService::new(config.clone()));
         let registry = Arc::new(ModelRegistry::new());
         let providers = Arc::new(ProviderRegistry::new());
         let quota = Arc::new(QuotaService::new());
@@ -191,6 +194,7 @@ impl AppState {
 
         Self {
             config,
+            auth,
             registry,
             providers,
             router,
@@ -206,6 +210,7 @@ impl AppState {
         registry: Arc<ModelRegistry>,
         router: Arc<ModelRouter>,
     ) -> Self {
+        let auth = Arc::new(AuthService::new(config.clone()));
         let providers = Arc::new(ProviderRegistry::new());
         let quota = Arc::new(QuotaService::new());
         let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
@@ -221,6 +226,7 @@ impl AppState {
         );
         Self {
             config,
+            auth,
             registry,
             providers,
             router,
@@ -237,6 +243,7 @@ impl AppState {
         providers: Arc<ProviderRegistry>,
         router: Arc<ModelRouter>,
     ) -> Self {
+        let auth = Arc::new(AuthService::new(config.clone()));
         let quota = Arc::new(QuotaService::new());
         let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
         let usage = Arc::new(UsageService::new(storage));
@@ -251,6 +258,7 @@ impl AppState {
         );
         Self {
             config,
+            auth,
             registry,
             providers,
             router,
@@ -269,6 +277,7 @@ impl AppState {
         usage: Arc<UsageService>,
         quota: Arc<QuotaService>,
     ) -> Self {
+        let auth = Arc::new(AuthService::new(config.clone()));
         let inference = Arc::new(
             InferenceService::new(
                 config.clone(),
@@ -280,6 +289,7 @@ impl AppState {
         );
         Self {
             config,
+            auth,
             registry,
             providers,
             router,
@@ -288,6 +298,12 @@ impl AppState {
             quota,
             start_time: std::time::Instant::now(),
         }
+    }
+
+    /// Builder helper to replace AuthService (e.g. for deterministic mock JWKS in tests).
+    pub fn with_auth_service(mut self, auth: Arc<AuthService>) -> Self {
+        self.auth = auth;
+        self
     }
 }
 
@@ -308,125 +324,13 @@ pub fn start_retention_maintenance(
     })
 }
 
-/// Request ID resolution and API Authentication middleware.
-async fn request_id_and_auth_middleware(
-    State(state): State<AppState>,
-    mut req: Request,
+/// Request ID resolution, Host validation, proxy security, and API Authentication middleware.
+pub async fn request_id_and_auth_middleware(
+    state: State<AppState>,
+    req: Request,
     next: Next,
 ) -> Response {
-    // 1. Resolve or generate Request ID (API_SPEC.md §1.1)
-    let request_id_str = if let Some(header_val) = req.headers().get("x-request-id") {
-        if let Ok(s) = header_val.to_str() {
-            let trimmed = s.trim();
-            if !trimmed.is_empty()
-                && trimmed.len() <= 128
-                && trimmed
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                trimmed.to_string()
-            } else {
-                format!(
-                    "req_{:012x}",
-                    REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
-                )
-            }
-        } else {
-            format!(
-                "req_{:012x}",
-                REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
-            )
-        }
-    } else {
-        format!(
-            "req_{:012x}",
-            REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
-        )
-    };
-
-    req.extensions_mut()
-        .insert(RequestId(request_id_str.clone()));
-
-    // 1b. Host Header Validation
-    if !state.config.allowed_hosts.is_empty() {
-        let host_val = req
-            .headers()
-            .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-        if !state.config.host_validator().validate_host(host_val) {
-            let err = AppError::InvalidRequest("Invalid or untrusted Host header".to_string());
-            return err.to_response_with_id(&request_id_str);
-        }
-    }
-
-    // 1c. Forwarded Header Protection against spoofing from untrusted peers
-    let peer_ip = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip());
-
-    let is_trusted_peer = match peer_ip {
-        Some(ip) => state.config.trusted_proxy_matcher().is_trusted(&ip),
-        None => false,
-    };
-
-    if !is_trusted_peer {
-        req.headers_mut().remove("x-forwarded-for");
-        req.headers_mut().remove("forwarded");
-        req.headers_mut().remove("x-forwarded-proto");
-        req.headers_mut().remove("x-forwarded-host");
-    }
-
-    // 2. Authentication enforcement (API_SPEC.md §1.1)
-    let path = req.uri().path();
-    let is_public_probe = path == "/api/v1/health" || path == "/api/v1/ready";
-    let is_operational_data = path.starts_with("/api/v1/usage") || path == "/api/v1/quotas";
-
-    // Operational endpoints on non-loopback bind address must always be authenticated
-    // to prevent exposing telemetry over an externally reachable unauthenticated server.
-    let operational_protection_required = is_operational_data && !state.config.is_loopback_host();
-
-    if !is_public_probe && (state.config.is_auth_required() || operational_protection_required) {
-        let is_authorized = if operational_protection_required && state.config.api_key.is_none() {
-            // When bound to an external address without an API key, operational data access is rejected.
-            false
-        } else {
-            req.headers()
-                .get("x-api-key")
-                .and_then(|hdr| hdr.to_str().ok())
-                .is_some_and(|key| state.config.validate_api_key(key.trim()))
-                || req
-                    .headers()
-                    .get("authorization")
-                    .and_then(|hdr| hdr.to_str().ok())
-                    .and_then(|val| val.trim().strip_prefix("Bearer "))
-                    .is_some_and(|tok| state.config.validate_api_key(tok.trim()))
-        };
-
-        if !is_authorized {
-            let err = AppError::Unauthorized(
-                if operational_protection_required && state.config.api_key.is_none() {
-                    "Authentication required: operational telemetry is protected on external interfaces"
-                        .to_string()
-                } else {
-                    "Missing or invalid authentication credentials".to_string()
-                },
-            );
-            return err.to_response_with_id(&request_id_str);
-        }
-    }
-
-    let mut response = next.run(req).await;
-
-    // Attach X-Request-ID to response headers
-    if let Ok(hdr_val) = HeaderValue::from_str(&request_id_str) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-request-id"), hdr_val);
-    }
-
-    response
+    crate::auth::auth_middleware(state, req, next).await
 }
 
 /// Create the full Axum router with registered endpoints, body limits, middleware, and fallback error handler.
@@ -436,7 +340,7 @@ pub fn create_app(state: AppState) -> axum::Router {
         .fallback(fallback_handler)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            request_id_and_auth_middleware,
+            crate::auth::auth_middleware,
         ))
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .with_state(state)

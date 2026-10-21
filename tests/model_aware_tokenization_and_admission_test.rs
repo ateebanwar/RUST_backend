@@ -21,7 +21,8 @@
 use ai_backend::config::AppConfig;
 use ai_backend::errors::AppError;
 use ai_backend::inference::tokens::{
-    EstimationMethod, TokenEstimator, TokenizerCapability, TokenizerFamily,
+    BpeEncoding, EstimationMethod, MappingKind, TokenEstimator, TokenizerCapability,
+    TokenizerFamily,
 };
 use ai_backend::inference::{ChatCompletionRequest, InferenceService};
 use ai_backend::models::{ChatMessage, ModelMetadata};
@@ -104,8 +105,16 @@ fn test_category_3_mixed_language_conversation() {
     ];
 
     let exact_est = TokenEstimator::estimate_chat_detailed(&msgs, Some("gpt-4o"));
-    assert!(exact_est.is_exact);
-    assert_eq!(exact_est.method, EstimationMethod::ExactTokenizer);
+    assert!(
+        !exact_est.is_exact,
+        "Chat requests must not claim full exactness due to heuristic framing constants"
+    );
+    assert_eq!(
+        exact_est.raw_text_exact,
+        Some(true),
+        "Raw message contents are tokenized exactly with verified BPE"
+    );
+    assert_eq!(exact_est.method, EstimationMethod::EstimatedChatFraming);
     assert_eq!(exact_est.safety_margin_applied, 0);
 
     let approx_est = TokenEstimator::estimate_chat_detailed(&msgs, Some("fast-chat-v1"));
@@ -532,4 +541,527 @@ fn test_category_15_overflow_safe_token_arithmetic() {
     let safety_margin = (huge_raw.saturating_mul(15) / 100).max(8);
     let safe_total = huge_raw.saturating_add(safety_margin);
     assert_eq!(safe_total, usize::MAX);
+}
+
+// =========================================================================
+// Category 16: Table-Driven Model-Mapping Matrix & Negative Substring Tests
+// =========================================================================
+#[test]
+fn test_category_16_table_driven_model_mapping_matrix() {
+    use ai_backend::inference::tokens::resolve_model_tokenizer;
+
+    struct MappingTestCase {
+        model_id: &'static str,
+        expected_kind: MappingKind,
+        expected_family: TokenizerFamily,
+        expected_encoding: Option<BpeEncoding>,
+        expected_raw_exact: bool,
+    }
+
+    let test_cases = vec![
+        // 1. Registered catalog models
+        MappingTestCase {
+            model_id: "gpt-4o",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-4o-mini",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-4-turbo",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::Cl100k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "fast-chat-v1",
+            expected_kind: MappingKind::ExplicitAlias,
+            expected_family: TokenizerFamily::Llama,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "deep-reasoner-v1",
+            expected_kind: MappingKind::ExplicitAlias,
+            expected_family: TokenizerFamily::DeepSeek,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "balanced-assistant-v1",
+            expected_kind: MappingKind::ExplicitAlias,
+            expected_family: TokenizerFamily::Mistral,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "llama-3.3-70b-versatile",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Llama,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "mistral-large-2407",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Mistral,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "deepseek-chat",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::DeepSeek,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        // 2. Investigated OpenAI models and newer families
+        MappingTestCase {
+            model_id: "o1",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "o1-mini",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "o3",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "o3-mini",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "o4-mini",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "o4-mini-2025-04-16",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-4.1",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-4.1-mini",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-4.1-nano",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-4.5",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-5",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-5-mini",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "chatgpt-4o-latest",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-4",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::Cl100k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "gpt-3.5-turbo",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::Cl100k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "openai/gpt-4o",
+            expected_kind: MappingKind::ExactVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        MappingTestCase {
+            model_id: "ft:gpt-4o:my-org:custom-1",
+            expected_kind: MappingKind::FamilyPrefixVerified,
+            expected_family: TokenizerFamily::Gpt,
+            expected_encoding: Some(BpeEncoding::O200k),
+            expected_raw_exact: true,
+        },
+        // 3. Negative lookalike tests (Defect 1 regression prevention)
+        MappingTestCase {
+            model_id: "auto1",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "echo1",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "audio3",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "demo3",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "my-custom-gpt",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "custom-gpt",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "gpt-unverified-future",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "unregistered-llm",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+        MappingTestCase {
+            model_id: "",
+            expected_kind: MappingKind::Unknown,
+            expected_family: TokenizerFamily::Generic,
+            expected_encoding: None,
+            expected_raw_exact: false,
+        },
+    ];
+
+    for tc in test_cases {
+        let res = resolve_model_tokenizer(tc.model_id, None);
+        assert_eq!(
+            res.mapping_kind, tc.expected_kind,
+            "Model '{}' mapping_kind mismatch: expected {:?}, got {:?}",
+            tc.model_id, tc.expected_kind, res.mapping_kind
+        );
+        assert_eq!(
+            res.family, tc.expected_family,
+            "Model '{}' family mismatch: expected {:?}, got {:?}",
+            tc.model_id, tc.expected_family, res.family
+        );
+        assert_eq!(
+            res.bpe_encoding, tc.expected_encoding,
+            "Model '{}' encoding mismatch: expected {:?}, got {:?}",
+            tc.model_id, tc.expected_encoding, res.bpe_encoding
+        );
+
+        let detailed = TokenEstimator::estimate_text_detailed("Hello world", Some(tc.model_id));
+        assert_eq!(
+            detailed.is_exact, tc.expected_raw_exact,
+            "Model '{}' is_exact mismatch: expected {}, got {}",
+            tc.model_id, tc.expected_raw_exact, detailed.is_exact
+        );
+    }
+}
+
+// =========================================================================
+// Category 17: Reference Tokenizer Provenance Fixtures (cl100k & o200k)
+// =========================================================================
+#[test]
+fn test_category_17_reference_tokenizer_provenance_fixtures() {
+    // Provenance: Counts verified against OpenAI's official tiktoken reference
+    // implementation for encodings cl100k_base and o200k_base.
+    struct ProvenanceFixture {
+        input: &'static str,
+        expected_cl100k: usize,
+        expected_o200k: usize,
+        description: &'static str,
+    }
+
+    let fixtures = vec![
+        ProvenanceFixture {
+            input: "Hello, world!",
+            expected_cl100k: 4,
+            expected_o200k: 4,
+            description: "Simple English greeting with comma and exclamation mark",
+        },
+        ProvenanceFixture {
+            input: "fn compute(x: i32) -> i32 { x * 2 + 1 }",
+            expected_cl100k: 19,
+            expected_o200k: 19,
+            description: "Rust arithmetic function signature and body",
+        },
+        ProvenanceFixture {
+            input: "def add(a, b):\n    return a + b",
+            expected_cl100k: 11,
+            expected_o200k: 11,
+            description: "Python function with newline and 4-space indentation",
+        },
+        ProvenanceFixture {
+            input: r#"{"status": "ok", "count": 42}"#,
+            expected_cl100k: 12,
+            expected_o200k: 12,
+            description: "Standard JSON payload",
+        },
+        ProvenanceFixture {
+            input: "compute_sha256_checksum_for_payload_buffer",
+            expected_cl100k: 7,
+            expected_o200k: 7,
+            description: "Long snake_case identifier",
+        },
+        ProvenanceFixture {
+            input: "برائے مہربانی اس سسٹم کی کارکردگی اور سیکیورٹی کو بہتر بنائیں",
+            expected_cl100k: 52,
+            expected_o200k: 22,
+            description: "Urdu request sentence demonstrating o200k compression efficiency",
+        },
+        ProvenanceFixture {
+            input: "🚀 🔥 🤖 ✨",
+            expected_cl100k: 10,
+            expected_o200k: 8,
+            description: "Unicode emojis with spaces",
+        },
+        ProvenanceFixture {
+            input: "!@#$%^&*()_+=-`~[]\\{}|;':\",./<>?",
+            expected_cl100k: 22,
+            expected_o200k: 22,
+            description: "Full standard ASCII punctuation sequence",
+        },
+    ];
+
+    for fix in fixtures {
+        let cl100k_actual = TokenEstimator::estimate_text_for_model(fix.input, Some("gpt-4"));
+        let o200k_actual = TokenEstimator::estimate_text_for_model(fix.input, Some("gpt-4o"));
+
+        assert_eq!(
+            cl100k_actual, fix.expected_cl100k,
+            "cl100k failure on fixture '{}' ({}): expected {}, got {}",
+            fix.description, fix.input, fix.expected_cl100k, cl100k_actual
+        );
+        assert_eq!(
+            o200k_actual, fix.expected_o200k,
+            "o200k failure on fixture '{}' ({}): expected {}, got {}",
+            fix.description, fix.input, fix.expected_o200k, o200k_actual
+        );
+    }
+}
+
+// =========================================================================
+// Category 18: Auto-Routing Per-Candidate Admission & Output Limit Checks
+// =========================================================================
+#[test]
+fn test_category_18_auto_routing_candidate_admission_and_output_limits() {
+    let small_candidate = ModelMetadata {
+        model_id: "tight-context-model".to_string(),
+        display_name: "Tight Context Model".to_string(),
+        provider_id: "test-provider".to_string(),
+        supported_modalities: vec!["text".to_string()],
+        context_window: 40,
+        max_output_tokens: 20,
+        streaming_supported: true,
+        tool_calling_supported: false,
+        speed_tier: "fast".to_string(),
+        cost_tier: "free-tier".to_string(),
+        available: true,
+        capabilities: vec!["simple_chat".to_string()],
+        last_health_check: "2026-10-21T00:00:00Z".to_string(),
+    };
+    let spacious_candidate = ModelMetadata {
+        model_id: "spacious-context-model".to_string(),
+        display_name: "Spacious Context Model".to_string(),
+        provider_id: "test-provider".to_string(),
+        supported_modalities: vec!["text".to_string()],
+        context_window: 8192,
+        max_output_tokens: 2048,
+        streaming_supported: true,
+        tool_calling_supported: false,
+        speed_tier: "balanced".to_string(),
+        cost_tier: "free-tier".to_string(),
+        available: true,
+        capabilities: vec!["simple_chat".to_string()],
+        last_health_check: "2026-10-21T00:00:00Z".to_string(),
+    };
+
+    let inference = build_test_inference(vec![small_candidate, spacious_candidate]);
+
+    // Request requires ~30 tokens. With allowance (256 min or 50 requested),
+    // it exceeds tight-context-model (40 ceiling) but fits spacious-context-model!
+    let req = ChatCompletionRequest {
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "This is a prompt that requires more than forty tokens to fit both prompt and allowance comfortably.".to_string(),
+        }],
+        routing_mode: "auto".to_string(),
+        requested_model_id: None,
+        requested_modality: "text".to_string(),
+        temperature: None,
+        max_tokens: Some(50),
+        stream: false,
+    };
+
+    let res = inference.resolve_candidates(&req).unwrap();
+    assert_eq!(
+        res.selected_model_id, "spacious-context-model",
+        "Auto-routing must filter out candidate that cannot fit token budget and select the capable candidate"
+    );
+
+    // Request exceeding max_output_tokens of all operational candidates
+    let excessive_req = ChatCompletionRequest {
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        }],
+        routing_mode: "auto".to_string(),
+        requested_model_id: None,
+        requested_modality: "text".to_string(),
+        temperature: None,
+        max_tokens: Some(4096), // Both models have max_output_tokens: 2048
+        stream: false,
+    };
+
+    let excessive_err = inference.resolve_candidates(&excessive_req).unwrap_err();
+    match excessive_err {
+        AppError::InvalidRequest(msg) => {
+            assert!(
+                msg.contains("Requested max_tokens (4096) exceeds maximum output token limit of all available operational models (2048)"),
+                "Expected specific output token limit error, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidRequest, got {other:?}"),
+    }
+}
+
+// =========================================================================
+// Category 19: Message Optimization Consistency in Admission & Routing
+// =========================================================================
+#[test]
+fn test_category_19_effective_message_compaction_consistency() {
+    let model = ModelMetadata {
+        model_id: "compaction-model".to_string(),
+        display_name: "Compaction Model".to_string(),
+        provider_id: "test-provider".to_string(),
+        supported_modalities: vec!["text".to_string()],
+        context_window: 50,
+        max_output_tokens: 20,
+        streaming_supported: true,
+        tool_calling_supported: false,
+        speed_tier: "fast".to_string(),
+        cost_tier: "free-tier".to_string(),
+        available: true,
+        capabilities: vec!["simple_chat".to_string()],
+        last_health_check: "2026-10-21T00:00:00Z".to_string(),
+    };
+
+    let inference = build_test_inference(vec![model]);
+
+    // Construct a request with redundant duplicate system instructions and whitespace
+    let uncompacted_messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are an assistant.".to_string(),
+        },
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are an assistant.".to_string(),
+        },
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are an assistant.".to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: "Hi!\n\n\n\n\n".to_string(),
+        },
+    ];
+
+    let req = ChatCompletionRequest {
+        messages: uncompacted_messages,
+        routing_mode: "manual".to_string(),
+        requested_model_id: Some("compaction-model".to_string()),
+        requested_modality: "text".to_string(),
+        temperature: None,
+        max_tokens: Some(15),
+        stream: false,
+    };
+
+    let resolution = inference.resolve_candidates(&req).unwrap();
+    // After compaction, 2 duplicate system messages and redundant blank lines are eliminated
+    // Ensuring the estimated prompt tokens reflects the effective message count.
+    assert!(
+        resolution.estimated_prompt_tokens < 30,
+        "Estimated prompt tokens ({}) should reflect compacted messages",
+        resolution.estimated_prompt_tokens
+    );
 }

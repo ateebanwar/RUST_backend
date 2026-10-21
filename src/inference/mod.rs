@@ -22,8 +22,8 @@ use tracing::{info, warn};
 
 pub mod tokens;
 pub use tokens::{
-    EstimationMethod, TokenCompactionMetrics, TokenEstimate, TokenEstimator, TokenizerCapability,
-    TokenizerFamily,
+    BpeEncoding, EstimationMethod, MappingKind, ModelTokenizerResolution, TokenCompactionMetrics,
+    TokenEstimate, TokenEstimator, TokenizerCapability, TokenizerFamily,
 };
 
 /// Inbound request payload for chat completion endpoints conforming to API_SPEC.md §5.1.
@@ -234,6 +234,13 @@ impl InferenceService {
         let detected_task = classification.category.as_str().to_string();
         let estimated_complexity = classification.complexity.as_str().to_string();
 
+        // Effective message compaction: ensure context estimation and admission evaluate
+        // the exact message representation that will be dispatched to the model provider.
+        let (effective_messages, _) = TokenEstimator::optimize_messages_for_model(
+            &req.messages,
+            req.requested_model_id.as_deref(),
+        );
+
         if req.routing_mode.eq_ignore_ascii_case("manual") {
             let preferred_id = match req.requested_model_id.as_deref() {
                 Some(id) if !id.trim().is_empty() => id.trim(),
@@ -275,7 +282,7 @@ impl InferenceService {
             };
 
             let context_estimate = TokenEstimator::estimate_request_context_safe(
-                &req.messages,
+                &effective_messages,
                 None,
                 Some(&model.model_id),
             );
@@ -330,6 +337,21 @@ impl InferenceService {
                 .registry
                 .query_models(&ModelFilter::new().with_available_only(true));
 
+            // Validate requested output tokens against maximum capacity of operational models
+            // before conflating with context window exhaustion.
+            if let Some(requested) = req.max_tokens {
+                let max_output_available = available_models
+                    .iter()
+                    .map(|m| m.max_output_tokens)
+                    .max()
+                    .unwrap_or(0);
+                if requested > max_output_available {
+                    return Err(AppError::InvalidRequest(format!(
+                        "Requested max_tokens ({requested}) exceeds maximum output token limit of all available operational models ({max_output_available})"
+                    )));
+                }
+            }
+
             // Capacity-aware context window filtering: only evaluate candidates that can fit prompt tokens + completion allowance
             let min_completion_allowance = req.max_tokens.unwrap_or(256);
             let fitting_models: Vec<crate::models::ModelMetadata> = available_models
@@ -346,7 +368,7 @@ impl InferenceService {
                     };
 
                     let est = TokenEstimator::estimate_request_context_safe(
-                        &req.messages,
+                        &effective_messages,
                         None,
                         Some(&m.model_id),
                     );
@@ -359,7 +381,8 @@ impl InferenceService {
                 .collect();
 
             if fitting_models.is_empty() {
-                let fallback_prompt_tokens = TokenEstimator::estimate_chat(&req.messages);
+                let fallback_prompt_tokens =
+                    TokenEstimator::estimate_chat_for_model(&effective_messages, None);
                 return Err(AppError::InvalidRequest(format!(
                     "Prompt estimated tokens ({fallback_prompt_tokens}) plus completion allowance ({min_completion_allowance}) exceed context window of all available operational models"
                 )));
@@ -404,7 +427,7 @@ impl InferenceService {
 
             let primary = &ordered_candidates[0];
             let estimated_prompt_tokens = TokenEstimator::estimate_request_context_safe(
-                &req.messages,
+                &effective_messages,
                 None,
                 Some(&primary.model_id),
             )

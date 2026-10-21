@@ -25,6 +25,9 @@
 | **DEC-012** | Deterministic Token Estimation, Prompt Compaction, and Pre-Dispatch Context Window Routing Safeguards | **APPROVED** | 2026-10-20 | Token Efficiency & Context Capacity |
 | **DEC-013** | Model-Aware Token Estimation Provenance, Conservative Prompt Preservation, and Reverse-Proxy / Durable Usage Resilience | **APPROVED** | 2026-10-20 | Security, Correctness & Reliability |
 | **DEC-014** | Autonomous Retention Maintenance Worker, Independent Local Disk Spooler, Multilingual Token Provenance, and Reverse-Proxy Security Defense | **APPROVED** | 2026-10-21 | Reliability, Storage & Security |
+| **DEC-015** | Model-Aware Tokenizer Integration, Capability Hierarchy & Context Admission | **APPROVED** | 2026-10-21 | Tokenizer Architecture & Context Safety |
+| **DEC-016** | Centralized Model-ID-to-Tokenizer Mapping, Truthful Framing Semantics, and Effective Message Context Admission | **APPROVED** | 2026-10-21 | Tokenizer Correctness & Routing Safety |
+| **DEC-017** | Phase 11 Multi-Client Authentication, Google OIDC ID Token Verification, and Constant-Time Credential Validation | **APPROVED** | 2026-10-21 | Authentication & Identity Security |
 
 ---
 
@@ -251,7 +254,31 @@
   4. *Strict Output Limit and Context Admission Gating:* Eliminated silent clamping of `req.max_tokens`. If a client requests more tokens than a model's `max_output_tokens`, the request is rejected with HTTP 400 `InvalidRequest`. Enforced checked addition (`estimated_prompt_tokens.checked_add(completion_allowance)`) to guard against integer overflow. Requests exceeding `model.context_window` are rejected prior to provider dispatch. Automatic routing evaluates candidate models against model-aware context requirements and output limits.
 - **Consequences:** Provides exact tokenization for supported OpenAI models, transparent approximation for other model families, and strict context safety across all routes. Verified by 258 automated tests across 16 test suites. Phase 11 remains strictly on hold.
 
+---
 
+### DEC-016: Centralized Model-ID-to-Tokenizer Mapping, Truthful Framing Semantics, and Effective Message Context Admission
+- **Status:** APPROVED
+- **Date:** 2026-10-21
+- **Context:** An end-to-end token estimation audit revealed critical correctness defects: (1) broad substring matching (`.contains("gpt")`, `.contains("o1")`) misclassified newer models (`gpt-4.1`, `gpt-4.5`, `gpt-5` as `cl100k` instead of `o200k`, dropped `o4-mini` to generic, and falsely classified unrelated models like `auto1`, `echo1`, `audio3`, `my-custom-gpt` as exact BPE); (2) chat requests and safe context estimates misleadingly reported `is_exact: true` even though message and schema framing were heuristic constants (+3 per message, +3 assistant primer, +12 schema overhead); (3) context admission evaluated uncompacted raw messages while execution dispatched compacted messages; (4) auto-routing conflated requested `max_tokens` exceeding model output limits with context window exhaustion.
+- **Decisions Made:**
+  1. *Authoritative Centralized Model-to-Tokenizer Engine (`src/inference/tokens.rs`):* Replaced broad substring matching with `resolve_model_tokenizer(model_id, registry)`. Mapped exact IDs and verified prefixes to verified BPE encodings (`o200k_base` vs `cl100k_base`) based directly on official OpenAI `tiktoken/model.py` specifications. Strips provider namespaces (`openai/*`, `groq/*`, `openrouter/*`). Explicitly aliases reference catalog models (`fast-chat-v1` -> Llama, `deep-reasoner-v1` -> DeepSeek, `balanced-assistant-v1` -> Mistral). Unknown IDs and negative lookalikes strictly fall through to `MappingKind::Unknown` and `TokenizerFamily::Generic`.
+  2. *Truthful Exactness Separation:* Strictly separated exact raw-text BPE tokenization (`is_exact: true`, `method: ExactTokenizer`, `raw_text_exact: Some(true)`) from multi-message chat estimation (`is_exact: false`, `method: EstimatedChatFraming`, `raw_text_exact: Some(true)`).
+  3. *Effective Message Context Admission (`src/inference/mod.rs`):* `resolve_candidates` now evaluates effective compacted messages (`effective_messages`) rather than raw messages, ensuring that admission checks and dispatched payloads are identical.
+  4. *Output Limit Discrimination in Auto-Routing:* Differentiated output-token limit violation from context-window exhaustion in auto-routing: if requested `max_tokens` exceeds all available models' `max_output_tokens`, it returns a specific error (`Requested max_tokens ({requested}) exceeds maximum output token limit of all available operational models ({max})`).
+  5. *Comprehensive Regression & Provenance Test Suite (`tests/model_aware_tokenization_and_admission_test.rs`):* Added table-driven mapping matrix (Category 16), reference tokenizer provenance fixtures (Category 17), auto-routing candidate admission & output limit checks (Category 18), and message compaction consistency (Category 19).
+- **Consequences:** All confirmed defects are permanently resolved and verified by 279 automated tests across 16 test suites with 0 failures, 0 Clippy warnings, and 0 secret leaks. Phase 11 remains strictly on hold.
 
+---
 
-
+### DEC-017: Phase 11 Multi-Client Authentication, Google OIDC ID Token Verification, and Constant-Time Credential Validation
+- **Status:** APPROVED
+- **Date:** 2026-10-21
+- **Context:** The Phase 11 mandate required implementing production-ready authentication and authorization across multiple client types (Flutter mobile, Custom IDE, VS Code Extension, and API consumers) while preserving zero-secret leaks, fail-closed production safety, and offline testability without live external identity dependencies.
+- **Decisions Made:**
+  1. *Dual Authentication Scheme Architecture (`src/auth/`):* Implemented a unified `AuthService` handling mobile/web clients via Google Sign-In OpenID Connect (OIDC) ID tokens and developer/IDE clients via Personal Access Tokens (PATs) and backend API keys.
+  2. *Cryptographic Google OIDC ID Token Verification (`src/auth/oidc.rs`):* Uses `jsonwebtoken` to cryptographically verify RS256 JWT signatures against Google's public JSON Web Key Sets (JWKS). Strictly validates `iss` (`https://accounts.google.com` or `accounts.google.com`), `aud` against configured Google Client IDs, expiration timestamp (`exp` with 60-second RFC 7519 leeway), and non-empty subject (`sub`). JWKS keys are cached with 1-hour TTL and bounded 5-second fetch timeout (`HttpJwksProvider`). Deterministic offline test execution is guaranteed via `MockJwksProvider` without live Google network access.
+  3. *Constant-Time Credential & PAT Hashing (`src/auth/pat.rs`):* Incoming tokens and API keys are SHA-256 hashed and verified using `subtle::ConstantTimeEq`, completely eliminating length and value timing side channels. Implemented secure PAT generation with standard `pat_` prefix and 64 random hex characters via OS secure random generator (`ring::rand::SystemRandom`).
+  4. *Request Identity Propagation & Role Authorization (`src/auth/principal.rs`):* Injects strongly-typed `AuthPrincipal` into Axum request extensions containing `subject`, `auth_type`, `client_type` (parsed from `X-Client-Type`), `email`, `roles` (`User`, `Admin`, `Service`), and `scopes`. Overrides `Debug` to redact email and secrets.
+  5. *Strict Route Protection & Precedence Policy:* Public probes (`/health`, `/ready`) are unconditionally accessible without authentication. All inference (`/chat/*`), model discovery (`/models/*`, `/providers`), routing preview, and operational telemetry (`/usage/*`, `/quotas`) endpoints require authentication. 3-segment JWTs route strictly to OIDC; non-JWT tokens route strictly to PAT/API key validators. Invalid credentials never fall back to weaker authentication.
+  6. *Fail-Closed Production Configuration (`src/config.rs`):* In production (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present. Configured keys must be at least 8 characters long.
+- **Consequences:** Provides robust, client-independent authentication with constant-time security and zero credential leakage. Verified by 299 automated tests across 17 test suites with 0 failures, 0 Clippy warnings, and 0 security vulnerabilities. Phase 12 remains strictly on hold.

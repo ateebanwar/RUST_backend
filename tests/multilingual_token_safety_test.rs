@@ -248,9 +248,20 @@ fn test_exact_bpe_reference_vs_approximate_comparison() {
     assert!(!llama_safe.is_exact);
     assert!(llama_safe.safety_margin_applied >= 8);
 
-    // Safe context estimation for GPT is exact with 0 margin
+    // Safe context estimation for GPT utilizes verified BPE raw text tokenization with standard
+    // chat framing overhead. Because wire-level message framing is heuristic (+3 framing, +3 primer),
+    // request-level is_exact is false, raw_text_exact is Some(true), and safety margin is 0.
     let gpt_safe = TokenEstimator::estimate_request_context_safe(&msg, None, Some("gpt-4o"));
-    assert!(gpt_safe.is_exact);
+    assert!(
+        !gpt_safe.is_exact,
+        "Full request cannot be marked exact due to estimated framing"
+    );
+    assert_eq!(
+        gpt_safe.raw_text_exact,
+        Some(true),
+        "Raw text BPE count is exact"
+    );
+    assert_eq!(gpt_safe.method, EstimationMethod::EstimatedChatFraming);
     assert_eq!(gpt_safe.safety_margin_applied, 0);
     // 3 tokens framing + 1 token role ("user") + 19 tokens content + 3 tokens primer = 26 tokens
     assert_eq!(gpt_safe.estimated_tokens, 26);

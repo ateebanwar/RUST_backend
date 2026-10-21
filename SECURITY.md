@@ -19,14 +19,24 @@
 ## 2. Multi-Client Authentication & Authorization
 
 1. **Mobile Users (Flutter):**
-   - User identity authenticated via Google Sign-In OIDC ID tokens.
-   - The backend validates token signatures against Google's public JSON Web Key Sets (JWKS), checking `iss` (`https://accounts.google.com`), `aud` (configured Google Client ID), and expiration timestamp (`exp`).
-   - Client-asserted user IDs are never trusted without cryptographic token validation.
-2. **Developer & IDE Clients (Custom IDE, VS Code Extension):**
-   - Authenticated via Personal Access Tokens (PATs) or backend API keys passed in the `Authorization: Bearer <pat>` or `X-API-Key: <key>` headers.
-   - Keys must be hashed using constant-time comparison algorithms (e.g. `subtle::ConstantTimeEq`) to prevent timing side-channel attacks.
-3. **Role & Resource Authorization:**
-   - Every protected API endpoint verifies resource ownership. A user can only access their own conversation synchronization streams.
+    - User identity authenticated via Google Sign-In OIDC ID tokens passed in `Authorization: Bearer <google_id_token>`.
+    - The backend cryptographically validates RS256 token signatures against Google's public JSON Web Key Sets (JWKS) via `jsonwebtoken`.
+    - Strictly checks `iss` (`https://accounts.google.com` or `accounts.google.com`), `aud` (configured Google Client ID(s)), expiration timestamp (`exp` with 60-second RFC 7519 leeway), and non-empty subject (`sub`).
+    - JWKS keys are cached in memory with a 1-hour TTL and bounded 5-second fetch timeout (`HttpJwksProvider`). Deterministic offline testing is guaranteed via `MockJwksProvider` without live Google network access.
+    - Client-asserted user IDs are never trusted without cryptographic token validation.
+ 2. **Developer & IDE Clients (Custom IDE, VS Code Extension, CLI):**
+    - Authenticated via Personal Access Tokens (PATs) (`pat_<64_hex_chars>`) or configured backend API keys passed in `Authorization: Bearer <pat>` or `X-API-Key: <key>`.
+    - Keys are stored in memory as SHA-256 hashes (`ring::digest`) and verified using constant-time comparison (`subtle::ConstantTimeEq`), eliminating length- and character-timing side channels.
+ 3. **Identity Propagation & Role Authorization:**
+    - Every authenticated request injects a strongly-typed `AuthPrincipal` into Axum request extensions, carrying `subject`, `auth_type` (`GoogleOidc`, `PersonalAccessToken`, `ApiKey`, `DevelopmentBypass`), `client_type` (`Flutter`, `CustomIde`, `VscodeExtension`, `ApiClient`), `email`, `roles` (`User`, `Admin`, `Service`), and `scopes`.
+    - Route handlers verify principal permissions and scopes prior to executing sensitive operations.
+ 4. **Strict Precedence & Zero Fallback:**
+    - Incoming 3-segment JWTs are routed strictly to the Google OIDC validator.
+    - Non-JWT tokens and `X-API-Key` headers are routed strictly to the PAT/API Key validator.
+    - An invalid credential never receives weaker fallback authentication or developer bypass.
+ 5. **Fail-Closed Production Configuration:**
+    - In production mode (`APP_ENV=production`), application startup fails closed with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is present.
+    - Operational telemetry endpoints (`/api/v1/usage/*`, `/api/v1/quotas`) unconditionally require authentication whenever the server binds to a non-loopback host interface.
 
 ---
 

@@ -11,14 +11,34 @@
 ## 1. Global Conventions & Standards
 
 ### 1.1 Authentication & Client Identification Headers
-All endpoints (except `/api/v1/health` and `/api/v1/ready`) require authentication via standard HTTP headers:
+All endpoints (except public probes `/api/v1/health` and `/api/v1/ready`) require authentication via standard HTTP headers:
 
 | Header Name | Required? | Accepted Values / Format | Description |
 |---|---|---|---|
-| `Authorization` | Yes* | `Bearer <google_id_token>` OR `Bearer <pat>` | Primary authentication token (*either Bearer token or `X-API-Key` required). |
-| `X-API-Key` | Yes* | `<64-hex-character-key>` | Alternative API key authentication for developer IDE / CLI clients. |
-| `X-Client-Type` | Optional | `flutter` \| `custom-ide` \| `vscode-extension` \| `api-client` | Client identifier used for telemetry, formatting optimizations, and quota tiering. Defaults to `api-client`. |
-| `X-Request-ID` | Optional | UUIDv4 string (e.g. `c73f328a-8f8a-4d2c-8822-6b9f2d1e5a2b`) | Client-supplied tracing correlation ID. If omitted, backend generates one. |
+| `Authorization` | Yes* | `Bearer <google_id_token>` OR `Bearer <pat>` OR `Bearer <api_key>` | Primary authentication header (*either valid Bearer token or `X-API-Key` required). 3-segment JWTs are validated via Google OIDC RS256 JWKS; other tokens are validated as PATs or API keys via constant-time SHA-256 hash comparison. |
+| `X-API-Key` | Yes* | `<min-8-char-key>` (e.g. 64-hex key or configured backend key) | Dedicated API key header for developer IDE, CLI, and automated service consumers. Evaluated in constant time. |
+| `X-Client-Type` | Optional | `flutter` \| `custom-ide` \| `vscode-extension` \| `api-client` | Client identifier header classifying caller. Injected into `AuthPrincipal.client_type` for audit logging and quota policy. Defaults to `api-client`. |
+| `X-Request-ID` | Optional | Alphanumeric, hyphen, and underscore string up to 128 chars | Tracing correlation ID. If omitted or malformed, backend generates a unique `req_<hex>` ID and propagates it in all response headers and error envelopes. |
+
+#### Route Protection Matrix
+
+| Route Path | Method | Authentication Policy | Minimum Role / Scope | Description |
+|---|---|---|---|---|
+| `/api/v1/health` | `GET` | **Public** (Unauthenticated) | None | Container liveness and process health probe |
+| `/api/v1/ready` | `GET` | **Public** (Unauthenticated) | None | Upstream model discovery & inference readiness probe |
+| `/api/v1/models` | `GET` | **Authenticated** | Scope `models:read` | Query catalog of registered AI models |
+| `/api/v1/models/{model_id}` | `GET` | **Authenticated** | Scope `models:read` | Lookup model metadata and capability spec |
+| `/api/v1/providers` | `GET` | **Authenticated** | Scope `models:read` | List active provider adapters & operational status |
+| `/api/v1/routing/preview` | `POST` | **Authenticated** | Scope `routing:read` | Preview task classification and candidate scoring |
+| `/api/v1/chat/completions` | `POST` | **Authenticated** | Scope `chat` | Execute buffered multi-turn chat completion |
+| `/api/v1/chat/stream` | `POST` | **Authenticated** | Scope `chat` | Execute real-time SSE token streaming chat |
+| `/api/v1/usage/summary` | `GET` | **Authenticated** | Scope `usage:read` | Aggregated usage & cost accounting metrics |
+| `/api/v1/usage/providers` | `GET` | **Authenticated** | Scope `usage:read` | Provider-level token and request metrics |
+| `/api/v1/usage/models` | `GET` | **Authenticated** | Scope `usage:read` | Model-level token and request metrics |
+| `/api/v1/quotas` | `GET` | **Authenticated** | Scope `usage:read` | Active rate-limit headroom and quota telemetry |
+
+> [!IMPORTANT]
+> **Strict Precedence & Zero Fallback Rule:** If an incoming request provides credentials (e.g. an expired Google ID token or invalid API key), it is rejected with HTTP 401 Unauthorized immediately. Invalid credentials never fall back to another authentication mechanism or developer bypass.
 
 ### 1.2 Standardized JSON Data Types & Formatting Rules
 - **Timestamps:** ISO 8601 / RFC 3339 UTC strings with trailing `Z` (e.g. `2026-10-19T17:00:00Z`).

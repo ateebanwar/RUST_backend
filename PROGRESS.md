@@ -2,8 +2,8 @@
 
 **Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
 **Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
-**Current Phase:** Phase 10 Complete | Phase 11 Strictly On Hold  
-**Last Updated:** 2026-10-20
+**Current Phase:** Phase 11 Complete | Phase 12 Strictly On Hold
+**Last Updated:** 2026-10-21
 
 ---
 
@@ -78,11 +78,20 @@
   - **Workstream C — Multilingual Token Calibration & Context Safety (`src/inference/tokens.rs`):** Calibrated token counting across Roman Hinglish, Urdu/Arabic script, Devanagari, emojis, code indentation, and JSON tool schemas. Introduces `EstimationMethod` and `TokenEstimate` with transparent approximation labeling (`is_exact: false`). Applies conservative safety margin in `estimate_request_context_safe` to strictly prevent context overflow on boundary requests.
   - **Workstream D — Security Hardening & Regression Suite (`src/security/mod.rs`):** Hardened Host header validation with exact and wildcard subdomain matching (`*.example.com`), lookalike domain rejection (`evil-example.com`), and malformed header rejection. Strips forwarded headers from direct untrusted clients and implements `resolve_client_ip` with reverse right-to-left traversal across trusted reverse-proxy tiers.
   - **Verification:** 242 automated tests passing across 15 test suites with 0 failures and 0 errors; `cargo clippy` passed with 0 warnings (`-D warnings`); `cargo fmt --check` clean; `cargo build --release` passing; zero credentials committed. Phase 11 remains strictly on hold.
-- [x] **End-to-End Model-Aware Tokenization & Context-Window Admission Safety (COMPLETE & VERIFIED):**
-  - **Root Cause Remediation:** Replaced pure heuristic estimation with exact BPE tokenization for supported model families via offline, zero-network `tiktoken-rs` (`cl100k_base` for GPT-4/GPT-3.5 and `o200k_base` for GPT-4o/o1/o3).
-  - **Explicit Capability Hierarchy (`TokenizerCapability`):** Exact (verified tokenizer + framing), Approximate (calibrated heuristic with explicit `is_exact: false` and 15% safety headroom), and ProviderReported (authoritative upstream post-execution usage).
-  - **Context-Window Admission Gating:** Validates requested `max_tokens` against model `max_output_tokens` without silent clamping; uses overflow-safe checked addition (`estimated_prompt_tokens.checked_add(completion_allowance)`); enforces context window limits before provider dispatch; filters candidates in auto-routing using model-specific context budgets.
-  - **Verification:** 258 automated tests passing across 16 test suites (`tests/model_aware_tokenization_and_admission_test.rs` covering 15 categories); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean; `gitleaks detect` clean. Phase 11 remains strictly on hold.
+- [x] **Comprehensive Token Estimation Audit, Tokenizer Correction & Production Readiness (COMPLETE & VERIFIED):**
+  - **Authoritative Model-to-Tokenizer Mapping:** Eliminated broad substring matching; implemented deterministic `resolve_model_tokenizer` backed by OpenAI `tiktoken/model.py` specifications (`o200k_base` for `o1`, `o3`, `o4-mini`, `gpt-4o`, `gpt-4.1`, `gpt-4.5`, `gpt-5`; `cl100k_base` for `gpt-4`, `gpt-3.5-turbo`; explicit aliases for `fast-chat-v1`, `deep-reasoner-v1`, `balanced-assistant-v1`; safe generic fallback for negative lookalikes).
+  - **Truthful Exactness Semantics:** Raw text tokenization with verified BPE reports `is_exact: true` (`ExactTokenizer`); multi-message chat requests and context safe estimates report `is_exact: false` with `EstimatedChatFraming` and `raw_text_exact: Some(true)`.
+  - **Effective Message Compaction Consistency:** `resolve_candidates` evaluates compacted effective messages matching provider dispatch payload, eliminating admission discrepancies.
+  - **Output Limit Discrimination:** Auto-routing differentiates max output capacity violations from context window exhaustion, returning explicit informative errors.
+  - **Comprehensive Verification:** 279 automated tests passing across 16 test suites (`tests/model_aware_tokenization_and_admission_test.rs` covering 19 categories including reference fixtures and mapping matrix); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean; `gitleaks detect -v` clean. Phase 11 remains strictly on hold.
+- [x] **Phase 11 — Authentication & Authorization (COMPLETE & VERIFIED):**
+  - **Multi-Client Authentication Subsystem (`src/auth/`):** Unified authentication service decoupled from specific frontends, serving Flutter mobile applications, Custom AI IDEs, VS Code / editor extensions, and automated API consumers.
+  - **Google Sign-In OIDC ID Token Verification (`src/auth/oidc.rs`):** RS256 JWT cryptographic signature verification against Google's public JWKS via `jsonwebtoken`. Enforces strict validation of `iss` (`https://accounts.google.com` or `accounts.google.com`), `aud` (configured Google Client IDs), expiration (`exp` with 60-second leeway), and subject (`sub`). JWKS keys cached in-memory with 1-hour TTL and bounded 5-second fetch timeout (`HttpJwksProvider`). Deterministic offline testing supported via `MockJwksProvider` without live Google network access.
+  - **Constant-Time PAT & API Key Verification (`src/auth/pat.rs`):** Inbound credentials and PATs (`pat_<64_hex_chars>`) are verified via SHA-256 hash comparison using `subtle::ConstantTimeEq`, completely eliminating length and value timing side channels. Secure PAT generation using OS random entropy (`ring::rand::SystemRandom`).
+  - **Request Identity & Authorization Propagation (`src/auth/principal.rs`):** Strongly-typed `AuthPrincipal` inserted into Axum request extensions containing `subject`, `auth_type`, `client_type` (parsed from `X-Client-Type`), `email`, `roles` (`User`, `Admin`, `Service`), and authorized `scopes`. Zero-leak `Debug` and `Display` formatting redacting emails and credentials.
+  - **Strict Precedence & Zero Fallback:** 3-segment JWT tokens route strictly to OIDC; non-JWT tokens and `X-API-Key` headers route strictly to PAT/API key validators. Invalid credentials never fall back to weaker authentication or developer bypass.
+  - **Fail-Closed Production Configuration (`src/config.rs`):** Production mode (`APP_ENV=production`) fails closed at startup with `ConfigError::InvalidValue` if no valid `API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID` is configured.
+  - **Comprehensive Test Coverage & Verification:** 299 automated tests passing across 17 test suites (`tests/authentication_test.rs` with 12 focused integration tests); `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `cargo build --release` passing. Phase 12 remains strictly on hold.
 
 ---
 
@@ -102,8 +111,8 @@
 | **8** | **Quota & Usage Tracking** | **COMPLETE** | Phase 7B | Persistent SQLite store, token accounting, quota awareness, read-only analytics APIs | 170 tests pass, clippy clean, zero warnings | Verified Complete |
 | **9** | **Failover & Reliability** | **COMPLETE** | Phase 8 | Bounded retries, exponential backoff, loop prevention, manual routing invariant, pre vs mid-stream handling | 196 tests pass, clippy clean, zero warnings | Verified Complete |
 | **10** | **Token Optimization & Operational Hardening** | **COMPLETE** | Phase 9 | Model-aware estimation, conservative compaction, context gating, proxy security, durable usage queue | 220 tests pass, clippy clean, zero warnings, release load tested | Verified Complete |
-| **11** | **Authentication** | **NEXT ELIGIBLE PHASE** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | Auth token verification tests | Eligible to Begin |
-| **12** | **Authorization & Secret Management** | **NOT STARTED** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Pending Approval |
+| **11** | **Authentication** | **COMPLETE** | Phase 10 | Google ID token verifier (mobile), PAT / API key validator (IDE) | All tests pass (299 tests), clippy clean, zero warnings | Approved by User |
+| **12** | **Authorization & Secret Management** | **NEXT ELIGIBLE PHASE** | Phase 11 | Role enforcement, secret redaction, zero-secret responses | Secret leak scanner tests | Eligible to Begin |
 | **13** | **Abuse Prevention** | **NOT STARTED** | Phase 12 | Inbound body size limits, rate limiting, connection timeouts | Fuzzing & request flood tests | Pending Approval |
 | **14** | **Security Hardening** | **NOT STARTED** | Phase 13 | SSRF IP allowlisting, dependency audit, security regression suite | `cargo audit`, SSRF block tests | Pending Approval |
 | **15** | **Google Drive Integration** | **NOT STARTED** | Phase 14 | OAuth token exchange, `drive.appdata` scope client, Drive I/O | Mock Google Drive API tests | Pending Approval |
@@ -117,8 +126,8 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Phase 10 Formally Closed & Verified:** All 10 mandatory acceptance gates (Gate A through Gate J) are fully satisfied and documented.
-2. **Phase 11 (Authentication) Is Next Eligible Phase:** Phase 11 remains unstarted and strictly on hold until explicit user authorization. No Phase 11 code has been implemented.
+1. **Phase 11 Formally Closed & Verified:** All mandatory acceptance criteria (OIDC verification, constant-time PAT/API keys, fail-closed production config, identity propagation, route matrix enforcement) are fully verified and passing.
+2. **Phase 12 (Authorization & Secret Management) Is Next Eligible Phase:** Phase 12 remains unstarted and strictly on hold until separate explicit user authorization. No Phase 12 code has been implemented.
 3. **Repository State Protected:** Secrets, local SQLite databases (`data/usage.db`), and compiled binaries (`target/`) are strictly excluded from version control with zero credential leakage.
 
 
