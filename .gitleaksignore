@@ -1,0 +1,3 @@
+# Gitleaks ignore list
+# Documentation mock example token in API_SPEC.md
+b0bf12455e6b84e4a53e0730ad4ff99cf271e306:API_SPEC.md:generic-api-key:472

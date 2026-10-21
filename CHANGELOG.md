@@ -2,6 +2,39 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Phase 12: Final Security Audit, Targeted Corrections, Independent Verification & Completion
+
+### Audited, Corrected & Verified
+- **Test-Suite & Test-Count Reconciliation (Audit A):**
+  - Resolved previous reporting discrepancies: verified execution of 1 unit test target (`src/lib.rs` with 97 tests) and 17 active integration test suites (247 tests), plus 1 benchmark suite (`load_benchmark.rs` with 1 ignored benchmark).
+  - Exact verified count: **344 passed; 0 failed; 1 ignored; 0 filtered out** across all 21 targets.
+- **Route-by-Route Authorization & IDOR Matrix (Audit B):**
+  - Audited all 17 registered endpoints across 6 module domains.
+  - Telemetry endpoints (`/api/v1/usage/*`) enforce server-verified `filter.subject = Some(p.subject)` for users, rejecting `?user_id=other` with HTTP 403 Forbidden.
+  - Credential management endpoints (`/api/v1/auth/tokens/*`) enforce HTTP 404 Not Found on cross-user lookup, rotation, and revocation to prevent existence enumeration.
+- **Recoverable Secret Storage vs. Token Hashing (Audit C):**
+  - Audited secret persistence architecture: Personal Access Tokens (PATs) are verification-only credentials and are stored strictly as irreversible SHA-256 hashes (`token_hash BLOB NOT NULL` in SQLite), adhering to cryptographic zero-recoverability best practices.
+  - Upstream provider credentials (`groq_api_key`, `openrouter_api_key`, etc.) are configured via operator environment variables/config and wrapped in `SecretString` in memory with zero database persistence.
+  - `AesGcmCipher` authenticated encryption at rest (AES-256-GCM with 96-bit random nonces and AAD binding) is verified in code and unit tests, ready for Phase 15 recoverable OAuth token persistence.
+- **Legacy Usage Records (`subject IS NULL`) Tenant Isolation (Audit D):**
+  - Verified SQL semantics: pre-migration usage records with `subject IS NULL` cannot match user-scoped queries because `subject = ?` evaluates to falsy for NULL in SQL.
+  - Added targeted integration test `test_legacy_usage_records_null_subject_isolation` asserting that regular users receive 0 legacy unassigned records, that attempts to inject `?user_id=null` return 403 Forbidden, and that administrators can view global platform aggregates without data loss.
+- **Token Revocation, Concurrency, and Persistence (Audit E):**
+  - Verified revocation semantics: `revoke_token` commits `UPDATE credentials SET revoked = 1, revoked_at = ?` in SQLite and atomically updates the in-memory cache under a `RwLock::write` lock.
+  - Subsequent requests immediately fail authentication with HTTP 401 Unauthorized with zero stale cache delay. In-flight requests authorized prior to revocation finish their current request.
+  - Added regression test `test_revocation_persistence_across_store_reloads` demonstrating that re-initializing or restarting `CredentialStore` from SQLite preserves revocation status and blocks tokens.
+  - Added regression test `test_concurrent_duplicate_revocations_safety` demonstrating idempotent, race-free parallel revocations.
+- **Toolchain Verification:**
+  - `cargo fmt --check`: Clean (0 diffs).
+  - `cargo check`: Clean (0 errors).
+  - `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+  - `cargo test`: 344 passed; 0 failed; 1 ignored (345 total).
+  - `cargo audit -n`: Clean (0 vulnerabilities across 183 crates).
+  - `gitleaks detect -v`: Clean (0 leaks; documentation mock fingerprint registered in `.gitleaksignore`).
+  - `cargo build --release`: Clean (target binary built in 0.55s).
+
+---
+
 ## 2026-10-22 — Phase 12: End-to-End Authorization, Resource Ownership, Dynamic PAT Lifecycle, and Secret Hardening
 
 ### Implemented & Verified

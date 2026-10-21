@@ -806,3 +806,301 @@ async fn test_concurrent_revocation_leaves_zero_access_window() {
         );
     }
 }
+
+// =========================================================================
+// 8. LEGACY USAGE RECORDS (NULL SUBJECT) TENANT ISOLATION
+// =========================================================================
+
+#[tokio::test]
+async fn test_legacy_usage_records_null_subject_isolation() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("test_admin_key_99999".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+
+    let now = 1700000000000u64;
+
+    // Seed 3 unassigned legacy records with subject: None (pre-migration records)
+    for i in 0..3 {
+        let rec = UsageRecord {
+            id: format!("req_legacy_{i}"),
+            provider_id: "groq-api".to_string(),
+            model_id: "llama3-8b".to_string(),
+            request_mode: RequestMode::Buffered,
+            routing_mode: RoutingMode::Auto,
+            start_time: now + i * 10,
+            completion_time: now + i * 10 + 50,
+            latency_ms: 50,
+            outcome: RequestOutcome::Success,
+            failure_category: None,
+            prompt_tokens: Some(50),
+            completion_tokens: Some(50),
+            total_tokens: Some(100),
+            usage_source: UsageSource::Reported,
+            record_status: RecordStatus::Final,
+            subject: None, // Legacy unassigned record
+        };
+        state.usage.storage().record_sync(&rec).unwrap();
+    }
+
+    // Seed 2 records for Alice with subject: Some("user_alice")
+    for i in 0..2 {
+        let rec = UsageRecord {
+            id: format!("req_alice_leg_{i}"),
+            provider_id: "openrouter-api".to_string(),
+            model_id: "claude-3-haiku".to_string(),
+            request_mode: RequestMode::Buffered,
+            routing_mode: RoutingMode::Auto,
+            start_time: now + 100 + i * 10,
+            completion_time: now + 100 + i * 10 + 60,
+            latency_ms: 60,
+            outcome: RequestOutcome::Success,
+            failure_category: None,
+            prompt_tokens: Some(100),
+            completion_tokens: Some(100),
+            total_tokens: Some(200),
+            usage_source: UsageSource::Reported,
+            record_status: RecordStatus::Final,
+            subject: Some("user_alice".to_string()),
+        };
+        state.usage.storage().record_sync(&rec).unwrap();
+    }
+
+    // Create PAT for Alice
+    let alice_principal = AuthPrincipal::new(
+        "user_alice".to_string(),
+        AuthType::PersonalAccessToken,
+        ClientType::Flutter,
+        None,
+        vec![AuthRole::User],
+        vec!["usage:read".to_string()],
+    );
+    let alice_token_resp = state
+        .credentials
+        .create_token(
+            &alice_principal,
+            CreateTokenRequest {
+                name: "Alice Phone".to_string(),
+                owner_subject: None,
+                scopes: None,
+                expires_in_secs: None,
+            },
+        )
+        .unwrap();
+
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // 1. Alice queries summary: receives ONLY her 2 records (400 tokens), zero legacy records
+    let alice_summary: Value = client
+        .get(format!("{base_url}/api/v1/usage/summary"))
+        .bearer_auth(&alice_token_resp.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(alice_summary["total_requests"], 2);
+    assert_eq!(alice_summary["total_tokens"], 400);
+
+    // 2. Alice queries providers: sees only "openrouter-api", never legacy "groq-api"
+    let alice_providers: Value = client
+        .get(format!("{base_url}/api/v1/usage/providers"))
+        .bearer_auth(&alice_token_resp.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_prov_arr = alice_providers.as_array().unwrap();
+    assert_eq!(alice_prov_arr.len(), 1);
+    assert_eq!(alice_prov_arr[0]["provider_id"], "openrouter-api");
+
+    // 3. Alice queries models: sees only "claude-3-haiku", never legacy "llama3-8b"
+    let alice_models: Value = client
+        .get(format!("{base_url}/api/v1/usage/models"))
+        .bearer_auth(&alice_token_resp.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let alice_model_arr = alice_models.as_array().unwrap();
+    assert_eq!(alice_model_arr.len(), 1);
+    assert_eq!(alice_model_arr[0]["model_id"], "claude-3-haiku");
+
+    // 4. Alice attempts to inject user_id=null -> rejected with 403 Forbidden
+    let idor_null = client
+        .get(format!("{base_url}/api/v1/usage/summary?user_id=null"))
+        .bearer_auth(&alice_token_resp.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idor_null.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // 5. Admin queries global summary without filter: aggregates all 5 records (3 legacy + 2 Alice = 700 tokens)
+    let admin_global: Value = client
+        .get(format!("{base_url}/api/v1/usage/summary"))
+        .header("X-API-Key", "test_admin_key_99999")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admin_global["total_requests"], 5);
+    assert_eq!(admin_global["total_tokens"], 700);
+
+    // 6. Admin queries Alice specifically: sees only Alice's 2 records
+    let admin_alice: Value = client
+        .get(format!(
+            "{base_url}/api/v1/usage/summary?user_id=user_alice"
+        ))
+        .header("X-API-Key", "test_admin_key_99999")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admin_alice["total_requests"], 2);
+    assert_eq!(admin_alice["total_tokens"], 400);
+}
+
+// =========================================================================
+// 9. REVOCATION PERSISTENCE ACROSS REBOOTS / STORE RELOADS
+// =========================================================================
+
+#[test]
+fn test_revocation_persistence_across_store_reloads() {
+    use ai_backend::auth::CredentialStore;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    // Shared connection handle (representing on-disk database file)
+    let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+
+    let store1 = CredentialStore::new(conn.clone()).unwrap();
+
+    let principal = AuthPrincipal::new(
+        "persistence_user".to_string(),
+        AuthType::PersonalAccessToken,
+        ClientType::Flutter,
+        None,
+        vec![AuthRole::User],
+        vec!["usage:read".to_string()],
+    );
+
+    let created = store1
+        .create_token(
+            &principal,
+            CreateTokenRequest {
+                name: "Persistent Key".to_string(),
+                owner_subject: None,
+                scopes: None,
+                expires_in_secs: None,
+            },
+        )
+        .unwrap();
+
+    // Verify token validates initially
+    assert!(
+        store1
+            .validate_token(&created.token, ClientType::Flutter)
+            .is_some()
+    );
+
+    // Revoke token in store1
+    store1
+        .revoke_token(&principal, &created.metadata.id)
+        .unwrap();
+
+    // Verify token is immediately invalid in store1
+    assert!(
+        store1
+            .validate_token(&created.token, ClientType::Flutter)
+            .is_none()
+    );
+
+    // Simulate backend server restart by initializing a new CredentialStore on same database
+    let store2 = CredentialStore::new(conn.clone()).unwrap();
+
+    // The token MUST remain invalid in store2 after reload
+    assert!(
+        store2
+            .validate_token(&created.token, ClientType::Flutter)
+            .is_none(),
+        "Revocation status must persist across store reloads"
+    );
+
+    // Inspecting token metadata in store2 shows revoked = true
+    let meta = store2.get_token(&principal, &created.metadata.id).unwrap();
+    assert!(meta.revoked);
+    assert!(meta.revoked_at.is_some());
+}
+
+// =========================================================================
+// 10. CONCURRENT DUPLICATE REVOCATIONS SAFETY
+// =========================================================================
+
+#[tokio::test]
+async fn test_concurrent_duplicate_revocations_safety() {
+    use ai_backend::auth::CredentialStore;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+    let store = CredentialStore::new(conn).unwrap();
+
+    let principal = AuthPrincipal::new(
+        "dup_user".to_string(),
+        AuthType::PersonalAccessToken,
+        ClientType::Flutter,
+        None,
+        vec![AuthRole::User],
+        vec!["usage:read".to_string()],
+    );
+
+    let created = store
+        .create_token(
+            &principal,
+            CreateTokenRequest {
+                name: "Dup Test".to_string(),
+                owner_subject: None,
+                scopes: None,
+                expires_in_secs: None,
+            },
+        )
+        .unwrap();
+
+    // Spawn 10 concurrent tasks calling revoke_token on the exact same token ID
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let store_c = store.clone();
+        let p_c = principal.clone();
+        let id_c = created.metadata.id.clone();
+        handles.push(tokio::spawn(
+            async move { store_c.revoke_token(&p_c, &id_c) },
+        ));
+    }
+
+    for h in handles {
+        let res = h.await.unwrap();
+        assert!(
+            res.is_ok(),
+            "Duplicate revocations must succeed idempotently"
+        );
+    }
+
+    // Token must remain revoked
+    assert!(
+        store
+            .validate_token(&created.token, ClientType::Flutter)
+            .is_none()
+    );
+    let meta = store.get_token(&principal, &created.metadata.id).unwrap();
+    assert!(meta.revoked);
+}
