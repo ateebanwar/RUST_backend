@@ -2,6 +2,32 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Master Implementation Directive: Google Drive-Only Storage Architecture & Stateless Backend Hardening
+
+### Architectural Hardening & Google Drive-Only Source of Truth
+- **Google Drive as Sole Permanent Source of Truth:**
+  - Enforced Google Drive's hidden `appDataFolder` (`spaces=appDataFolder`) as the exclusive permanent storage location for all user data (conversations, messages, attachments, library files, tombstones, and manifests).
+  - Eliminated permanent backend user database dependencies: removed SQLite user tables (`local_sync_conversations`, `local_sync_library`, `local_sync_metadata`).
+  - Refactored `LocalSyncStore` (`src/drive/local_store.rs`) into an ephemeral in-memory working cache (`is_persistent() -> false`), ensuring a stateless backend suitable for serverless microVM execution (Vercel Serverless Functions) and ephemeral container restarts.
+- **Save-Confirmation Protocol & Cold-Start Hydration:**
+  - Implemented strict save-confirmation protocol on all user data mutations (`create_conversation`, `create_library_item`, `delete_conversation`, `delete_library_item`): HTTP 200/201 is returned to the client ONLY after AES-256-GCM encryption, Google Drive upload, and remote manifest commit succeed.
+  - Implemented transparent cold-start hydration (`get_or_hydrate_conversation`, `get_or_hydrate_library_item`, `get_library_item_content`, `list_conversations_with_drive`, `list_library_items_with_drive`) restoring cached state directly from Google Drive upon cache miss.
+- **Model-Agnostic Chat Continuity Across Providers:**
+  - Added `conversation_id: Option<String>` to `ChatCompletionRequest`.
+  - Implemented `hydrate_conversation_context`: fetches canonical conversation history from Google Drive, validates tenant ownership, reconstructs model-agnostic message history, runs inference against any requested provider (Groq/OpenAI, Claude, Gemini, Perplexity), and atomically appends updated user and assistant turns back to Google Drive upon completion.
+- **Safe Legacy SQLite Migration Module (`src/drive/migration.rs`):**
+  - Created `inspect_legacy_sqlite` to discover pre-existing SQLite user records.
+  - Created `migrate_legacy_sqlite_to_drive` to safely export, encrypt, and commit legacy records to Google Drive.
+  - Source database files are strictly preserved and never dropped or deleted.
+- **Multi-Tenant Hardening in MockDriveClient:**
+  - Scoped `MockFile` by `owner_token`, ensuring deterministic multi-tenant isolation where User A's token cannot discover, download, or delete User B's files.
+- **Verification Results:**
+  - `cargo fmt --check`: Clean (0 diffs).
+  - `cargo check --all-targets --all-features`: Clean (0 warnings).
+  - `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+  - `cargo test --all-targets --all-features`: 421 tests passing across 26 test targets with 0 failures (100% pass rate).
+  - `cargo build --release`: Clean (compiled release binary in 1m 06s).
+
 ## 2026-10-22 — Phase 15 Durable Persistence: SQLite LocalSyncStore Persistence & Crash Safety
 
 ### Persistence Hardening & Restart Survival

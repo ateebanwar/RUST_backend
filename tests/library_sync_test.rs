@@ -90,6 +90,7 @@ async fn test_upload_and_download_library_item() {
 
     let resp = client
         .post(format!("{base_url}/api/v1/drive/library"))
+        .header("x-drive-token", "test_drive_token_123")
         .json(&payload)
         .send()
         .await
@@ -99,6 +100,7 @@ async fn test_upload_and_download_library_item() {
     // 2. Download content via GET /api/v1/drive/library/lib_doc_1/content
     let download_resp = client
         .get(format!("{base_url}/api/v1/drive/library/lib_doc_1/content"))
+        .header("x-drive-token", "test_drive_token_123")
         .send()
         .await
         .unwrap();
@@ -171,6 +173,7 @@ async fn test_chat_deletion_leaves_library_items_intact() {
         .delete(format!(
             "{base_url}/api/v1/drive/conversations/chat_to_delete"
         ))
+        .header("x-drive-token", "test_drive_token_123")
         .send()
         .await
         .unwrap();
@@ -214,6 +217,7 @@ async fn test_chat_deletion_leaves_library_items_intact() {
         .delete(format!(
             "{base_url}/api/v1/drive/library/photo_attachment_1"
         ))
+        .header("x-drive-token", "test_drive_token_123")
         .send()
         .await
         .unwrap();

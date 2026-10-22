@@ -66,7 +66,7 @@ pub struct AppState {
 
 fn default_sync_engine(
     config: &AppConfig,
-    conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+    _conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
 ) -> Arc<crate::drive::SyncEngine> {
     let drive_crypto = if let Some(hex_key) = &config.drive_encryption_key {
         match crate::drive::DriveCryptoEngine::from_hex(hex_key) {
@@ -90,30 +90,7 @@ fn default_sync_engine(
         config.google_drive_timeout_secs,
         config.google_drive_max_retries,
     ));
-    let local_sync_store = if let Some(conn) = conn {
-        match crate::drive::LocalSyncStore::from_connection(conn) {
-            Ok(store) => Arc::new(store),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "Failed to initialize persistent LocalSyncStore from connection; falling back to in-memory store"
-                );
-                Arc::new(crate::drive::LocalSyncStore::new())
-            }
-        }
-    } else {
-        match crate::drive::LocalSyncStore::open(&config.database_path) {
-            Ok(store) => Arc::new(store),
-            Err(e) => {
-                tracing::error!(
-                    path = %config.database_path,
-                    error = %e,
-                    "Failed to open persistent LocalSyncStore at database_path; falling back to in-memory store"
-                );
-                Arc::new(crate::drive::LocalSyncStore::new())
-            }
-        }
-    };
+    let local_sync_store = Arc::new(crate::drive::LocalSyncStore::new());
     Arc::new(crate::drive::SyncEngine::new(
         drive_client,
         drive_crypto,

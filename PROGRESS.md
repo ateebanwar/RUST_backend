@@ -131,13 +131,15 @@
     - Added fail-closed startup validation in `AppConfig::validate` requiring `DRIVE_ENCRYPTION_KEY` when `google_drive_sync_enabled == true`.
     - Added secret redaction (`[REDACTED]`) in `fmt::Debug for DriveCryptoEngine` and `fmt::Debug for AppConfig`.
     - Added early checks in `POST /api/v1/drive/config` (`update_sync_config`), `SyncEngine::sync`, `SyncEngine::restore`, and `SyncEngine::get_library_item_content`.
-  - **LocalSyncStore Durable Persistence (SQLite Backed):**
-    - Transitioned `LocalSyncStore` from transient in-memory-only storage to a crash-safe write-through cache backed by SQLite (`rusqlite` bundled).
-    - Designed tables `local_sync_conversations`, `local_sync_library`, and `local_sync_metadata` with indexes on `(owner_subject, is_dirty)`.
-    - Auto-reloads all persisted state on restart (conversations, messages, library items, binary payloads, revisions, dirty flags, tombstones, and sync stats).
-    - Strong typing with `LocalStoreError`; mutating methods propagate failures to HTTP endpoints (500 Internal Error) rather than reporting silent success.
-    - Added dedicated test suite `tests/local_store_persistence_test.rs` covering restart recovery, missing storage, corruption safety, concurrency, idempotency, and logout isolation.
-  - **Verification:** **417 automated tests passing** across 26 test targets (120 unit + 297 integration across 25 integration/benchmark suites) with 0 failures (100% pass rate); `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo build --release` passing.
+  - **Master Directive — Google Drive-Only Storage & Backend Hardening (COMPLETE):**
+    - Established Google Drive's hidden `appDataFolder` (`spaces=appDataFolder`) as the **sole permanent source of truth** for all user data (conversations, messages, attachments, library files, tombstones, and manifests).
+    - Eliminated permanent backend user database dependencies: removed SQLite user tables (`local_sync_conversations`, `local_sync_library`, `local_sync_metadata`).
+    - Transitioned `LocalSyncStore` into an ephemeral in-memory working cache (`is_persistent() -> false`), ensuring a stateless backend tailored for serverless microVM execution (Vercel Serverless Functions) and ephemeral container restarts.
+    - Implemented strict save-confirmation protocol: create and update operations return HTTP 200/201 confirmation only after AES-256-GCM encryption, Google Drive upload, and remote manifest commit succeed.
+    - Implemented model-agnostic chat continuity: chat history is decoupled from specific AI provider formats; clients supply `conversation_id`, and the backend hydrates context from Drive, executes inference across any AI provider, and atomically appends updated turns back to Google Drive.
+    - Added safe legacy SQLite migration module (`src/drive/migration.rs`) with `inspect_legacy_sqlite` and `migrate_legacy_sqlite_to_drive`, preserving original SQLite files without deletion or data loss.
+    - Enforced strict multi-tenant isolation across all Drive and Library operations, ensuring zero cross-tenant contamination.
+  - **Verification:** **421 automated tests passing** across 26 test targets (118 unit + 303 integration across 25 integration/benchmark suites) with 0 failures (100% pass rate); `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo build --release` passing.
 
 ---
 

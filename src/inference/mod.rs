@@ -39,6 +39,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 fn default_routing_mode() -> String {
@@ -47,6 +49,21 @@ fn default_routing_mode() -> String {
 
 fn default_modality() -> String {
     "text".to_string()
+}
+
+impl Default for ChatCompletionRequest {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            routing_mode: default_routing_mode(),
+            requested_model_id: None,
+            requested_modality: default_modality(),
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            conversation_id: None,
+        }
+    }
 }
 
 impl ChatCompletionRequest {

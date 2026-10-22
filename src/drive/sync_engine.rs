@@ -10,7 +10,7 @@
 //! - Reinstall and account recovery bootstrapping from remote manifest.
 //! - Bounded retries and exponential backoff for transient network errors and rate limiting.
 
-use super::client::{DriveClient, DriveError};
+use super::client::{DriveClient, DriveError, DriveFileMetadata};
 use super::crypto::{DriveCryptoEngine, compute_sha256};
 use super::local_store::LocalSyncStore;
 use super::models::{
@@ -481,11 +481,13 @@ impl SyncEngine {
             return Ok(content);
         }
 
-        let item = self
-            .local_store
-            .get_library_item(owner, item_id)
-            .await
-            .ok_or_else(|| DriveError::NotFound(format!("Library item {item_id} not found")))?;
+        let item = match self.local_store.get_library_item(owner, item_id).await {
+            Some(item) => item,
+            None => self
+                .get_or_hydrate_library_item(owner, item_id, drive_token)
+                .await?
+                .ok_or_else(|| DriveError::NotFound(format!("Library item {item_id} not found")))?,
+        };
 
         let drive_id = item.drive_file_id.as_deref().ok_or_else(|| {
             DriveError::NotFound(format!(
@@ -518,12 +520,489 @@ impl SyncEngine {
             });
         }
 
-        // Cache locally for subsequent fast offline access
-        let _ = self
-            .local_store
-            .save_library_item(owner, item, Some(plain_bytes.clone()))
+        // Cache locally for subsequent fast access
+        self.local_store
+            .cache_library_content(owner, item_id, &plain_bytes)
             .await;
 
         Ok(plain_bytes)
+    }
+
+    /// Load or initialize remote manifest from Google Drive.
+    pub async fn load_remote_manifest(
+        &self,
+        owner: &str,
+        drive_token: &str,
+    ) -> Result<(SyncManifest, Option<String>), DriveError> {
+        let manifest_meta = self
+            .retry_drive_op(|| {
+                self.client
+                    .find_file(drive_token, REMOTE_MANIFEST_FILENAME, DRIVE_APPDATA_SPACE)
+            })
+            .await?;
+
+        match manifest_meta {
+            Some(meta) => {
+                let enc_bytes = self
+                    .retry_drive_op(|| self.client.download_file(drive_token, &meta.id))
+                    .await?;
+                let plain_bytes =
+                    self.crypto
+                        .decrypt(owner, REMOTE_MANIFEST_FILENAME, &enc_bytes)?;
+                let parsed: SyncManifest = serde_json::from_slice(&plain_bytes).map_err(|e| {
+                    DriveError::CorruptData(format!("Failed to parse remote sync manifest: {e}"))
+                })?;
+
+                if parsed.schema_version > CURRENT_SCHEMA_VERSION {
+                    return Err(DriveError::SchemaMismatch {
+                        expected: CURRENT_SCHEMA_VERSION,
+                        actual: parsed.schema_version,
+                    });
+                }
+                Ok((parsed, Some(meta.id)))
+            }
+            None => Ok((SyncManifest::new(owner.to_string()), None)),
+        }
+    }
+
+    /// Save updated manifest back to Google Drive.
+    pub async fn save_remote_manifest(
+        &self,
+        owner: &str,
+        drive_token: &str,
+        manifest: &mut SyncManifest,
+        manifest_file_id: Option<&str>,
+    ) -> Result<DriveFileMetadata, DriveError> {
+        let now = chrono_like_now();
+        manifest.last_sync_time = Some(now);
+
+        let manifest_bytes = serde_json::to_vec(manifest)
+            .map_err(|e| DriveError::Internal(format!("Failed to serialize sync manifest: {e}")))?;
+        let enc_manifest = self
+            .crypto
+            .encrypt(owner, REMOTE_MANIFEST_FILENAME, &manifest_bytes)?;
+
+        self.retry_drive_op(|| {
+            self.client.upload_file(
+                drive_token,
+                manifest_file_id,
+                REMOTE_MANIFEST_FILENAME,
+                "application/octet-stream",
+                &enc_manifest,
+                DRIVE_APPDATA_SPACE,
+            )
+        })
+        .await
+    }
+
+    /// Persist a conversation directly to the user's Google Drive with authenticated encryption.
+    ///
+    /// Confirms save only after Drive file write and manifest commit succeed.
+    pub async fn persist_conversation_to_drive(
+        &self,
+        owner: &str,
+        mut conv: SyncConversation,
+        drive_token: &str,
+    ) -> Result<SyncConversation, DriveError> {
+        if !self.crypto.is_configured() {
+            return Err(DriveError::CryptoError(
+                "Cannot persist conversation: DRIVE_ENCRYPTION_KEY is not configured on the backend server. A valid 32-byte key is strictly required.".to_string(),
+            ));
+        }
+
+        // 1. Load manifest first to check existing drive_file_id and bump revision
+        let (mut manifest, manifest_file_id) =
+            self.load_remote_manifest(owner, drive_token).await?;
+
+        let existing_entry = manifest.conversations.get(&conv.id);
+        let drive_file_id = existing_entry.and_then(|e| e.drive_file_id.clone());
+        if let Some(entry) = existing_entry
+            && conv.revision <= entry.revision
+        {
+            conv.revision = entry.revision + 1;
+        }
+        let now = chrono_like_now();
+        conv.owner_subject = owner.to_string();
+        conv.updated_at = now;
+
+        // 2. Encrypt and upload conversation file to Drive
+        let conv_filename = format!("conv_{}.json.enc", conv.id);
+        let resource_aad = format!("conv_{}", conv.id);
+        let json_bytes = serde_json::to_vec(&conv)
+            .map_err(|e| DriveError::Internal(format!("Failed to serialize conversation: {e}")))?;
+        let enc_bytes = self.crypto.encrypt(owner, &resource_aad, &json_bytes)?;
+
+        let meta = self
+            .retry_drive_op(|| {
+                self.client.upload_file(
+                    drive_token,
+                    drive_file_id.as_deref(),
+                    &conv_filename,
+                    "application/octet-stream",
+                    &enc_bytes,
+                    DRIVE_APPDATA_SPACE,
+                )
+            })
+            .await?;
+
+        // 3. Update manifest entry
+        manifest.conversations.insert(
+            conv.id.clone(),
+            ConversationIndexEntry {
+                id: conv.id.clone(),
+                title: conv.title.clone(),
+                updated_at: conv.updated_at.clone(),
+                revision: conv.revision,
+                deleted: conv.deleted,
+                deleted_at: conv.deleted_at.clone(),
+                message_count: conv.messages.len(),
+                drive_file_id: Some(meta.id.clone()),
+            },
+        );
+
+        // 4. Save updated manifest to Drive
+        self.save_remote_manifest(
+            owner,
+            drive_token,
+            &mut manifest,
+            manifest_file_id.as_deref(),
+        )
+        .await?;
+
+        // 5. Update local in-memory working cache
+        let _ = self
+            .local_store
+            .apply_remote_conversation(owner, conv.clone(), meta.id)
+            .await;
+
+        Ok(conv)
+    }
+
+    /// Soft-delete a conversation on Google Drive by recording a tombstone in the manifest.
+    ///
+    /// CRITICAL RULE: Associated Library items are NEVER deleted when deleting a conversation.
+    pub async fn delete_conversation_on_drive(
+        &self,
+        owner: &str,
+        conv_id: &str,
+        drive_token: &str,
+    ) -> Result<bool, DriveError> {
+        if !self.crypto.is_configured() {
+            return Err(DriveError::CryptoError(
+                "Cannot delete conversation on Drive: DRIVE_ENCRYPTION_KEY is not configured."
+                    .to_string(),
+            ));
+        }
+
+        let (mut manifest, manifest_file_id) =
+            self.load_remote_manifest(owner, drive_token).await?;
+        let Some(entry) = manifest.conversations.get_mut(conv_id) else {
+            return self
+                .local_store
+                .delete_conversation(owner, conv_id)
+                .await
+                .map_err(Into::into);
+        };
+
+        let now = chrono_like_now();
+        entry.deleted = true;
+        entry.deleted_at = Some(now.clone());
+        entry.revision += 1;
+        entry.updated_at = now.clone();
+
+        // Soft-delete in local working cache as well
+        let _ = self.local_store.delete_conversation(owner, conv_id).await;
+
+        // If file exists on Drive, update its tombstone state
+        if let Some(file_id) = &entry.drive_file_id {
+            let tombstone_conv = SyncConversation {
+                id: conv_id.to_string(),
+                owner_subject: owner.to_string(),
+                title: entry.title.clone(),
+                created_at: entry.updated_at.clone(),
+                updated_at: now,
+                revision: entry.revision,
+                schema_version: CURRENT_SCHEMA_VERSION,
+                deleted: true,
+                deleted_at: entry.deleted_at.clone(),
+                messages: Vec::new(),
+            };
+            let tombstone_filename = format!("conv_{conv_id}.json.enc");
+            let conv_aad = format!("conv_{conv_id}");
+            if let Ok(json_bytes) = serde_json::to_vec(&tombstone_conv)
+                && let Ok(enc_bytes) = self.crypto.encrypt(owner, &conv_aad, &json_bytes)
+            {
+                let _ = self
+                    .retry_drive_op(|| {
+                        self.client.upload_file(
+                            drive_token,
+                            Some(file_id),
+                            &tombstone_filename,
+                            "application/octet-stream",
+                            &enc_bytes,
+                            DRIVE_APPDATA_SPACE,
+                        )
+                    })
+                    .await;
+            }
+        }
+
+        // Save updated manifest to Drive
+        self.save_remote_manifest(
+            owner,
+            drive_token,
+            &mut manifest,
+            manifest_file_id.as_deref(),
+        )
+        .await?;
+
+        Ok(true)
+    }
+
+    /// Persist a library item directly to the user's Google Drive with authenticated encryption.
+    pub async fn persist_library_item_to_drive(
+        &self,
+        owner: &str,
+        mut item: LibraryItem,
+        raw_bytes: Vec<u8>,
+        drive_token: &str,
+    ) -> Result<LibraryItem, DriveError> {
+        if !self.crypto.is_configured() {
+            return Err(DriveError::CryptoError(
+                "Cannot persist library item: DRIVE_ENCRYPTION_KEY is not configured on the backend server.".to_string(),
+            ));
+        }
+
+        let (mut manifest, manifest_file_id) =
+            self.load_remote_manifest(owner, drive_token).await?;
+        let existing_entry = manifest.library_items.get(&item.id);
+        let drive_file_id = existing_entry.and_then(|e| e.drive_file_id.clone());
+
+        let resource_aad = format!("lib_{}", item.id);
+        let filename = format!("lib_{}.bin.enc", item.id);
+        let enc_bytes = self.crypto.encrypt(owner, &resource_aad, &raw_bytes)?;
+
+        let meta = self
+            .retry_drive_op(|| {
+                self.client.upload_file(
+                    drive_token,
+                    drive_file_id.as_deref(),
+                    &filename,
+                    "application/octet-stream",
+                    &enc_bytes,
+                    DRIVE_APPDATA_SPACE,
+                )
+            })
+            .await?;
+
+        let now = chrono_like_now();
+        item.owner_subject = owner.to_string();
+        item.updated_at = now;
+        item.drive_file_id = Some(meta.id.clone());
+
+        manifest.library_items.insert(
+            item.id.clone(),
+            LibraryIndexEntry {
+                id: item.id.clone(),
+                filename: item.filename.clone(),
+                mime_type: item.mime_type.clone(),
+                size_bytes: item.size_bytes,
+                checksum_sha256: item.checksum_sha256.clone(),
+                updated_at: item.updated_at.clone(),
+                deleted: item.deleted,
+                deleted_at: item.deleted_at.clone(),
+                conversation_id: item.conversation_id.clone(),
+                drive_file_id: Some(meta.id.clone()),
+            },
+        );
+
+        self.save_remote_manifest(
+            owner,
+            drive_token,
+            &mut manifest,
+            manifest_file_id.as_deref(),
+        )
+        .await?;
+        let _ = self
+            .local_store
+            .apply_remote_library_item(owner, item.clone(), meta.id)
+            .await;
+        let _ = self
+            .local_store
+            .save_library_item(owner, item.clone(), Some(raw_bytes))
+            .await;
+
+        Ok(item)
+    }
+
+    /// Explicitly delete a library item on Google Drive by tombstoning it in the manifest.
+    pub async fn delete_library_item_on_drive(
+        &self,
+        owner: &str,
+        item_id: &str,
+        drive_token: &str,
+    ) -> Result<bool, DriveError> {
+        let (mut manifest, manifest_file_id) =
+            self.load_remote_manifest(owner, drive_token).await?;
+        let Some(entry) = manifest.library_items.get_mut(item_id) else {
+            return self
+                .local_store
+                .delete_library_item(owner, item_id)
+                .await
+                .map_err(Into::into);
+        };
+
+        let now = chrono_like_now();
+        entry.deleted = true;
+        entry.deleted_at = Some(now);
+
+        let _ = self.local_store.delete_library_item(owner, item_id).await;
+        self.save_remote_manifest(
+            owner,
+            drive_token,
+            &mut manifest,
+            manifest_file_id.as_deref(),
+        )
+        .await?;
+
+        Ok(true)
+    }
+
+    /// Retrieve a conversation, hydrating from Google Drive on cold start or multi-instance cache miss.
+    pub async fn get_or_hydrate_conversation(
+        &self,
+        owner: &str,
+        conv_id: &str,
+        drive_token: Option<&str>,
+    ) -> Result<Option<SyncConversation>, DriveError> {
+        if let Some(conv) = self.local_store.get_conversation(owner, conv_id).await {
+            return Ok(Some(conv));
+        }
+
+        let Some(token) = drive_token else {
+            return Ok(None);
+        };
+
+        if !self.crypto.is_configured() {
+            return Ok(None);
+        }
+
+        let (manifest, _) = self.load_remote_manifest(owner, token).await?;
+        if let Some(entry) = manifest.conversations.get(conv_id) {
+            if entry.deleted {
+                return Ok(None);
+            }
+            if let Some(drive_file_id) = &entry.drive_file_id {
+                let enc_bytes = self
+                    .retry_drive_op(|| self.client.download_file(token, drive_file_id))
+                    .await?;
+                let plain_bytes =
+                    self.crypto
+                        .decrypt(owner, &format!("conv_{conv_id}"), &enc_bytes)?;
+                let conv: SyncConversation = serde_json::from_slice(&plain_bytes).map_err(|e| {
+                    DriveError::CorruptData(format!("Corrupt conversation {conv_id}: {e}"))
+                })?;
+                let _ = self
+                    .local_store
+                    .apply_remote_conversation(owner, conv.clone(), drive_file_id.clone())
+                    .await;
+                return Ok(Some(conv));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// List active conversations, hydrating from Google Drive if local working cache is unpopulated.
+    pub async fn list_conversations_with_drive(
+        &self,
+        owner: &str,
+        drive_token: Option<&str>,
+    ) -> Result<Vec<SyncConversation>, DriveError> {
+        let cached = self.local_store.list_conversations(owner).await;
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+
+        if let Some(token) = drive_token
+            && self.crypto.is_configured()
+        {
+            let _ = self.restore(owner, token).await;
+            return Ok(self.local_store.list_conversations(owner).await);
+        }
+
+        Ok(cached)
+    }
+
+    /// Retrieve library item metadata, hydrating from Google Drive on cache miss.
+    pub async fn get_or_hydrate_library_item(
+        &self,
+        owner: &str,
+        item_id: &str,
+        drive_token: Option<&str>,
+    ) -> Result<Option<LibraryItem>, DriveError> {
+        if let Some(item) = self.local_store.get_library_item(owner, item_id).await {
+            return Ok(Some(item));
+        }
+
+        let Some(token) = drive_token else {
+            return Ok(None);
+        };
+
+        if !self.crypto.is_configured() {
+            return Ok(None);
+        }
+
+        let (manifest, _) = self.load_remote_manifest(owner, token).await?;
+        if let Some(entry) = manifest.library_items.get(item_id) {
+            if entry.deleted {
+                return Ok(None);
+            }
+            let item = LibraryItem {
+                id: entry.id.clone(),
+                owner_subject: owner.to_string(),
+                filename: entry.filename.clone(),
+                mime_type: entry.mime_type.clone(),
+                size_bytes: entry.size_bytes,
+                checksum_sha256: entry.checksum_sha256.clone(),
+                created_at: entry.updated_at.clone(),
+                updated_at: entry.updated_at.clone(),
+                conversation_id: entry.conversation_id.clone(),
+                drive_file_id: entry.drive_file_id.clone(),
+                deleted: false,
+                deleted_at: None,
+                schema_version: CURRENT_SCHEMA_VERSION,
+            };
+            if let Some(dfid) = &entry.drive_file_id {
+                let _ = self
+                    .local_store
+                    .apply_remote_library_item(owner, item.clone(), dfid.clone())
+                    .await;
+            }
+            return Ok(Some(item));
+        }
+
+        Ok(None)
+    }
+
+    /// List active library items, hydrating from Google Drive if local working cache is unpopulated.
+    pub async fn list_library_items_with_drive(
+        &self,
+        owner: &str,
+        drive_token: Option<&str>,
+    ) -> Result<Vec<LibraryItem>, DriveError> {
+        let cached = self.local_store.list_library_items(owner).await;
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+
+        if let Some(token) = drive_token
+            && self.crypto.is_configured()
+        {
+            let _ = self.restore(owner, token).await;
+            return Ok(self.local_store.list_library_items(owner).await);
+        }
+
+        Ok(cached)
     }
 }

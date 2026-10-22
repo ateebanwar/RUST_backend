@@ -560,23 +560,37 @@ graph TD
 
 ### 11.2 Architectural Invariants & Guarantees
 
-1. **Private `appDataFolder` Isolation:**
+1. **Google Drive as the Sole Permanent Store:**
+   - In accordance with Master Directive §2, Google Drive's hidden `appDataFolder` is the **sole permanent source of truth** for all user data (conversations, messages, attachments, library files, tombstones, and manifests).
+   - The backend is a **stateless processing layer** tailored for serverless microVM execution (e.g. Vercel Serverless Functions) and ephemeral container restarts.
+   - Permanent backend SQLite storage of user content (`local_sync_conversations`, `local_sync_library`, `local_sync_metadata`) is completely eliminated.
+2. **Ephemeral In-Memory Working Cache (`LocalSyncStore`):**
+   - `LocalSyncStore` is an ephemeral, in-memory request-scoped working cache (`is_persistent() -> false`).
+   - Caches active conversations and decrypted library items in memory during active processing, dropping all state across process restarts.
+   - Multi-tenant isolation is strictly enforced in memory, partitioned by `owner_subject`.
+3. **Save-Confirmation Protocol & Cold-Start Hydration:**
+   - All write operations (`create_conversation`, `create_library_item`) follow a strict **save-confirmation protocol**: HTTP 201/200 responses are returned to the client ONLY after the payload is encrypted, successfully uploaded to Google Drive, and indexed in the remote manifest.
+   - On server restart or cache miss (cold starts), the backend transparently hydrates conversations and library metadata directly from Google Drive via `get_or_hydrate_conversation` and `get_or_hydrate_library_item`.
+4. **Model-Agnostic Chat Continuity:**
+   - Conversation history is decoupled from specific AI model formatting.
+   - When switching providers (e.g., Anthropic Claude -> Google Gemini -> Groq / OpenAI), the client supplies `conversation_id`. The backend hydrates the canonical conversation history from Google Drive, reconstructs provider-agnostic context turns, dispatches to the newly requested model, and atomically appends updated user and assistant messages back to Google Drive upon completion.
+5. **Private `appDataFolder` Isolation & Least-Privilege Scopes:**
    - Persistence is strictly confined to Google Drive's hidden `appDataFolder` (`spaces=appDataFolder`) using least-privilege scope `https://www.googleapis.com/auth/drive.appdata`.
    - Files stored here are invisible in standard Google Drive UI, preventing accidental user tampering or deletion.
-2. **Ephemeral Transit & Zero Disk Token Storage:**
+6. **Ephemeral Transit & Zero Disk Token Storage:**
    - Google Drive access tokens (`X-Drive-Token`) are passed ephemerally in HTTP headers and never written to disk, SQLite, or structured logs.
-3. **Authenticated Encryption at Rest with AAD Binding (`src/drive/crypto.rs`):**
+7. **Authenticated Encryption at Rest with AAD Binding (`src/drive/crypto.rs`):**
    - Prior to uploading to Google Drive, all conversation JSON and binary library payloads are encrypted using AES-256-GCM via `ring::aead`.
    - Associated Data (AAD) is strictly bound to `owner_subject:resource_id`. If ciphertext is copied or moved across tenants or resources, tag verification fails in constant time, defeating ciphertext transplantation attacks.
-4. **Independent Chat & Library Lifecycles:**
+8. **Independent Chat & Library Lifecycles:**
    - Conversations and Library items are tracked as distinct top-level entities in `SyncManifest`.
-   - Soft-deleting a conversation (`DELETE /api/v1/drive/conversations/{id}`) marks the conversation deleted but **NEVER** deletes associated Library items.
+   - Soft-deleting a conversation (`DELETE /api/v1/drive/conversations/{id}`) marks the conversation deleted with a tombstone but **NEVER** deletes associated Library items.
    - Library items are removed exclusively via explicit `DELETE /api/v1/drive/library/{id}` calls.
-5. **Bidirectional Sync with Last-Write-Wins (LWW) Conflict Resolution (`src/drive/sync_engine.rs`):**
-   - Remote `manifest.json` tracks timestamps (`updated_at`).
-   - If local timestamp is newer, local payload is encrypted and uploaded; if remote timestamp is newer, authoritative remote payload is downloaded, decrypted, and applied locally.
-6. **Path Traversal Sanitization (`src/drive/models.rs`):**
-   - `sanitize_filename` strips directory traversal sequences (`../`, `..\`) and replaces invalid characters, ensuring safe Content-Disposition downloads.
-7. **Transient Failure Resilience & Rate-Limit Handling:**
-   - Remote Google Drive calls are wrapped in `retry_drive_op` supporting bounded exponential backoff with jitter and RFC 9110 `Retry-After` parsing on HTTP 429.
+9. **Safe Legacy SQLite Migration (`src/drive/migration.rs`):**
+   - For environments with pre-existing legacy SQLite user databases, `inspect_legacy_sqlite` discovers legacy records and `migrate_legacy_sqlite_to_drive` safely uploads and encrypts them to Google Drive.
+   - Source databases are strictly preserved and never dropped or deleted.
+10. **Path Traversal Sanitization (`src/drive/models.rs`):**
+    - `sanitize_filename` strips directory traversal sequences (`../`, `..\`) and replaces invalid characters, ensuring safe Content-Disposition downloads.
+11. **Transient Failure Resilience & Rate-Limit Handling:**
+    - Remote Google Drive calls are wrapped in `retry_drive_op` supporting bounded exponential backoff with jitter and RFC 9110 `Retry-After` parsing on HTTP 429.
 

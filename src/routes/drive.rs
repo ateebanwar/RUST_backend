@@ -1,22 +1,23 @@
 //! Google Drive chat and library synchronization HTTP routes.
 //!
-//! Conforms to MASTER_SPEC.md §15 & Phase 15 requirements:
-//! - Protected by existing authentication and authorization middleware (scope `drive`).
-//! - Extracts Google Drive OAuth token from `X-Drive-Token` header.
-//! - Local-first: chats and library items can be read and created offline.
-//! - Drive switch toggle (`POST /api/v1/drive/config`) defaults to OFF.
-//! - Bidirectional sync (`POST /api/v1/drive/sync`) with LWW conflict resolution.
+//! Conforms to MASTER_SPEC.md §15 and Master Directive:
+//! - Google Drive is the SOLE permanent storage for user data.
+//! - The backend is a stateless processing layer.
+//! - Both Google authentication (`AuthPrincipal`) and Drive authorization (`X-Drive-Token`)
+//!   are strictly mandatory (fail-closed, no anonymous local fallback).
+//! - Save-Confirmation: 201 Created / 200 OK is returned ONLY after the Google Drive operation
+//!   and manifest commit succeed and are verified.
+//! - Cold-start hydration: Conversations and Library items are fetched directly from Google Drive
+//!   when the ephemeral in-memory working cache is cold.
 //! - Independent Library lifecycle: Deleting a conversation NEVER deletes Library items.
-//! - Explicit Library deletion (`DELETE /api/v1/drive/library/{id}`).
 //! - Reinstall and bootstrap restore (`POST /api/v1/drive/restore`).
-//! - Safe logout (`POST /api/v1/drive/logout`) clears local cache without deleting remote data.
+//! - Safe logout (`POST /api/v1/drive/logout`) clears ephemeral in-memory cache without affecting Drive.
 
 use crate::AppState;
 use crate::auth::principal::AuthPrincipal;
 use crate::drive::{
-    CreateConversationRequest, CreateLibraryItemRequest, DriveConfigUpdate, DriveError,
-    LibraryItem, SyncConversation, SyncResult, SyncStatus, compute_sha256, decode_base64,
-    sanitize_filename,
+    CreateConversationRequest, CreateLibraryItemRequest, DriveConfigUpdate, LibraryItem,
+    SyncConversation, SyncResult, SyncStatus, compute_sha256, decode_base64, sanitize_filename,
 };
 use crate::errors::AppError;
 use axum::Json;
@@ -25,15 +26,20 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-/// Helper to extract authenticated owner subject from request extension.
+/// Extract authenticated owner subject from request extension.
+///
+/// Fails closed with 401 Unauthorized if principal is missing or invalid.
 fn get_owner_subject(principal: &Option<Extension<AuthPrincipal>>) -> Result<String, AppError> {
     match principal {
-        Some(Extension(p)) => Ok(p.subject.clone()),
-        None => Ok("anonymous_local".to_string()),
+        Some(Extension(p)) if !p.subject.trim().is_empty() => Ok(p.subject.clone()),
+        _ => Err(AppError::Unauthorized(
+            "Authentication required: Google login is mandatory for all user data operations"
+                .to_string(),
+        )),
     }
 }
 
-/// Helper to extract `X-Drive-Token` header.
+/// Extract optional `X-Drive-Token` header.
 fn get_drive_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("x-drive-token")
@@ -42,12 +48,27 @@ fn get_drive_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Extract and enforce required `X-Drive-Token` header.
+///
+/// Fails closed with 401 Unauthorized if token is missing or empty.
+fn require_drive_token(headers: &HeaderMap) -> Result<&str, AppError> {
+    get_drive_token(headers).ok_or_else(|| {
+        AppError::Unauthorized(
+            "Google Drive authorization required: missing or empty X-Drive-Token header"
+                .to_string(),
+        )
+    })
+}
+
 /// GET /api/v1/drive/status — Query synchronization status and pending change counts.
 pub async fn get_sync_status(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
 ) -> Result<(StatusCode, Json<SyncStatus>), AppError> {
-    let owner = get_owner_subject(&principal)?;
+    let owner = principal
+        .as_ref()
+        .map(|Extension(p)| p.subject.clone())
+        .unwrap_or_else(|| "anonymous".to_string());
     let status = state.sync_engine.get_status(&owner).await;
     Ok((StatusCode::OK, Json(status)))
 }
@@ -58,13 +79,16 @@ pub async fn update_sync_config(
     principal: Option<Extension<AuthPrincipal>>,
     Json(payload): Json<DriveConfigUpdate>,
 ) -> Result<(StatusCode, Json<SyncStatus>), AppError> {
-    let owner = get_owner_subject(&principal)?;
     if payload.enabled && !state.sync_engine.crypto().is_configured() {
         return Err(AppError::InvalidRequest(
             "Cannot enable Google Drive synchronization: DRIVE_ENCRYPTION_KEY is not configured or invalid on the backend server. A valid 32-byte key (64 hex characters) is strictly required.".to_string(),
         ));
     }
     state.sync_engine.set_sync_enabled(payload.enabled).await;
+    let owner = principal
+        .as_ref()
+        .map(|Extension(p)| p.subject.clone())
+        .unwrap_or_else(|| "anonymous".to_string());
     let status = state.sync_engine.get_status(&owner).await;
     Ok((StatusCode::OK, Json(status)))
 }
@@ -76,33 +100,43 @@ pub async fn trigger_sync(
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<SyncResult>), AppError> {
     let owner = get_owner_subject(&principal)?;
-    let token = get_drive_token(&headers).ok_or(DriveError::MissingDriveToken)?;
+    let token = require_drive_token(&headers)?;
 
     let result = state.sync_engine.sync(&owner, token).await?;
     Ok((StatusCode::OK, Json(result)))
 }
 
 /// GET /api/v1/drive/conversations — List all active conversations for the authenticated user.
+///
+/// Hydrates transparently from Google Drive if the in-memory cache is cold.
 pub async fn list_conversations(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Vec<SyncConversation>>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = get_drive_token(&headers);
+
     let list = state
         .sync_engine
-        .local_store()
-        .list_conversations(&owner)
-        .await;
+        .list_conversations_with_drive(&owner, token)
+        .await?;
+
     Ok((StatusCode::OK, Json(list)))
 }
 
-/// POST /api/v1/drive/conversations — Create or upsert a conversation locally (marked pending sync).
+/// POST /api/v1/drive/conversations — Create or upsert a conversation on Google Drive.
+///
+/// Confirms save only after Drive file write and manifest commit succeed.
 pub async fn create_conversation(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<SyncConversation>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = require_drive_token(&headers)?;
+
     let id = payload
         .id
         .filter(|s| !s.trim().is_empty())
@@ -113,43 +147,48 @@ pub async fn create_conversation(
 
     let saved = state
         .sync_engine
-        .local_store()
-        .upsert_conversation(&owner, conv)
+        .persist_conversation_to_drive(&owner, conv, token)
         .await?;
 
     Ok((StatusCode::CREATED, Json(saved)))
 }
 
 /// GET /api/v1/drive/conversations/{id} — Retrieve a single conversation by ID.
+///
+/// Hydrates transparently from Google Drive if not cached locally.
 pub async fn get_conversation(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<SyncConversation>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = get_drive_token(&headers);
+
     let conv = state
         .sync_engine
-        .local_store()
-        .get_conversation(&owner, &id)
-        .await
+        .get_or_hydrate_conversation(&owner, &id, token)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("Conversation '{id}' not found")))?;
 
     Ok((StatusCode::OK, Json(conv)))
 }
 
-/// DELETE /api/v1/drive/conversations/{id} — Soft-delete a conversation (tombstone).
+/// DELETE /api/v1/drive/conversations/{id} — Soft-delete a conversation on Google Drive.
 ///
 /// CRITICAL: Deleting a conversation NEVER deletes its referenced Library items!
 pub async fn delete_conversation(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = require_drive_token(&headers)?;
+
     let deleted = state
         .sync_engine
-        .local_store()
-        .delete_conversation(&owner, &id)
+        .delete_conversation_on_drive(&owner, &id, token)
         .await?;
 
     if deleted {
@@ -158,7 +197,7 @@ pub async fn delete_conversation(
             Json(json!({
                 "status": "deleted",
                 "conversation_id": id,
-                "message": "Conversation soft-deleted. Referenced Library items remain preserved."
+                "message": "Conversation soft-deleted on Google Drive. Referenced Library items remain preserved."
             })),
         ))
     } else {
@@ -170,23 +209,30 @@ pub async fn delete_conversation(
 pub async fn list_library_items(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Vec<LibraryItem>>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = get_drive_token(&headers);
+
     let list = state
         .sync_engine
-        .local_store()
-        .list_library_items(&owner)
-        .await;
+        .list_library_items_with_drive(&owner, token)
+        .await?;
+
     Ok((StatusCode::OK, Json(list)))
 }
 
-/// POST /api/v1/drive/library — Create or upload a new library item.
+/// POST /api/v1/drive/library — Create and upload a new library item to Google Drive.
+///
+/// Confirms save only after Drive binary upload and manifest commit succeed.
 pub async fn create_library_item(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateLibraryItemRequest>,
 ) -> Result<(StatusCode, Json<LibraryItem>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = require_drive_token(&headers)?;
 
     let clean_filename = sanitize_filename(&payload.filename);
     let raw_bytes = decode_base64(&payload.content_base64)
@@ -214,8 +260,7 @@ pub async fn create_library_item(
 
     let saved = state
         .sync_engine
-        .local_store()
-        .save_library_item(&owner, item, Some(raw_bytes))
+        .persist_library_item_to_drive(&owner, item, raw_bytes, token)
         .await?;
 
     Ok((StatusCode::CREATED, Json(saved)))
@@ -225,14 +270,16 @@ pub async fn create_library_item(
 pub async fn get_library_item(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<LibraryItem>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = get_drive_token(&headers);
+
     let item = state
         .sync_engine
-        .local_store()
-        .get_library_item(&owner, &id)
-        .await
+        .get_or_hydrate_library_item(&owner, &id, token)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("Library item '{id}' not found")))?;
 
     Ok((StatusCode::OK, Json(item)))
@@ -250,9 +297,8 @@ pub async fn get_library_item_content(
 
     let meta = state
         .sync_engine
-        .local_store()
-        .get_library_item(&owner, &id)
-        .await
+        .get_or_hydrate_library_item(&owner, &id, token)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("Library item '{id}' not found")))?;
 
     let bytes = state
@@ -274,17 +320,19 @@ pub async fn get_library_item_content(
     Ok(resp)
 }
 
-/// DELETE /api/v1/drive/library/{id} — Explicitly delete a library item.
+/// DELETE /api/v1/drive/library/{id} — Explicitly delete a library item on Google Drive.
 pub async fn delete_library_item(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    let token = require_drive_token(&headers)?;
+
     let deleted = state
         .sync_engine
-        .local_store()
-        .delete_library_item(&owner, &id)
+        .delete_library_item_on_drive(&owner, &id, token)
         .await?;
 
     if deleted {
@@ -293,7 +341,7 @@ pub async fn delete_library_item(
             Json(json!({
                 "status": "deleted",
                 "library_item_id": id,
-                "message": "Library item explicitly deleted."
+                "message": "Library item explicitly deleted on Google Drive."
             })),
         ))
     } else {
@@ -308,7 +356,7 @@ pub async fn restore_data(
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<SyncResult>), AppError> {
     let owner = get_owner_subject(&principal)?;
-    let token = get_drive_token(&headers).ok_or(DriveError::MissingDriveToken)?;
+    let token = require_drive_token(&headers)?;
 
     let result = state.sync_engine.restore(&owner, token).await?;
     Ok((StatusCode::OK, Json(result)))
@@ -316,7 +364,7 @@ pub async fn restore_data(
 
 /// POST /api/v1/drive/logout — Clear local in-memory session/cache for user.
 ///
-/// Remote Drive data is NEVER deleted.
+/// Remote Google Drive data is NEVER deleted.
 pub async fn logout_user(
     State(state): State<AppState>,
     principal: Option<Extension<AuthPrincipal>>,

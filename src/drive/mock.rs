@@ -22,6 +22,7 @@ pub struct MockFile {
     pub content: Vec<u8>,
     pub modified_time: String,
     pub spaces: String,
+    pub owner_token: String,
 }
 
 /// Thread-safe in-memory mock client implementing `DriveClient`.
@@ -159,7 +160,10 @@ impl DriveClient for MockDriveClient {
 
             let lock = self.files.read().await;
             for file in lock.values() {
-                if file.name == name && (spaces.is_empty() || file.spaces == spaces) {
+                if file.owner_token == token
+                    && file.name == name
+                    && (spaces.is_empty() || file.spaces == spaces)
+                {
                     return Ok(Some(DriveFileMetadata {
                         id: file.id.clone(),
                         name: file.name.clone(),
@@ -191,6 +195,11 @@ impl DriveClient for MockDriveClient {
             let id = match file_id {
                 Some(existing_id) => {
                     if let Some(existing) = lock.get_mut(existing_id) {
+                        if existing.owner_token != token {
+                            return Err(DriveError::NotFound(format!(
+                                "File ID {existing_id} does not exist"
+                            )));
+                        }
                         existing.content = content.to_vec();
                         existing.modified_time = now.clone();
                         existing.mime_type = mime_type.to_string();
@@ -213,6 +222,7 @@ impl DriveClient for MockDriveClient {
                         content: content.to_vec(),
                         modified_time: now.clone(),
                         spaces: spaces.to_string(),
+                        owner_token: token.to_string(),
                     };
                     lock.insert(generated_id.clone(), file);
                     generated_id
@@ -239,7 +249,11 @@ impl DriveClient for MockDriveClient {
 
             let lock = self.files.read().await;
             if let Some(file) = lock.get(file_id) {
-                Ok(file.content.clone())
+                if file.owner_token == token {
+                    Ok(file.content.clone())
+                } else {
+                    Err(DriveError::NotFound(format!("File {file_id} not found")))
+                }
             } else {
                 Err(DriveError::NotFound(format!("File {file_id} not found")))
             }
@@ -251,7 +265,11 @@ impl DriveClient for MockDriveClient {
             self.check_injections(token).await?;
 
             let mut lock = self.files.write().await;
-            lock.remove(file_id);
+            if let Some(file) = lock.get(file_id)
+                && file.owner_token == token
+            {
+                lock.remove(file_id);
+            }
             Ok(())
         })
     }
@@ -268,7 +286,7 @@ impl DriveClient for MockDriveClient {
             let lock = self.files.read().await;
             let mut list = Vec::new();
             for file in lock.values() {
-                if spaces.is_empty() || file.spaces == spaces {
+                if file.owner_token == token && (spaces.is_empty() || file.spaces == spaces) {
                     list.push(DriveFileMetadata {
                         id: file.id.clone(),
                         name: file.name.clone(),

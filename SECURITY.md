@@ -86,24 +86,34 @@ To prevent Server-Side Request Forgery (SSRF), cloud metadata exfiltration, and 
 
 ---
 
-## 5. Google Drive Least Privilege, Encryption & Token Security
+## 5. Google Drive Sole Permanent Storage, Least Privilege & Encryption
 
-1. **Restricted OAuth Scope:**
+1. **Google Drive as the Sole Permanent Store:**
+   - In accordance with Master Directive §2, Google Drive's hidden `appDataFolder` is the **sole permanent source of truth** for all user data (conversations, messages, attachments, library files, tombstones, and manifests).
+   - The backend operates strictly as a **stateless processing layer** with zero permanent user database tables (`local_sync_conversations`, `local_sync_library`, `local_sync_metadata` have been removed).
+   - In-memory state in `LocalSyncStore` is an ephemeral request-scoped working cache (`is_persistent() -> false`) that is completely dropped across process restarts.
+2. **Save-Confirmation Protocol & Fail-Closed Writes:**
+   - Mutating operations (`create_conversation`, `create_library_item`, `delete_conversation`, `delete_library_item`) follow a strict **save-confirmation protocol**: HTTP 200/201 responses are returned to the client ONLY after the payload is encrypted, successfully uploaded to Google Drive, and indexed in the remote manifest.
+   - If Google Drive rejects the write (e.g., token expiration, quota exceeded, network drop), the operation fails closed with an error response (e.g. HTTP 403 / 503) and no unpersisted success is acknowledged.
+3. **Restricted OAuth Scope:**
    - The backend strictly requires the narrowest possible Drive scope: `https://www.googleapis.com/auth/drive.appdata`.
    - This scope restricts the application to its own private, hidden Application Data folder (`spaces=appDataFolder`). It CANNOT view, list, modify, or delete any of the user's personal files, photos, or documents.
-2. **Ephemeral Transit & Zero Disk Token Storage:**
+4. **Ephemeral Transit & Zero Disk Token Storage:**
    - Google Drive access tokens are passed in request headers (`X-Drive-Token`) and processed entirely in ephemeral memory.
    - The backend NEVER stores Google OAuth refresh tokens or access tokens on disk, in SQLite, or in a permanent database.
    - All structured logging automatically redacts `X-Drive-Token` headers.
-3. **Authenticated Encryption with AAD Context Binding (`src/drive/crypto.rs`):**
+5. **Authenticated Encryption with AAD Context Binding (`src/drive/crypto.rs`):**
    - Prior to uploading to Google Drive, all conversation JSON and binary library payloads are encrypted using AES-256-GCM via `ring::aead`.
    - Associated Data (AAD) is strictly bound to `owner_subject:resource_id`. If ciphertext is copied or transplanted to a different user account or resource ID, decryption and tag verification fail in constant time.
-4. **Independent Chat & Library Lifecycles:**
-   - Soft-deleting a conversation marks the conversation deleted, but NEVER deletes associated Library items (uploaded files, media, generated documents).
+6. **Independent Chat & Library Lifecycles:**
+   - Soft-deleting a conversation marks the conversation deleted with a tombstone, but NEVER deletes associated Library items (uploaded files, media, generated documents).
    - Library items can only be deleted via explicit `DELETE /api/v1/drive/library/{id}` calls.
-5. **Path Traversal Protection (`src/drive/models.rs`):**
+7. **Safe Legacy SQLite Migration Safety (`src/drive/migration.rs`):**
+   - Pre-existing legacy SQLite user databases are safely discovered via `inspect_legacy_sqlite` and migrated to Google Drive via `migrate_legacy_sqlite_to_drive`.
+   - Source databases are strictly preserved and never dropped or deleted during or after migration.
+8. **Path Traversal Protection (`src/drive/models.rs`):**
    - Uploaded library filenames are sanitized via `sanitize_filename`, which rejects directory traversal sequences (`../`, `..\`) and replaces illegal characters, preventing directory escape during download.
-6. **Safe Logout & Disconnect Semantics:**
+9. **Safe Logout & Disconnect Semantics:**
    - Calling `POST /api/v1/drive/logout` terminates the local in-memory session only. Remote Google Drive backups and library items must NEVER be deleted upon logout.
 
 

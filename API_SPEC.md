@@ -261,6 +261,7 @@ All error responses (HTTP 4xx and 5xx) must strictly conform to the canonical er
       "content": "Explain how Axum handles Tower middleware layers."
     }
   ],
+  "conversation_id": "conv_drive_123",
   "routing_mode": "auto",
   "requested_model_id": null,
   "temperature": 0.7,
@@ -272,6 +273,7 @@ All error responses (HTTP 4xx and 5xx) must strictly conform to the canonical er
   - `messages`: Required, array of 1 to 50 message objects.
   - `messages[].role`: Required, enum (`system`, `user`, `assistant`).
   - `messages[].content`: Required, string, 1 to 100,000 characters.
+  - `conversation_id`: Optional string. When provided, automatically hydrates model-agnostic chat history from Google Drive, validates tenant ownership, and atomically appends updated user and assistant messages back to Google Drive upon completion.
   - `temperature`: Optional, float between `0.0` and `2.0`. Default: `0.7`.
   - `max_tokens`: Optional, integer between `1` and `32768`.
   - `stream`: Boolean, must be `false` for buffered endpoint.
@@ -372,47 +374,124 @@ data: {"status":"completed"}
 
 ---
 
-## 7. Google Drive Chat History Sync Endpoints
+## 7. Google Drive-Only Storage & Synchronization Endpoints
 
-### 7.1 Incremental Synchronization
-- **Method & Path:** `POST /api/v1/drive/sync`
-- **Authentication:** Required (`Authorization: Bearer <google_id_token>`)
-- **Required Header:** `X-Drive-Token: <oauth_access_token_with_drive_appdata_scope>`
-- **Request Body Schema:**
-```json
-{
-  "client_last_sync_timestamp": "2026-10-19T16:00:00Z",
-  "local_updates": [
-    {
-      "chat_id": "c_9f83a1b2...",
-      "title": "Rust Backend Architecture",
-      "updated_at": "2026-10-19T16:45:00Z",
-      "version": 3,
-      "messages": [
-        {
-          "id": "m_01h7x9...",
-          "role": "user",
-          "content": "How does Drive sync handle conflict resolution?",
-          "timestamp": "2026-10-19T16:45:00Z"
-        }
-      ]
-    }
-  ]
-}
-```
+### 7.1 Architecture & Security Rules
+- **Sole Permanent Store:** Google Drive (`appDataFolder`, `drive.appdata` scope) is the **sole permanent source of truth** for all user data (conversations, messages, attachments, library files, tombstones, and manifests).
+- **Stateless Backend:** The backend maintains **zero permanent user database tables** (SQLite user tables `local_sync_conversations`, `local_sync_library`, `local_sync_metadata` have been removed). The local store is strictly an ephemeral in-memory working cache (`is_persistent() -> false`).
+- **Save-Confirmation Protocol:** All create/update endpoints return HTTP 200/201 confirmation **only after** the payload has been encrypted with AES-256-GCM, uploaded to Google Drive, and indexed in the authoritative remote `manifest.json`.
+- **Fail-Closed Authentication:** All user data operations strictly mandate valid Google authentication (`AuthPrincipal`) and the `X-Drive-Token` header.
+- **Independent Library Lifecycle:** Deleting a conversation NEVER deletes its associated Library items. Library items can only be removed via explicit library deletion.
+
+### 7.2 Configuration & Status Endpoints
+
+#### GET /api/v1/drive/status
+- **Authentication:** Optional for basic status; authenticated for user-scoped sync stats.
 - **Response Schema (200 OK):**
 ```json
 {
-  "sync_timestamp": "2026-10-19T17:00:00Z",
-  "remote_updates": [],
-  "conflicts_resolved": [
-    {
-      "chat_id": "c_9f83a1b2...",
-      "resolution": "client_timestamp_won"
-    }
-  ]
+  "sync_enabled": true,
+  "last_sync_time": "2026-10-22T14:30:00Z",
+  "pending_conversations": 0,
+  "pending_library_items": 0,
+  "last_error": null
 }
 ```
+
+#### POST /api/v1/drive/config
+- **Authentication:** Optional
+- **Request Body Schema:**
+```json
+{
+  "enabled": true
+}
+```
+- **Response Schema (200 OK):** Returns updated `SyncStatus`. If `enabled: true` is requested when `DRIVE_ENCRYPTION_KEY` is not configured, returns `400 Bad Request`.
+
+### 7.3 Conversation Endpoints
+
+#### GET /api/v1/drive/conversations
+- **Authentication:** Required (`Authorization: Bearer <google_id_token>`)
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (optional; if working cache is empty, hydrates from Drive)
+- **Response Schema (200 OK):** Array of active `SyncConversation` objects.
+
+#### GET /api/v1/drive/conversations/{id}
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>`
+- **Response Schema (200 OK):** Hydrated `SyncConversation` object.
+
+#### POST /api/v1/drive/conversations
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (mandatory)
+- **Request Body Schema:** `SyncConversation` JSON.
+- **Response Schema (201 Created):** Returns confirmed `SyncConversation` persisted to Google Drive.
+
+#### DELETE /api/v1/drive/conversations/{id}
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (mandatory)
+- **Response Schema (200 OK):** Confirms soft-delete tombstone written to Drive. Associated Library items remain intact.
+
+### 7.4 Library Endpoints
+
+#### GET /api/v1/drive/library
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (optional; hydrates from Drive on cache miss)
+- **Response Schema (200 OK):** Array of active `LibraryItem` metadata objects.
+
+#### GET /api/v1/drive/library/{id}
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>`
+- **Response Schema (200 OK):** Hydrated `LibraryItem` metadata.
+
+#### GET /api/v1/drive/library/{id}/content
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (mandatory)
+- **Response (200 OK):** Decrypted raw binary bytes with `Content-Type`, `Content-Disposition`, and SHA-256 checksum verification.
+
+#### POST /api/v1/drive/library
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (mandatory)
+- **Request Body Schema:**
+```json
+{
+  "filename": "document.pdf",
+  "mime_type": "application/pdf",
+  "content_base64": "JVBERi0xLjQK...",
+  "conversation_id": "conv_123"
+}
+```
+- **Response Schema (201 Created):** Confirms binary upload and metadata indexing to Drive.
+
+#### DELETE /api/v1/drive/library/{id}
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (mandatory)
+- **Response Schema (200 OK):** Confirms explicit deletion of library item and remote Drive blob.
+
+### 7.5 Synchronization, Restore & Session Endpoints
+
+#### POST /api/v1/drive/sync
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (mandatory)
+- **Response Schema (200 OK):**
+```json
+{
+  "uploaded_conversations": 1,
+  "downloaded_conversations": 0,
+  "uploaded_library_items": 1,
+  "downloaded_library_items": 0,
+  "conflicts_resolved": 0,
+  "last_sync_time": "2026-10-22T14:35:00Z"
+}
+```
+
+#### POST /api/v1/drive/restore
+- **Authentication:** Required
+- **Headers:** `X-Drive-Token: <oauth_access_token>` (mandatory)
+- **Response Schema (200 OK):** Full bootstrap restoration from remote Drive manifest.
+
+#### POST /api/v1/drive/logout
+- **Authentication:** Required
+- **Response Schema (200 OK):** Clears ephemeral in-memory working cache. Remote Drive files are never touched.
 
 ---
 
