@@ -130,7 +130,8 @@ async fn test_chat_deletion_leaves_library_items_intact() {
     sync_engine
         .local_store()
         .upsert_conversation(owner, conv)
-        .await;
+        .await
+        .unwrap();
 
     // 2. Create a library item associated with this conversation
     let raw_photo = b"JPEG_IMAGE_DATA_5544332211";
@@ -146,7 +147,8 @@ async fn test_chat_deletion_leaves_library_items_intact() {
     sync_engine
         .local_store()
         .save_library_item(owner, lib_item, Some(raw_photo.to_vec()))
-        .await;
+        .await
+        .unwrap();
 
     // Verify conversation and library item both exist
     assert!(
@@ -260,7 +262,8 @@ async fn test_library_sync_to_google_drive() {
     sync_engine
         .local_store()
         .save_library_item(owner, lib_item, Some(raw_file.to_vec()))
-        .await;
+        .await
+        .unwrap();
 
     // Trigger sync
     let sync_res = sync_engine.sync(owner, token).await.unwrap();

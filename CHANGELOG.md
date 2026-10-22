@@ -2,6 +2,68 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Phase 15 Durable Persistence: SQLite LocalSyncStore Persistence & Crash Safety
+
+### Persistence Hardening & Restart Survival
+- **Durable SQLite Backing for `LocalSyncStore` (`src/drive/local_store.rs`):**
+  - Replaced transient in-memory-only storage with a write-through cache backed by SQLite (`rusqlite` bundled).
+  - Designed and implemented 3 dedicated tables:
+    - `local_sync_conversations`: `id`, `owner_subject`, `title`, `created_at`, `updated_at`, `revision`, `schema_version`, `deleted`, `deleted_at`, `is_dirty`, `drive_file_id`, `messages_json` (PRIMARY KEY `(owner_subject, id)`).
+    - `local_sync_library`: `id`, `owner_subject`, `filename`, `mime_type`, `size_bytes`, `checksum_sha256`, `created_at`, `updated_at`, `conversation_id`, `drive_file_id`, `deleted`, `deleted_at`, `schema_version`, `is_dirty`, `content` BLOB (PRIMARY KEY `(owner_subject, id)`).
+    - `local_sync_metadata`: `owner_subject` PRIMARY KEY, `last_sync_time`, `last_error`.
+  - Added indexes on `(owner_subject)` and `(owner_subject, is_dirty)` for sub-millisecond dirty query execution.
+  - Implemented `LocalSyncStore::open(db_path)` and `LocalSyncStore::from_connection(conn)`.
+- **Automatic Startup Recovery & Validation:**
+  - On store creation, idempotent schema migrations run automatically (`CREATE TABLE IF NOT EXISTS`).
+  - Preloads all persisted conversations, messages, library items, binary payloads, dirty tracking flags, Drive file ID associations, revisions, and sync stats into in-memory cache with zero runtime blocking.
+  - Corrupt or malformed row protection: If a record contains invalid JSON messages, a warning is logged and the record defaults safely to empty messages rather than aborting reload or crashing.
+- **Fail-Closed Write Error Handling:**
+  - Mutating methods (`upsert_conversation`, `delete_conversation`, `save_library_item`, `delete_library_item`, `mark_*_synced`, `apply_remote_*`, `update_sync_status`, `clear_user_session`) return strongly typed `Result<_, LocalStoreError>`.
+  - If a database write fails (disk full, lock failure, I/O error), the in-memory cache is NOT modified, and the error propagates immediately (`From<LocalStoreError>` to `AppError::InternalError` and `DriveError::Internal`), ensuring failed writes never appear silently successful.
+- **Production Integration (`src/lib.rs`):**
+  - Updated `default_sync_engine` to attach `LocalSyncStore` directly to `config.database_path` / `usage_storage.conn()`, guaranteeing that live production backend instances persist all local sync state across restarts.
+- **Multi-Tenant Logout Isolation:**
+  - `clear_user_session(owner)` executes an atomic SQLite transaction deleting local data for that specific owner while strictly preserving remote Google Drive data and all other tenants' data.
+- **Automated Persistence Test Suite (`tests/local_store_persistence_test.rs`):**
+  - 9 comprehensive integration tests covering write & recreate persistence, restart with tombstones & sync state, auto-creation of missing paths, corruption safety & recovery, failed write detection, high concurrency (10 concurrent tasks, 100 items), repeated initialization & revision monotonicity, AppState server restart compatibility & encryption fail-closed safety, and multi-tenant logout isolation.
+- **Verification Results:**
+  - `cargo fmt --check`: Clean (0 diffs).
+  - `cargo check --all-targets --all-features`: Clean (0 warnings).
+  - `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+  - `cargo test --all-targets --all-features`: 417 tests passing across 26 targets with 0 failures (100% pass rate).
+  - `cargo build --release`: Clean (compiled release binary in 1m 06s).
+
+---
+
+## 2026-10-22 — Phase 15 Critical Security Hardening: Elimination of Insecure Encryption Key Fallback
+
+### Security Hardening & Root Cause Remediation
+- **Complete Elimination of Insecure Production Key Fallback:**
+  - Removed `master = [0x5au8; 32]` and `derive_for_owner(&master, "ai-backend-default")` from `src/lib.rs`.
+  - Replaced silent fallback substitution with explicit `DriveCryptoState::Unconfigured { reason }` that fails closed with `CryptoError::KeyMissing` on any attempt to encrypt or decrypt.
+- **Strict Key Validation & Zero Silent Mutation:**
+  - Enforced strict 64-character hexadecimal format (exactly 32 bytes for AES-256-GCM) in both `DriveCryptoEngine::from_hex` and `AppConfig::validate()`.
+  - Removed silent trimming (`.trim()`), padding, and truncation. Any malformed key, empty key, or incorrect length is rejected immediately.
+  - Fail-closed initialization: If `google_drive_sync_enabled == true` and `DRIVE_ENCRYPTION_KEY` is missing or invalid, application startup aborts with a clear, safe validation error.
+- **Secret Redaction by Default:**
+  - `fmt::Debug for DriveCryptoEngine` outputs only `{ configured: bool, key_fingerprint: "prefix..." }`, never printing raw key bytes.
+  - `fmt::Debug for AppConfig` explicitly redacts `drive_encryption_key` as `"[REDACTED]"`.
+  - Configuration error envelopes report `key: "DRIVE_ENCRYPTION_KEY", value: "[REDACTED]"`, strictly preventing secrets from leaking in logs or error bodies.
+- **Runtime Early-Check Defenses:**
+  - Added early check in `POST /api/v1/drive/config` (`update_sync_config`): Enabling sync when crypto is unconfigured fails immediately with an informative, safe 400 Bad Request error.
+  - Added early checks in `SyncEngine::sync`, `SyncEngine::restore`, and `SyncEngine::get_library_item_content` to fail closed before initiating Google Drive network requests.
+- **Automated Lifecycle Test Suite:**
+  - Added 16 focused security and lifecycle integration tests in `tests/encryption_key_lifecycle_test.rs` covering valid key acceptance, roundtrip encryption/decryption, format backwards-compatibility, rejection of missing/empty/malformed/short/long keys, tag tampering rejection, restart determinism with identical key, restart mismatch rejection, failure preservation of existing data, and zero leak in debug logs.
+- **Verification Results:**
+  - `cargo fmt --check`: Clean (0 diffs).
+  - `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+  - `cargo test --all-targets --all-features`: 408 tests passing across 25 targets with 0 failures (100% pass rate).
+  - `cargo audit -n`: Clean (0 vulnerabilities across 183 dependencies).
+  - `gitleaks git -v`: Clean (0 leaks in git history).
+  - `cargo build --release`: Clean (compiled release binary in 58s).
+
+---
+
 ## 2026-10-22 — Phase 15: Production-Grade Google Drive Integration, Chat Sync, Library Sync, Encryption, Restore & Verification
 
 ### Implemented, Hardened & Verified

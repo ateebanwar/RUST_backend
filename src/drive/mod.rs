@@ -16,7 +16,7 @@ pub mod sync_engine;
 
 pub use client::{DriveClient, DriveError, DriveFileMetadata, GoogleDriveClient};
 pub use crypto::{DriveCryptoEngine, compute_sha256, decode_base64, encode_base64};
-pub use local_store::LocalSyncStore;
+pub use local_store::{LocalStoreError, LocalSyncStore};
 pub use mock::MockDriveClient;
 pub use models::{
     CURRENT_SCHEMA_VERSION, ConversationIndexEntry, CreateConversationRequest,

@@ -64,26 +64,56 @@ pub struct AppState {
     pub start_time: std::time::Instant,
 }
 
-fn default_sync_engine(config: &AppConfig) -> Arc<crate::drive::SyncEngine> {
+fn default_sync_engine(
+    config: &AppConfig,
+    conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+) -> Arc<crate::drive::SyncEngine> {
     let drive_crypto = if let Some(hex_key) = &config.drive_encryption_key {
-        Arc::new(
-            crate::drive::DriveCryptoEngine::from_hex(hex_key).unwrap_or_else(|_| {
-                let master = [0x5au8; 32];
-                crate::drive::DriveCryptoEngine::derive_for_owner(&master, "ai-backend-default")
-            }),
-        )
+        match crate::drive::DriveCryptoEngine::from_hex(hex_key) {
+            Ok(engine) => Arc::new(engine),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Configured DRIVE_ENCRYPTION_KEY is invalid; encryption disabled until valid key is provided"
+                );
+                Arc::new(crate::drive::DriveCryptoEngine::unconfigured(format!(
+                    "Invalid DRIVE_ENCRYPTION_KEY: {e}"
+                )))
+            }
+        }
     } else {
-        let master = [0x5au8; 32];
-        Arc::new(crate::drive::DriveCryptoEngine::derive_for_owner(
-            &master,
-            "ai-backend-default",
+        Arc::new(crate::drive::DriveCryptoEngine::unconfigured(
+            "DRIVE_ENCRYPTION_KEY environment variable is not configured",
         ))
     };
     let drive_client = Arc::new(crate::drive::GoogleDriveClient::new(
         config.google_drive_timeout_secs,
         config.google_drive_max_retries,
     ));
-    let local_sync_store = Arc::new(crate::drive::LocalSyncStore::new());
+    let local_sync_store = if let Some(conn) = conn {
+        match crate::drive::LocalSyncStore::from_connection(conn) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Failed to initialize persistent LocalSyncStore from connection; falling back to in-memory store"
+                );
+                Arc::new(crate::drive::LocalSyncStore::new())
+            }
+        }
+    } else {
+        match crate::drive::LocalSyncStore::open(&config.database_path) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                tracing::error!(
+                    path = %config.database_path,
+                    error = %e,
+                    "Failed to open persistent LocalSyncStore at database_path; falling back to in-memory store"
+                );
+                Arc::new(crate::drive::LocalSyncStore::new())
+            }
+        }
+    };
     Arc::new(crate::drive::SyncEngine::new(
         drive_client,
         drive_crypto,
@@ -252,7 +282,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config),
+            sync_engine: default_sync_engine(&config, Some(usage_storage.conn())),
             start_time: std::time::Instant::now(),
         }
     }
@@ -298,7 +328,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config),
+            sync_engine: default_sync_engine(&config, Some(storage.conn())),
             start_time: std::time::Instant::now(),
         }
     }
@@ -344,7 +374,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config),
+            sync_engine: default_sync_engine(&config, Some(storage.conn())),
             start_time: std::time::Instant::now(),
         }
     }
@@ -385,11 +415,11 @@ impl AppState {
             providers,
             router,
             inference,
-            usage,
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config),
+            sync_engine: default_sync_engine(&config, Some(usage.storage().conn())),
+            usage,
             start_time: std::time::Instant::now(),
         }
     }

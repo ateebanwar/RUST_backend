@@ -59,6 +59,11 @@ pub async fn update_sync_config(
     Json(payload): Json<DriveConfigUpdate>,
 ) -> Result<(StatusCode, Json<SyncStatus>), AppError> {
     let owner = get_owner_subject(&principal)?;
+    if payload.enabled && !state.sync_engine.crypto().is_configured() {
+        return Err(AppError::InvalidRequest(
+            "Cannot enable Google Drive synchronization: DRIVE_ENCRYPTION_KEY is not configured or invalid on the backend server. A valid 32-byte key (64 hex characters) is strictly required.".to_string(),
+        ));
+    }
     state.sync_engine.set_sync_enabled(payload.enabled).await;
     let status = state.sync_engine.get_status(&owner).await;
     Ok((StatusCode::OK, Json(status)))
@@ -110,7 +115,7 @@ pub async fn create_conversation(
         .sync_engine
         .local_store()
         .upsert_conversation(&owner, conv)
-        .await;
+        .await?;
 
     Ok((StatusCode::CREATED, Json(saved)))
 }
@@ -145,7 +150,7 @@ pub async fn delete_conversation(
         .sync_engine
         .local_store()
         .delete_conversation(&owner, &id)
-        .await;
+        .await?;
 
     if deleted {
         Ok((
@@ -211,7 +216,7 @@ pub async fn create_library_item(
         .sync_engine
         .local_store()
         .save_library_item(&owner, item, Some(raw_bytes))
-        .await;
+        .await?;
 
     Ok((StatusCode::CREATED, Json(saved)))
 }
@@ -280,7 +285,7 @@ pub async fn delete_library_item(
         .sync_engine
         .local_store()
         .delete_library_item(&owner, &id)
-        .await;
+        .await?;
 
     if deleted {
         Ok((
@@ -321,7 +326,7 @@ pub async fn logout_user(
         .sync_engine
         .local_store()
         .clear_user_session(&owner)
-        .await;
+        .await?;
 
     Ok((
         StatusCode::OK,

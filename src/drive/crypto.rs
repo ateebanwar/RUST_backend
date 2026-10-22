@@ -15,24 +15,41 @@ use ring::hmac;
 use std::fmt;
 
 /// Errors arising during Drive cryptographic operations.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CryptoError {
+    /// Encryption key is not configured.
+    KeyMissing(String),
+    /// Encryption key is empty.
+    EmptyKey,
+    /// Key length does not match required AES-256 size (32 bytes / 64 hex characters).
     InvalidKeyLength { expected: usize, actual: usize },
+    /// Key string contains non-hexadecimal characters or malformed encoding.
+    InvalidKeyEncoding(String),
+    /// Cryptographic sealing failure (e.g. CSPRNG failure).
     EncryptionFailed(String),
+    /// Decryption or Poly1305 authentication tag verification failed.
     DecryptionFailed(String),
+    /// Base64 decode error.
     Base64DecodeError(String),
+    /// Hex decode error.
     HexDecodeError(String),
 }
 
 impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::KeyMissing(msg) => write!(f, "Encryption key missing: {msg}"),
+            Self::EmptyKey => write!(f, "Encryption key must not be empty"),
             Self::InvalidKeyLength { expected, actual } => {
                 write!(f, "Invalid key length: expected {expected}, got {actual}")
             }
+            Self::InvalidKeyEncoding(msg) => write!(f, "Invalid key encoding: {msg}"),
             Self::EncryptionFailed(msg) => write!(f, "Encryption failed: {msg}"),
             Self::DecryptionFailed(msg) => {
-                write!(f, "Decryption or tag verification failed: {msg}")
+                write!(
+                    f,
+                    "Decryption or authentication tag verification failed: {msg}"
+                )
             }
             Self::Base64DecodeError(msg) => write!(f, "Base64 decode error: {msg}"),
             Self::HexDecodeError(msg) => write!(f, "Hex decode error: {msg}"),
@@ -48,6 +65,7 @@ impl From<EncryptionError> for CryptoError {
             EncryptionError::InvalidKeyLength { expected, actual } => {
                 Self::InvalidKeyLength { expected, actual }
             }
+            EncryptionError::InvalidKeyEncoding(msg) => Self::InvalidKeyEncoding(msg),
             EncryptionError::DecryptionFailed => Self::DecryptionFailed(
                 "Ciphertext authentication tag verification failed".to_string(),
             ),
@@ -56,26 +74,111 @@ impl From<EncryptionError> for CryptoError {
     }
 }
 
+/// Internal state of the Drive cryptographic engine.
+#[derive(Clone)]
+enum DriveCryptoState {
+    Configured {
+        cipher: AesGcmCipher,
+        key_fingerprint: String,
+    },
+    Unconfigured {
+        reason: String,
+    },
+}
+
 /// Dedicated cryptographic engine for securing user data prior to Google Drive synchronization.
 #[derive(Clone)]
 pub struct DriveCryptoEngine {
-    cipher: AesGcmCipher,
+    state: DriveCryptoState,
 }
 
 impl DriveCryptoEngine {
     /// Initialize with a direct 32-byte AES-256 key.
     pub fn new(key: &[u8]) -> Result<Self, CryptoError> {
+        if key.is_empty() {
+            return Err(CryptoError::EmptyKey);
+        }
+        if key.len() != AES_256_KEY_LEN {
+            return Err(CryptoError::InvalidKeyLength {
+                expected: AES_256_KEY_LEN,
+                actual: key.len(),
+            });
+        }
         let cipher = AesGcmCipher::new(key)?;
-        Ok(Self { cipher })
+        let key_fingerprint = compute_sha256(key);
+        Ok(Self {
+            state: DriveCryptoState::Configured {
+                cipher,
+                key_fingerprint,
+            },
+        })
     }
 
-    /// Initialize from a 64-character hexadecimal key string.
+    /// Initialize from an exact 64-character hexadecimal key string.
+    ///
+    /// Conforms to strict security requirements:
+    /// - Rejects empty keys.
+    /// - Rejects keys whose length != 64 (never silently trims, truncates, or pads).
+    /// - Rejects non-hex characters.
+    /// - Decodes to exactly 32 bytes for AES-256-GCM.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn from_hex(hex_key: &str) -> Result<Self, CryptoError> {
-        let cipher = AesGcmCipher::from_hex(hex_key)?;
-        Ok(Self { cipher })
+        if hex_key.is_empty() {
+            return Err(CryptoError::EmptyKey);
+        }
+        if hex_key.len() != AES_256_KEY_LEN * 2 {
+            return Err(CryptoError::InvalidKeyLength {
+                expected: AES_256_KEY_LEN * 2,
+                actual: hex_key.len(),
+            });
+        }
+        if !hex_key.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(CryptoError::InvalidKeyEncoding(
+                "Key contains invalid hexadecimal characters. Expected 64 hex characters (0-9, a-f, A-F)."
+                    .to_string(),
+            ));
+        }
+
+        let mut key_bytes = [0u8; AES_256_KEY_LEN];
+        for (i, chunk) in hex_key.as_bytes().chunks_exact(2).enumerate() {
+            let s = std::str::from_utf8(chunk)
+                .map_err(|e| CryptoError::InvalidKeyEncoding(e.to_string()))?;
+            key_bytes[i] = u8::from_str_radix(s, 16)
+                .map_err(|e| CryptoError::InvalidKeyEncoding(e.to_string()))?;
+        }
+
+        Self::new(&key_bytes)
+    }
+
+    /// Create an unconfigured crypto engine with an explicit reason.
+    ///
+    /// Calling `encrypt` or `decrypt` will fail closed with `CryptoError::KeyMissing`.
+    pub fn unconfigured(reason: impl Into<String>) -> Self {
+        Self {
+            state: DriveCryptoState::Unconfigured {
+                reason: reason.into(),
+            },
+        }
+    }
+
+    /// Check if the crypto engine is configured with a valid encryption key.
+    pub fn is_configured(&self) -> bool {
+        matches!(self.state, DriveCryptoState::Configured { .. })
+    }
+
+    /// Return the SHA-256 fingerprint of the configured key, if configured.
+    pub fn key_fingerprint(&self) -> Option<&str> {
+        match &self.state {
+            DriveCryptoState::Configured {
+                key_fingerprint, ..
+            } => Some(key_fingerprint),
+            DriveCryptoState::Unconfigured { .. } => None,
+        }
     }
 
     /// Derive a tenant-specific 32-byte key from a master secret and owner subject using HMAC-SHA256.
+    ///
+    /// Provided for isolated test fixtures. Never used as a fallback in production code.
     pub fn derive_for_owner(master_secret: &[u8], owner_subject: &str) -> Self {
         let s_key = hmac::Key::new(hmac::HMAC_SHA256, master_secret);
         let tag = hmac::sign(&s_key, owner_subject.as_bytes());
@@ -96,8 +199,15 @@ impl DriveCryptoEngine {
         resource_id: &str,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        let aad = Self::aad_binding(owner_subject, resource_id);
-        self.cipher.encrypt(plaintext, &aad).map_err(Into::into)
+        match &self.state {
+            DriveCryptoState::Configured { cipher, .. } => {
+                let aad = Self::aad_binding(owner_subject, resource_id);
+                cipher.encrypt(plaintext, &aad).map_err(Into::into)
+            }
+            DriveCryptoState::Unconfigured { reason } => Err(CryptoError::KeyMissing(format!(
+                "Cannot encrypt data: encryption key is not configured ({reason}). Set DRIVE_ENCRYPTION_KEY environment variable (64-character hexadecimal string)."
+            ))),
+        }
     }
 
     /// Decrypt ciphertext verifying AAD binding and 128-bit authentication tag.
@@ -107,8 +217,46 @@ impl DriveCryptoEngine {
         resource_id: &str,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        let aad = Self::aad_binding(owner_subject, resource_id);
-        self.cipher.decrypt(ciphertext, &aad).map_err(Into::into)
+        match &self.state {
+            DriveCryptoState::Configured { cipher, .. } => {
+                let aad = Self::aad_binding(owner_subject, resource_id);
+                cipher.decrypt(ciphertext, &aad).map_err(|e| match e {
+                    EncryptionError::DecryptionFailed => CryptoError::DecryptionFailed(
+                        "Decryption or authentication tag verification failed. Ciphertext may have been modified, or decrypted with the wrong key."
+                            .to_string(),
+                    ),
+                    other => other.into(),
+                })
+            }
+            DriveCryptoState::Unconfigured { reason } => Err(CryptoError::KeyMissing(format!(
+                "Cannot decrypt data: encryption key is not configured ({reason}). The original 32-byte key (DRIVE_ENCRYPTION_KEY) is required."
+            ))),
+        }
+    }
+}
+
+impl fmt::Debug for DriveCryptoEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.state {
+            DriveCryptoState::Configured {
+                key_fingerprint, ..
+            } => {
+                let prefix = if key_fingerprint.len() >= 8 {
+                    &key_fingerprint[..8]
+                } else {
+                    key_fingerprint
+                };
+                f.debug_struct("DriveCryptoEngine")
+                    .field("configured", &true)
+                    .field("key_fingerprint", &format!("{prefix}..."))
+                    .finish()
+            }
+            DriveCryptoState::Unconfigured { reason } => f
+                .debug_struct("DriveCryptoEngine")
+                .field("configured", &false)
+                .field("reason", reason)
+                .finish(),
+        }
     }
 }
 

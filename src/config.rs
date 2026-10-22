@@ -1050,6 +1050,41 @@ impl AppConfig {
             }
         }
 
+        // --- Phase 15: Google Drive encryption key validation ---
+        if let Some(ref key) = self.drive_encryption_key {
+            if key.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    key: "DRIVE_ENCRYPTION_KEY",
+                    value: "[REDACTED]".to_string(),
+                    reason: "DRIVE_ENCRYPTION_KEY must not be empty",
+                });
+            }
+
+            if key.len() != 64 {
+                return Err(ConfigError::InvalidValue {
+                    key: "DRIVE_ENCRYPTION_KEY",
+                    value: "[REDACTED]".to_string(),
+                    reason: "DRIVE_ENCRYPTION_KEY must be exactly 64 hexadecimal characters (32 bytes for AES-256)",
+                });
+            }
+
+            if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConfigError::InvalidValue {
+                    key: "DRIVE_ENCRYPTION_KEY",
+                    value: "[REDACTED]".to_string(),
+                    reason: "DRIVE_ENCRYPTION_KEY must contain only hexadecimal characters (0-9, a-f, A-F)",
+                });
+            }
+        }
+
+        if self.google_drive_sync_enabled && self.drive_encryption_key.is_none() {
+            return Err(ConfigError::InvalidValue {
+                key: "DRIVE_ENCRYPTION_KEY",
+                value: "[MISSING]".to_string(),
+                reason: "DRIVE_ENCRYPTION_KEY is required when Google Drive synchronization is enabled (GOOGLE_DRIVE_SYNC_ENABLED=true)",
+            });
+        }
+
         Ok(())
     }
 }
@@ -1129,6 +1164,12 @@ impl fmt::Debug for AppConfig {
             .field(
                 "outbound_connect_timeout_secs",
                 &self.outbound_connect_timeout_secs,
+            )
+            .field("google_drive_sync_enabled", &self.google_drive_sync_enabled)
+            .field("google_drive_folder_name", &self.google_drive_folder_name)
+            .field(
+                "drive_encryption_key",
+                &self.drive_encryption_key.as_ref().map(|_| "[REDACTED]"),
             )
             .finish()
     }

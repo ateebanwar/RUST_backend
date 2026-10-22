@@ -125,15 +125,23 @@ impl SyncEngine {
             return Err(DriveError::SyncDisabled);
         }
 
+        if !self.crypto.is_configured() {
+            return Err(DriveError::CryptoError(
+                "Cannot synchronize: encryption key is not configured. Set DRIVE_ENCRYPTION_KEY environment variable (64-character hexadecimal string).".to_string(),
+            ));
+        }
+
         let run_result = self.execute_sync_cycle(owner, drive_token).await;
         match &run_result {
             Ok(res) => {
-                self.local_store
+                let _ = self
+                    .local_store
                     .update_sync_status(owner, Some(res.last_sync_time.clone()), None)
                     .await;
             }
             Err(err) => {
-                self.local_store
+                let _ = self
+                    .local_store
                     .update_sync_status(owner, None, Some(err.to_string()))
                     .await;
             }
@@ -228,7 +236,7 @@ impl SyncEngine {
 
                 self.local_store
                     .apply_remote_conversation(owner, remote_conv, drive_file_id.clone())
-                    .await;
+                    .await?;
                 downloaded_convs += 1;
             }
         }
@@ -260,7 +268,7 @@ impl SyncEngine {
 
             self.local_store
                 .mark_conversation_synced(owner, &conv.id, meta.id.clone())
-                .await;
+                .await?;
 
             // Update manifest index entry
             manifest.conversations.insert(
@@ -310,7 +318,7 @@ impl SyncEngine {
             if let Some(did) = &drive_id {
                 self.local_store
                     .mark_library_item_synced(owner, &item.id, did.clone())
-                    .await;
+                    .await?;
             }
 
             manifest.library_items.insert(
@@ -364,6 +372,12 @@ impl SyncEngine {
 
     /// Restore all data from Google Drive (bootstrap on clean device or reinstall).
     pub async fn restore(&self, owner: &str, drive_token: &str) -> Result<SyncResult, DriveError> {
+        if !self.crypto.is_configured() {
+            return Err(DriveError::CryptoError(
+                "Cannot restore: encryption key is not configured. The original 32-byte key (DRIVE_ENCRYPTION_KEY) is required.".to_string(),
+            ));
+        }
+
         let manifest_meta = self
             .retry_drive_op(|| {
                 self.client
@@ -409,7 +423,7 @@ impl SyncEngine {
                 })?;
                 self.local_store
                     .apply_remote_conversation(owner, conv, file_id.clone())
-                    .await;
+                    .await?;
                 restored_convs += 1;
             }
         }
@@ -435,7 +449,7 @@ impl SyncEngine {
                 };
                 self.local_store
                     .apply_remote_library_item(owner, item, file_id.clone())
-                    .await;
+                    .await?;
                 restored_libs += 1;
             }
         }
@@ -443,7 +457,7 @@ impl SyncEngine {
         let now = chrono_like_now();
         self.local_store
             .update_sync_status(owner, Some(now.clone()), None)
-            .await;
+            .await?;
 
         Ok(SyncResult {
             uploaded_conversations: 0,
@@ -480,6 +494,12 @@ impl SyncEngine {
         })?;
 
         let token = drive_token.ok_or(DriveError::MissingDriveToken)?;
+
+        if !self.crypto.is_configured() {
+            return Err(DriveError::CryptoError(
+                "Cannot decrypt library item content: encryption key is not configured. The original 32-byte key (DRIVE_ENCRYPTION_KEY) is required.".to_string(),
+            ));
+        }
 
         // Download from Drive
         let enc_bytes = self

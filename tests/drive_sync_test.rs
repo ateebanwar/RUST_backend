@@ -129,7 +129,8 @@ async fn test_empty_account_initial_sync_and_local_conversation_upload() {
     sync_engine
         .local_store()
         .upsert_conversation(owner, conv1)
-        .await;
+        .await
+        .unwrap();
 
     let mut conv2 = SyncConversation::new(
         "conv_2".to_string(),
@@ -145,7 +146,8 @@ async fn test_empty_account_initial_sync_and_local_conversation_upload() {
     sync_engine
         .local_store()
         .upsert_conversation(owner, conv2)
-        .await;
+        .await
+        .unwrap();
 
     // Check status: 2 pending conversations
     let status = sync_engine.get_status(owner).await;
@@ -210,7 +212,8 @@ async fn test_lww_conflict_resolution() {
     sync_engine
         .local_store()
         .upsert_conversation(owner, conv)
-        .await;
+        .await
+        .unwrap();
     sync_engine.sync(owner, token).await.unwrap();
 
     // 2. Simulate local update with higher revision (local = 3, remote = 2)
@@ -224,7 +227,8 @@ async fn test_lww_conflict_resolution() {
     sync_engine
         .local_store()
         .upsert_conversation(owner, local_newer)
-        .await;
+        .await
+        .unwrap();
 
     let sync_res = sync_engine.sync(owner, token).await.unwrap();
     assert_eq!(sync_res.uploaded_conversations, 1);
@@ -256,7 +260,8 @@ async fn test_transient_failure_retries_and_recovery() {
     sync_engine
         .local_store()
         .upsert_conversation(owner, conv)
-        .await;
+        .await
+        .unwrap();
 
     // Inject 1 transient network failure (client will retry and succeed)
     mock_client.set_transient_failures(1);
@@ -309,14 +314,19 @@ async fn test_logout_preserves_remote_data_and_restore_recovers_it() {
     sync_engine
         .local_store()
         .upsert_conversation(owner, conv)
-        .await;
+        .await
+        .unwrap();
     sync_engine.sync(owner, token).await.unwrap();
 
     // Verify remote has file
     assert_eq!(mock_client.file_count().await, 2); // manifest + 1 conv
 
     // 2. Logout: clear local session
-    sync_engine.local_store().clear_user_session(owner).await;
+    sync_engine
+        .local_store()
+        .clear_user_session(owner)
+        .await
+        .unwrap();
 
     // Verify local store is empty for Charlie
     assert!(
@@ -361,7 +371,8 @@ async fn test_tenant_isolation_between_accounts() {
     sync_engine
         .local_store()
         .upsert_conversation(owner_a, conv_a)
-        .await;
+        .await
+        .unwrap();
 
     // Bob cannot read Alice's conversation
     assert!(

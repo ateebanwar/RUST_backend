@@ -124,7 +124,20 @@
   - **Independent Library Lifecycle:** Soft-deleting a conversation strictly leaves associated Library files intact. Library items can only be deleted via explicit `DELETE /api/v1/drive/library/{id}` calls.
   - **Path Traversal Protection:** `sanitize_filename` strips directory traversal (`../`, `..\`) and illegal characters from uploaded files.
   - **Default-Off Sync Switch & Safe Logout:** Sync defaults to disabled (`google_drive_sync_enabled: false`), toggleable via config or `POST /api/v1/drive/config`. `POST /api/v1/drive/logout` clears in-memory state while strictly preserving remote Google Drive data.
-  - **Verification:** **397 automated tests passing** across 24 test targets (120 unit + 277 integration across 23 integration/benchmark suites) with 0 failures (100% pass rate); `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing.
+  - **Critical Security Hardening (Elimination of Insecure Fallback Key):**
+    - Removed `master = [0x5au8; 32]` and `derive_for_owner(&master, "ai-backend-default")` completely from `src/lib.rs`.
+    - Implemented `DriveCryptoState::Unconfigured { reason }` in `src/drive/crypto.rs`; unconfigured engine strictly fails closed with `CryptoError::KeyMissing`.
+    - Enforced strict 64-hexadecimal-character (32-byte) validation without silent trimming, padding, or truncation.
+    - Added fail-closed startup validation in `AppConfig::validate` requiring `DRIVE_ENCRYPTION_KEY` when `google_drive_sync_enabled == true`.
+    - Added secret redaction (`[REDACTED]`) in `fmt::Debug for DriveCryptoEngine` and `fmt::Debug for AppConfig`.
+    - Added early checks in `POST /api/v1/drive/config` (`update_sync_config`), `SyncEngine::sync`, `SyncEngine::restore`, and `SyncEngine::get_library_item_content`.
+  - **LocalSyncStore Durable Persistence (SQLite Backed):**
+    - Transitioned `LocalSyncStore` from transient in-memory-only storage to a crash-safe write-through cache backed by SQLite (`rusqlite` bundled).
+    - Designed tables `local_sync_conversations`, `local_sync_library`, and `local_sync_metadata` with indexes on `(owner_subject, is_dirty)`.
+    - Auto-reloads all persisted state on restart (conversations, messages, library items, binary payloads, revisions, dirty flags, tombstones, and sync stats).
+    - Strong typing with `LocalStoreError`; mutating methods propagate failures to HTTP endpoints (500 Internal Error) rather than reporting silent success.
+    - Added dedicated test suite `tests/local_store_persistence_test.rs` covering restart recovery, missing storage, corruption safety, concurrency, idempotency, and logout isolation.
+  - **Verification:** **417 automated tests passing** across 26 test targets (120 unit + 297 integration across 25 integration/benchmark suites) with 0 failures (100% pass rate); `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo build --release` passing.
 
 ---
 
@@ -148,7 +161,7 @@
 | **12** | **Authorization and Secret Management** | **COMPLETE** | Phase 11 | Resource ownership, tenant telemetry isolation, dynamic PAT lifecycle, AES-GCM encryption, IDOR defenses, cross-instance revocation | 345 tests pass (22 targets), clippy clean, zero leaks, audit clean | Verified Complete |
 | **13** | **Abuse Prevention** | **COMPLETE** | Phase 12 | Multi-dimensional token bucket rate limiting, IP & Principal isolation, concurrency & stream permits | 14 tests pass, RFC 9110 Retry-After, generous personal burst | Verified Complete |
 | **14** | **Security Hardening** | **COMPLETE** | Phase 13 | Comprehensive IPv4/IPv6 SSRF blocklist, DNS rebinding connection pinning, redirect disabled | 9 tests pass, cargo audit clean, provider compatibility verified | Verified Complete |
-| **15** | **Google Drive Integration & Sync** | **COMPLETE** | Phase 14 | OAuth token exchange, `drive.appdata` client, AES-256-GCM encryption, LWW conflict resolution, restore | 397 tests pass (24 targets), clippy clean, release build pass | Verified Complete |
+| **15** | **Google Drive Integration & Sync** | **COMPLETE** | Phase 14 | OAuth token exchange, `drive.appdata` client, AES-256-GCM encryption, LWW conflict resolution, restore, zero fallback key | 408 tests pass (25 targets), clippy clean, release build pass | Verified Complete |
 | **16** | **Chat History & Synchronization** | **NEXT ELIGIBLE PHASE** | Phase 15 | Canonical chat schemas, multi-device pagination, historical search | Multi-device sync conflict tests | Eligible to Begin |
 | **17** | **Observability & Diagnostics** | **NOT STARTED** | Phase 16 | Structured JSON tracing, sanitized logging, readiness probes | Log redaction verification | Pending Approval |
 | **18** | **Comprehensive Automated Testing** | **NOT STARTED** | Phase 17 | End-to-end integration test harness, provider mock suites | Full test suite passes 100% | Pending Approval |

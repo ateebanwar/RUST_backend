@@ -26,6 +26,7 @@ pub const AES_GCM_TAG_LEN: usize = 16;
 #[derive(Debug, PartialEq, Eq)]
 pub enum EncryptionError {
     InvalidKeyLength { expected: usize, actual: usize },
+    InvalidKeyEncoding(String),
     InvalidCiphertextLength { min_expected: usize, actual: usize },
     RngError,
     DecryptionFailed,
@@ -40,6 +41,7 @@ impl fmt::Display for EncryptionError {
                     "Invalid encryption key length: expected {expected} bytes, got {actual}"
                 )
             }
+            Self::InvalidKeyEncoding(msg) => write!(f, "Invalid key encoding: {msg}"),
             Self::InvalidCiphertextLength {
                 min_expected,
                 actual,
@@ -92,25 +94,25 @@ impl AesGcmCipher {
     /// Initialize cipher from a 64-character hexadecimal key string.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn from_hex(hex_key: &str) -> Result<Self, EncryptionError> {
-        let trimmed = hex_key.trim();
-        if trimmed.len() != AES_256_KEY_LEN * 2 {
+        if hex_key.len() != AES_256_KEY_LEN * 2 {
             return Err(EncryptionError::InvalidKeyLength {
                 expected: AES_256_KEY_LEN,
-                actual: trimmed.len() / 2,
+                actual: hex_key.len() / 2,
             });
+        }
+        if !hex_key.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(EncryptionError::InvalidKeyEncoding(
+                "Key contains invalid hexadecimal characters. Expected 64 hex characters (0-9, a-f, A-F)."
+                    .to_string(),
+            ));
         }
 
         let mut key_bytes = [0u8; AES_256_KEY_LEN];
-        for (i, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
-            let s = std::str::from_utf8(chunk).map_err(|_| EncryptionError::InvalidKeyLength {
-                expected: AES_256_KEY_LEN,
-                actual: 0,
-            })?;
-            key_bytes[i] =
-                u8::from_str_radix(s, 16).map_err(|_| EncryptionError::InvalidKeyLength {
-                    expected: AES_256_KEY_LEN,
-                    actual: 0,
-                })?;
+        for (i, chunk) in hex_key.as_bytes().chunks_exact(2).enumerate() {
+            let s = std::str::from_utf8(chunk)
+                .map_err(|e| EncryptionError::InvalidKeyEncoding(e.to_string()))?;
+            key_bytes[i] = u8::from_str_radix(s, 16)
+                .map_err(|e| EncryptionError::InvalidKeyEncoding(e.to_string()))?;
         }
         Self::new(&key_bytes)
     }
