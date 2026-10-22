@@ -37,7 +37,15 @@ async fn hydrate_conversation_context(
     headers: &HeaderMap,
     payload: &mut ChatCompletionRequest,
     req_id: &str,
-) -> Result<Option<(String, String, crate::drive::SyncConversation)>, Response> {
+) -> Result<
+    Option<(
+        String,
+        String,
+        crate::drive::SyncConversation,
+        Vec<crate::models::ChatMessage>,
+    )>,
+    Response,
+> {
     let Some(ref conv_id) = payload.conversation_id else {
         return Ok(None);
     };
@@ -46,24 +54,49 @@ async fn hydrate_conversation_context(
         Some(Extension(p)) if !p.subject.trim().is_empty() => p.subject.clone(),
         _ => {
             return Err(AppError::Unauthorized(
-                "Authentication required for conversation continuity".to_string(),
+                "Authentication required for conversation continuity: valid Google login is mandatory".to_string(),
             )
             .to_response_with_id(req_id));
         }
     };
 
-    let drive_token = headers
+    let drive_token = match headers
         .get("x-drive-token")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+    {
+        Some(t) => t,
+        None => {
+            return Err(AppError::Unauthorized(
+                "Google Drive authorization required for conversation continuity: missing X-Drive-Token header".to_string(),
+            )
+            .to_response_with_id(req_id));
+        }
+    };
 
-    let existing_conv_opt = match state
+    let existing_conv = match state
         .sync_engine
-        .get_or_hydrate_conversation(&owner, conv_id, drive_token)
+        .get_or_hydrate_conversation(&owner, conv_id, Some(drive_token))
         .await
     {
-        Ok(c) => c,
+        Ok(Some(c)) => {
+            if c.owner_subject != owner {
+                return Err(
+                    AppError::Forbidden("Access denied to conversation".to_string())
+                        .to_response_with_id(req_id),
+                );
+            }
+            c
+        }
+        Ok(None) => {
+            // Initialize new conversation record for this tenant
+            crate::drive::SyncConversation::new(
+                conv_id.clone(),
+                owner.clone(),
+                "New Conversation".to_string(),
+            )
+        }
         Err(e) => {
             return Err(
                 AppError::InternalError(format!("Failed to retrieve conversation: {e}"))
@@ -71,20 +104,6 @@ async fn hydrate_conversation_context(
             );
         }
     };
-
-    let Some(existing_conv) = existing_conv_opt else {
-        return Err(
-            AppError::NotFound(format!("Conversation '{conv_id}' not found"))
-                .to_response_with_id(req_id),
-        );
-    };
-
-    if existing_conv.owner_subject != owner {
-        return Err(
-            AppError::Forbidden("Access denied to conversation".to_string())
-                .to_response_with_id(req_id),
-        );
-    }
 
     // Reconstruct model-agnostic messages from Drive history
     let mut full_messages: Vec<crate::models::ChatMessage> = Vec::new();
@@ -96,38 +115,67 @@ async fn hydrate_conversation_context(
 
     if let Some(sys) = payload_system {
         full_messages.push(sys);
-    }
-
-    for msg in &existing_conv.messages {
-        if msg.role.eq_ignore_ascii_case("system")
-            && full_messages
-                .iter()
-                .any(|m| m.role.eq_ignore_ascii_case("system"))
-        {
-            continue;
-        }
+    } else if let Some(sys_conv) = existing_conv
+        .messages
+        .iter()
+        .find(|m| m.role.eq_ignore_ascii_case("system"))
+    {
         full_messages.push(crate::models::ChatMessage {
-            role: msg.role.clone(),
-            content: msg.content.clone(),
+            role: sys_conv.role.clone(),
+            content: sys_conv.content.clone(),
         });
     }
 
-    for msg in &payload.messages {
-        if !msg.role.eq_ignore_ascii_case("system") {
-            if full_messages
-                .last()
-                .map(|last| last.role == msg.role && last.content == msg.content)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            full_messages.push(msg.clone());
+    let existing_non_sys: Vec<&crate::drive::SyncMessage> = existing_conv
+        .messages
+        .iter()
+        .filter(|m| !m.role.eq_ignore_ascii_case("system"))
+        .collect();
+
+    let incoming_non_sys: Vec<&crate::models::ChatMessage> = payload
+        .messages
+        .iter()
+        .filter(|m| !m.role.eq_ignore_ascii_case("system"))
+        .collect();
+
+    let mut prefix_len = 0;
+    while prefix_len < existing_non_sys.len() && prefix_len < incoming_non_sys.len() {
+        let e = existing_non_sys[prefix_len];
+        let p = incoming_non_sys[prefix_len];
+        if e.role.eq_ignore_ascii_case(&p.role) && e.content == p.content {
+            prefix_len += 1;
+        } else {
+            break;
+        }
+    }
+
+    for e in &existing_non_sys {
+        full_messages.push(crate::models::ChatMessage {
+            role: e.role.clone(),
+            content: e.content.clone(),
+        });
+    }
+
+    let mut new_user_msgs = Vec::new();
+    if prefix_len > 0 && prefix_len <= incoming_non_sys.len() {
+        for p in &incoming_non_sys[prefix_len..] {
+            full_messages.push((*p).clone());
+            new_user_msgs.push((*p).clone());
+        }
+    } else {
+        for p in incoming_non_sys {
+            full_messages.push(p.clone());
+            new_user_msgs.push(p.clone());
         }
     }
 
     payload.messages = full_messages;
-    let token_str = drive_token.unwrap_or("").to_string();
-    Ok(Some((owner, token_str, existing_conv)))
+    Ok(Some((
+        owner,
+        drive_token.to_string(),
+        existing_conv,
+        new_user_msgs,
+    )))
 }
 
 /// Handler for POST /api/v1/chat/completions (Buffered synchronous completion)
@@ -177,24 +225,17 @@ pub async fn chat_completions(
                 .await;
 
             // Automatically persist updated conversation turns back to Google Drive
-            if let Some((owner, token_str, mut existing_conv)) = conv_context
+            if let Some((owner, token_str, mut existing_conv, new_user_msgs)) = conv_context
                 && !token_str.is_empty()
                 && state.sync_engine.crypto().is_configured()
             {
-                for msg in &payload.messages {
-                    if msg.role.eq_ignore_ascii_case("user")
-                        && !existing_conv
-                            .messages
-                            .iter()
-                            .any(|m| m.role == msg.role && m.content == msg.content)
-                    {
-                        existing_conv.messages.push(crate::drive::SyncMessage::new(
-                            format!("msg_{}", generate_msg_id()),
-                            existing_conv.id.clone(),
-                            msg.role.clone(),
-                            msg.content.clone(),
-                        ));
-                    }
+                for msg in new_user_msgs {
+                    existing_conv.messages.push(crate::drive::SyncMessage::new(
+                        format!("msg_{}", generate_msg_id()),
+                        existing_conv.id.clone(),
+                        msg.role,
+                        msg.content,
+                    ));
                 }
                 existing_conv.messages.push(crate::drive::SyncMessage::new(
                     format!("msg_{}", generate_msg_id()),
@@ -309,15 +350,59 @@ impl Drop for StreamFinalizationGuard {
     }
 }
 
+struct StreamContext {
+    accumulated_content: String,
+    conv_context: Option<(
+        String,
+        String,
+        crate::drive::SyncConversation,
+        Vec<crate::models::ChatMessage>,
+    )>,
+    sync_engine: Arc<crate::drive::SyncEngine>,
+}
+
+fn persist_streamed_conversation(mut stream_ctx: StreamContext) {
+    if let Some((owner, token_str, mut existing_conv, new_user_msgs)) =
+        stream_ctx.conv_context.take()
+        && !token_str.is_empty()
+        && stream_ctx.sync_engine.crypto().is_configured()
+    {
+        for msg in new_user_msgs {
+            existing_conv.messages.push(crate::drive::SyncMessage::new(
+                format!("msg_{}", generate_msg_id()),
+                existing_conv.id.clone(),
+                msg.role,
+                msg.content,
+            ));
+        }
+        existing_conv.messages.push(crate::drive::SyncMessage::new(
+            format!("msg_{}", generate_msg_id()),
+            existing_conv.id.clone(),
+            "assistant".to_string(),
+            stream_ctx.accumulated_content,
+        ));
+        existing_conv.revision += 1;
+        existing_conv.updated_at = crate::drive::chrono_like_now();
+        let se = stream_ctx.sync_engine;
+        tokio::spawn(async move {
+            let _ = se
+                .persist_conversation_to_drive(&owner, existing_conv, &token_str)
+                .await;
+        });
+    }
+}
+
 enum SseStreamState {
     SendRouting {
         routing_ev: Event,
         inner: ProviderStream,
         guard: Arc<StreamFinalizationGuard>,
+        stream_ctx: StreamContext,
     },
     Streaming {
         inner: ProviderStream,
         guard: Arc<StreamFinalizationGuard>,
+        stream_ctx: StreamContext,
     },
     Terminated {
         _guard: Arc<StreamFinalizationGuard>,
@@ -339,7 +424,7 @@ pub async fn chat_stream(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let _conv_context =
+    let conv_context =
         hydrate_conversation_context(&state, &principal, &headers, &mut payload, &req_id).await?;
 
     let routing_mode = if payload.routing_mode.eq_ignore_ascii_case("manual") {
@@ -427,10 +512,17 @@ pub async fn chat_stream(
         _stream_permit: Some(stream_permit),
     });
 
+    let stream_ctx = StreamContext {
+        accumulated_content: String::new(),
+        conv_context,
+        sync_engine: state.sync_engine.clone(),
+    };
+
     let initial_state = SseStreamState::SendRouting {
         routing_ev: routing_event,
         inner: stream_res.stream,
         guard,
+        stream_ctx,
     };
 
     let sse_stream = futures_util::stream::unfold(initial_state, |state| async move {
@@ -439,11 +531,20 @@ pub async fn chat_stream(
                 routing_ev,
                 inner,
                 guard,
+                stream_ctx,
             } => Some((
                 Ok::<Event, Infallible>(routing_ev),
-                SseStreamState::Streaming { inner, guard },
+                SseStreamState::Streaming {
+                    inner,
+                    guard,
+                    stream_ctx,
+                },
             )),
-            SseStreamState::Streaming { mut inner, guard } => match inner.next().await {
+            SseStreamState::Streaming {
+                mut inner,
+                guard,
+                mut stream_ctx,
+            } => match inner.next().await {
                 Some(Ok(chunk)) => {
                     if let Some(u) = chunk.usage {
                         *guard.latest_usage.lock().unwrap() = Some(u);
@@ -479,15 +580,25 @@ pub async fn chat_stream(
                             });
                         }
 
+                        persist_streamed_conversation(stream_ctx);
+
                         let done_ev = Event::default()
                             .event("done")
                             .data(json!({ "status": "completed" }).to_string());
                         Some((Ok(done_ev), SseStreamState::Terminated { _guard: guard }))
                     } else {
+                        stream_ctx.accumulated_content.push_str(&chunk.delta);
                         let chunk_ev = Event::default()
                             .event("chunk")
                             .data(json!({ "delta": chunk.delta }).to_string());
-                        Some((Ok(chunk_ev), SseStreamState::Streaming { inner, guard }))
+                        Some((
+                            Ok(chunk_ev),
+                            SseStreamState::Streaming {
+                                inner,
+                                guard,
+                                stream_ctx,
+                            },
+                        ))
                     }
                 }
                 Some(Err(err)) => {
@@ -560,6 +671,8 @@ pub async fn chat_stream(
                                 .await;
                         });
                     }
+
+                    persist_streamed_conversation(stream_ctx);
 
                     let done_ev = Event::default()
                         .event("done")

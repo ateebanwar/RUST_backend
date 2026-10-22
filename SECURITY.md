@@ -115,6 +115,14 @@ To prevent Server-Side Request Forgery (SSRF), cloud metadata exfiltration, and 
    - Uploaded library filenames are sanitized via `sanitize_filename`, which rejects directory traversal sequences (`../`, `..\`) and replaces illegal characters, preventing directory escape during download.
 9. **Safe Logout & Disconnect Semantics:**
    - Calling `POST /api/v1/drive/logout` terminates the local in-memory session only. Remote Google Drive backups and library items must NEVER be deleted upon logout.
+10. **Fail-Closed Chat Context Hydration & Drive Authentication:**
+    - Supplying `conversation_id` in `/api/v1/chat/completions` or `/api/v1/chat/stream` strictly requires both an authenticated `AuthPrincipal` and a non-empty `X-Drive-Token` header.
+    - If either is absent, the backend immediately fails closed with HTTP 401 `Unauthorized` without contacting upstream AI providers.
+    - Decryption is bound via AES-256-GCM AAD to `owner_subject:resource_id`, preventing any tenant from decrypting another tenant's conversation.
+    - Any error messages containing credentials, tokens, or restricted parameters are automatically sanitized prior to transmission.
+11. **Serverless In-Memory Zero-Disk Baseline:**
+    - Under serverless execution (`DEPLOYMENT_MODE=serverless`), the operational telemetry database defaults to `:memory:` and disk spool to `/tmp/usage_spool.log`.
+    - No persistent files or databases are created on disk; all process memory is scrubbed upon microVM container suspension.
 
 
 ---

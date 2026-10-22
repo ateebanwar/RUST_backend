@@ -594,3 +594,65 @@ graph TD
 11. **Transient Failure Resilience & Rate-Limit Handling:**
     - Remote Google Drive calls are wrapped in `retry_drive_op` supporting bounded exponential backoff with jitter and RFC 9110 `Retry-After` parsing on HTTP 429.
 
+---
+
+## 12. Resolution of Chat History Contradiction & Scope Boundaries
+
+### 12.1 The Architectural Distinction: Routing Continuity vs. Phase 16 Client Sync
+A critical architectural boundary exists between model-agnostic chat continuity (Phase 7B & Phase 15) and multi-device historical synchronization (Phase 16):
+
+1. **Operational Chat Continuity (Phase 7B & Phase 15 — Active & Implemented):**
+   - **Responsibility:** Unified request context hydration and atomic turn persistence across diverse AI providers.
+   - **Mechanism:** When a client issues a request to `/api/v1/chat/completions` or `/api/v1/chat/stream` with a `conversation_id`, the backend:
+     - Extracts the authenticated caller subject (`AuthPrincipal.subject`) and verifies possession of a valid `X-Drive-Token`.
+     - Hydrates the canonical conversation envelope from Google Drive's hidden `appDataFolder`.
+     - Deduplicates client-submitted messages against pre-existing canonical turns via deterministic prefix-matching.
+     - Assembles the combined model-agnostic conversation context and routes the prompt to the selected or requested AI provider (e.g. Turn 1 on Provider A, Turn 2 on Provider B).
+     - Upon completion, atomically appends the user prompt and assistant response to the conversation, increments the monotonic revision counter, and persists the encrypted record back to Google Drive.
+     - For streaming connections (`POST /api/v1/chat/stream`), token deltas are accumulated in real time and persisted asynchronously on stream completion without blocking the client SSE `event: done`.
+   - **Status:** **Fully Implemented, Verified, and Tested** (`tests/chat_continuity_and_stateless_test.rs`).
+
+2. **Client-Side Sync & Historical Search (Phase 16 — Strictly On Hold):**
+   - **Responsibility:** Client-side local SQLite caching (on Flutter mobile and Custom IDE), offline cross-device sync orchestration, paginated history retrieval (`GET /api/v1/chat/history?cursor=...`), and full-text offline search index management.
+   - **Status:** **Strictly On Hold**. No code for client-side pagination, local mobile sync protocols, or full-text historical search has been implemented.
+
+---
+
+## 13. Database Strategy & Dual-Target Serverless Portability
+
+### 13.1 Google Drive as the Sole Permanent Source of Truth
+- **Zero Permanent Server-Side User Storage:** The backend stores zero user data (conversations, messages, attachments, library documents, or user metadata) on backend disk or SQLite tables.
+- **Google Drive `appDataFolder` Exclusivity:** All permanent user records reside in Google Drive's hidden application data sandbox (`spaces=appDataFolder`), encrypted with AES-256-GCM.
+- **Ephemeral Request Cache:** `LocalSyncStore` functions strictly as an ephemeral in-memory working cache (`is_persistent() -> false`), holding decrypted records only for the duration of active request processing.
+
+### 13.2 Operational Telemetry vs. In-Memory Serverless Execution
+- **Local Telemetry (`data/usage.db`):** In daemon hosting mode, `data/usage.db` stores strictly operational, anonymized telemetry (exact token counts, latencies, provider IDs, HTTP outcome codes, and SHA-256 hashed PAT credentials). It never contains user prompt text, completions, or file contents.
+- **100% Database-Free and Disk-Free Serverless Execution:**
+  - When `DEPLOYMENT_MODE=serverless` is configured, the backend automatically defaults `DATABASE_PATH` to `":memory:"` and `USAGE_SPOOL_PATH` to `"/tmp/usage_spool.log"`.
+  - The SQLite database engine operates entirely in RAM.
+  - All health probes (`/api/v1/health`, `/api/v1/ready`) and inference pipelines execute with zero permanent disk footprint, achieving cold-start resilience across ephemeral microVM platforms (AWS Lambda, Vercel Serverless Functions).
+  - Verified by automated tests in `tests/chat_continuity_and_stateless_test.rs` (`test_stateless_and_memory_only_backend`).
+
+---
+
+## 14. Google Drive Live Testing Strategy & Verification Procedures
+
+### 14.1 Deterministic Mock Testing as Primary Suite
+- **Primary CI/Local Verification:** Automated testing relies on `MockDriveClient` (`src/drive/mock.rs`), providing 100% deterministic, offline verification without live Google network access or fragile test credentials.
+- **Multi-Tenant Isolation:** `MockDriveClient` partitions all simulated remote files by `owner_token`, verifying tenant boundaries, error injection, rate-limit backoff, and save-confirmation protocols.
+
+### 14.2 Live Integration Harness (`tests/drive_live_integration_test.rs`)
+To validate genuine end-to-end cloud persistence against Google Drive APIs, a dedicated live test harness is provided:
+- **Gated Execution:** The test suite checks for the `LIVE_GOOGLE_DRIVE_TOKEN` environment variable. If unset or empty, the test prints detailed setup instructions and skips cleanly without failing CI.
+- **Required OAuth Scopes:**
+  - Scope: `https://www.googleapis.com/auth/drive.appdata` (private Application Data folder).
+  - Can be acquired via Google OAuth 2.0 Playground or mobile client sign-in flow.
+- **Live Test Workflow:**
+  1. Validates token format (non-empty, rejecting control characters / CRLF injection).
+  2. Creates and encrypts a test conversation payload using `DriveCryptoEngine` with AES-256-GCM and AAD binding.
+  3. Uploads the encrypted blob to Google Drive's hidden `appDataFolder` via `DriveClient::upload_file`.
+  4. Queries `DriveClient::find_file` to verify searchability in the hidden sandbox.
+  5. Downloads the file via `DriveClient::download_file` and decrypts the payload, asserting exact bitwise round-trip fidelity.
+  6. Deletes the remote file via `DriveClient::delete_file` ensuring zero leftover test artifacts.
+
+

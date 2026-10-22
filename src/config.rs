@@ -261,6 +261,15 @@ impl AppConfig {
         }
     }
 
+    /// Default serverless configuration with in-memory usage storage and ephemeral spooling.
+    pub fn default_serverless() -> Self {
+        let mut cfg = Self::default_local();
+        cfg.deployment_mode = DeploymentMode::Serverless;
+        cfg.database_path = ":memory:".to_string();
+        cfg.usage_spool_path = "/tmp/usage_spool.log".to_string();
+        cfg
+    }
+
     /// Parse .env key-value pairs from raw string content.
     pub fn parse_dotenv(content: &str) -> std::collections::HashMap<String, String> {
         let mut map = std::collections::HashMap::new();
@@ -435,6 +444,8 @@ impl AppConfig {
 
         if let Some(db) = get_var("DATABASE_PATH") {
             config.database_path = db;
+        } else if config.deployment_mode == DeploymentMode::Serverless {
+            config.database_path = ":memory:".to_string();
         }
 
         if let Some(days) =
@@ -504,6 +515,8 @@ impl AppConfig {
 
         if let Some(spool) = get_var("USAGE_SPOOL_PATH") {
             config.usage_spool_path = spool;
+        } else if config.deployment_mode == DeploymentMode::Serverless {
+            config.usage_spool_path = "/tmp/usage_spool.log".to_string();
         }
 
         if let Some(bytes) =

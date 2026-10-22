@@ -273,7 +273,12 @@ All error responses (HTTP 4xx and 5xx) must strictly conform to the canonical er
   - `messages`: Required, array of 1 to 50 message objects.
   - `messages[].role`: Required, enum (`system`, `user`, `assistant`).
   - `messages[].content`: Required, string, 1 to 100,000 characters.
-  - `conversation_id`: Optional string. When provided, automatically hydrates model-agnostic chat history from Google Drive, validates tenant ownership, and atomically appends updated user and assistant messages back to Google Drive upon completion.
+  - `conversation_id`: Optional string. When provided:
+    - Caller must be authenticated (`AuthPrincipal`) and must provide a valid, non-empty `X-Drive-Token` header. Missing principal or missing `X-Drive-Token` fails closed with HTTP 401 `Unauthorized` (`UNAUTHORIZED`).
+    - The backend hydrates canonical model-agnostic chat history from Google Drive's hidden `appDataFolder`, verifying tenant ownership (`owner_subject:resource_id`).
+    - Client-submitted messages are deduplicated against pre-existing canonical turns via deterministic prefix-matching.
+    - Upon completion of buffered inference, the user turn and assistant response turn are atomically appended to the conversation, the revision is incremented monotonically, and the encrypted payload is persisted back to Google Drive before returning HTTP 200 OK.
+    - In streaming inference (`POST /api/v1/chat/stream`), token deltas are accumulated into the complete assistant turn and persisted to Google Drive upon stream termination (`is_done` and stream EOF) without blocking the client SSE `event: done`.
   - `temperature`: Optional, float between `0.0` and `2.0`. Default: `0.7`.
   - `max_tokens`: Optional, integer between `1` and `32768`.
   - `stream`: Boolean, must be `false` for buffered endpoint.
