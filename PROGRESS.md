@@ -181,8 +181,14 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Final Backend Completion & Verification Directive Completed:** All remaining backend architecture requirements prior to Phase 16 have been resolved and verified with **428 automated tests passing** across 27 test targets (100% pass rate). Model-agnostic chat continuity, real-time streaming persistence, in-memory serverless execution, and Google Drive live test harness are fully verified.
+1. **Final Master Directive Completed:** All required backend architecture requirements prior to Phase 16 have been implemented, verified, and locked:
+   - **Strict Zero-Database Requirement:** Completely eradicated SQLite and `rusqlite`. Telemetry is 100% in-memory with FIFO bounded capacity (`MAX_IN_MEMORY_USAGE_RECORDS = 10_000`). Zero disk database or spool files are created in daemon, local, or serverless runtime modes.
+   - **Streaming Save Safety Contract:** SSE streaming completion awaits Google Drive persistence and only acknowledges `saved: true` upon success. Emits `event: save_error` (`DRIVE_PERSISTENCE_FAILED`) and terminal `done` with `status: completed_save_failed`, `saved: false` on failure. Buffered completions fail closed with HTTP 502 / `UPSTREAM_FAILURE`.
+   - **Failure Injection Test Suite:** 10/10 scenarios passing in `tests/streaming_safety_and_failure_injection_test.rs`.
+   - **Zero-Database Regression Test Suite:** 4/4 scenarios passing in `tests/zero_database_regression_test.rs`.
+   - **Comprehensive Test Results:** 100% passing across all 25+ targets (0 failures); `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo build --release` clean.
 2. **Phase 16 (Chat History & Synchronization) Remains Strictly On Hold:** Phase 16 represents client-side pagination, mobile SQLite local cache sync, and offline historical search. It remains strictly on hold until separate explicit user authorization. No Phase 16 code has been implemented.
-3. **Repository State Protected:** Secrets, local SQLite databases (`data/usage.db`), and compiled binaries (`target/`) are strictly excluded from version control with zero credential leakage.
+3. **Google Drive Live Testing Notice:** Real Google Drive testing is intentionally postponed until the front-end UI and Google OAuth consent flow are connected.
+4. **Repository State Protected:** Zero secrets in diff or repository. No unauthorized production deployment performed.
 
 

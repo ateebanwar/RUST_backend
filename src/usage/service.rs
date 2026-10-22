@@ -2,53 +2,40 @@
 //!
 //! Provides the primary application interface for recording inference request outcomes
 //! and querying aggregated telemetry while enforcing safe failure isolation.
+//! Conforms strictly to zero-database architecture (100% in-memory telemetry).
 
 use crate::models::UsageMetadata;
 use crate::usage::model::{
     ModelUsageSummary, ProviderUsageSummary, RecordStatus, RequestMode, RequestOutcome,
     RetryDrainResult, RetryQueueMetrics, RoutingMode, UsageQueryFilter, UsageRecord, UsageSummary,
 };
-use crate::usage::spool::{SpoolDrainResult, UsageSpooler};
 use crate::usage::storage::{StorageError, UsageStorage};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::{error, warn};
+use tracing::warn;
 
-/// Combined drain results from both independent disk spool and SQLite retry queue.
+/// Combined drain results representing in-memory retry drain.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CombinedDrainResult {
-    pub spool: SpoolDrainResult,
     pub sqlite: RetryDrainResult,
 }
 
 impl CombinedDrainResult {
     pub fn total_succeeded(&self) -> usize {
-        self.spool.succeeded + self.sqlite.succeeded
+        self.sqlite.succeeded
     }
 }
 
-/// Thread-safe service for usage recording and analytics.
+/// Thread-safe service for usage recording and analytics (100% in-memory).
 #[derive(Clone)]
 pub struct UsageService {
     storage: Arc<UsageStorage>,
-    spool: Arc<UsageSpooler>,
 }
 
 impl UsageService {
-    /// Initialize with an existing storage handle and default independent disk spool.
+    /// Initialize with an in-memory storage handle.
     pub fn new(storage: Arc<UsageStorage>) -> Self {
-        let spool = Arc::new(UsageSpooler::new("data/usage_spool.log", 10 * 1024 * 1024));
-        Self { storage, spool }
-    }
-
-    /// Initialize with explicit storage and independent disk spool handles.
-    pub fn with_spool(storage: Arc<UsageStorage>, spool: Arc<UsageSpooler>) -> Self {
-        Self { storage, spool }
-    }
-
-    /// Access reference to the independent disk spooler.
-    pub fn spool(&self) -> &Arc<UsageSpooler> {
-        &self.spool
+        Self { storage }
     }
 
     /// Access reference to underlying storage engine.
@@ -56,10 +43,7 @@ impl UsageService {
         &self.storage
     }
 
-    /// Record a buffered completion attempt.
-    ///
-    /// In accordance with Phase 8 failure isolation policy:
-    /// Storage write errors are logged as warnings and NEVER bubble up to fail the AI request.
+    /// Record a buffered completion attempt in memory.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_buffered(
         &self,
@@ -112,30 +96,13 @@ impl UsageService {
             warn!(
                 request_id = %request_id,
                 error = %err,
-                "UsageService: Failed to record buffered usage record (non-fatal), enqueuing to durable retry queue"
+                "UsageService: In-memory record write failed (non-fatal), falling back to retry buffer"
             );
-            if let Err(enq_err) = self.storage.enqueue_retry(&record, &err.to_string()).await {
-                warn!(
-                    request_id = %request_id,
-                    error = %enq_err,
-                    "UsageService: Primary SQLite retry enqueue failed; falling back to independent disk spool"
-                );
-                if let Err(spool_err) = self
-                    .spool
-                    .append_record(&record, &format!("sqlite_enqueue_failed: {enq_err}"))
-                    .await
-                {
-                    error!(
-                        request_id = %request_id,
-                        error = %spool_err,
-                        "UsageService: CRITICAL: Both SQLite storage/retry and independent disk spool failed to persist usage record"
-                    );
-                }
-            }
+            let _ = self.storage.enqueue_retry(&record, &err.to_string()).await;
         }
     }
 
-    /// Record a streaming completion finalization.
+    /// Record a streaming completion finalization in memory.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_streaming(
         &self,
@@ -188,26 +155,9 @@ impl UsageService {
             warn!(
                 request_id = %request_id,
                 error = %err,
-                "UsageService: Failed to record streaming usage record (non-fatal), enqueuing to durable retry queue"
+                "UsageService: In-memory record write failed (non-fatal), falling back to retry buffer"
             );
-            if let Err(enq_err) = self.storage.enqueue_retry(&record, &err.to_string()).await {
-                warn!(
-                    request_id = %request_id,
-                    error = %enq_err,
-                    "UsageService: Primary SQLite retry enqueue failed; falling back to independent disk spool"
-                );
-                if let Err(spool_err) = self
-                    .spool
-                    .append_record(&record, &format!("sqlite_enqueue_failed: {enq_err}"))
-                    .await
-                {
-                    error!(
-                        request_id = %request_id,
-                        error = %spool_err,
-                        "UsageService: CRITICAL: Both SQLite storage/retry and independent disk spool failed to persist usage record"
-                    );
-                }
-            }
+            let _ = self.storage.enqueue_retry(&record, &err.to_string()).await;
         }
     }
 
@@ -296,38 +246,17 @@ impl UsageService {
         self.storage.get_retry_queue_metrics().await
     }
 
-    /// Run non-blocking WAL maintenance checkpoint.
+    /// Run non-blocking WAL maintenance checkpoint (no-op in zero-database architecture).
     pub async fn maintenance_wal_checkpoint(&self) -> Result<(), StorageError> {
         self.storage.maintenance_wal_checkpoint().await
     }
 
-    /// Drain pending retries from both the independent disk spool and SQLite retry queue.
+    /// Drain pending retries.
     pub async fn drain_all_retries(
         &self,
         batch_limit: usize,
     ) -> Result<CombinedDrainResult, StorageError> {
-        let spool_res = self
-            .spool
-            .drain_to_storage(&self.storage, batch_limit)
-            .await
-            .unwrap_or_else(|err| {
-                warn!(
-                    error = %err,
-                    "UsageService: Error draining independent disk spool into SQLite"
-                );
-                SpoolDrainResult {
-                    processed: 0,
-                    succeeded: 0,
-                    failed: 0,
-                    corrupted: 0,
-                }
-            });
-
         let sqlite_res = self.storage.drain_retry_queue(batch_limit).await?;
-
-        Ok(CombinedDrainResult {
-            spool: spool_res,
-            sqlite: sqlite_res,
-        })
+        Ok(CombinedDrainResult { sqlite: sqlite_res })
     }
 }

@@ -14,26 +14,13 @@
 use ai_backend::drive::mock::MockDriveClient;
 use ai_backend::drive::{
     DriveCryptoEngine, LibraryItem, LocalSyncStore, SyncConversation, SyncEngine, SyncMessage,
-    compute_sha256, inspect_legacy_sqlite, migrate_legacy_sqlite_to_drive,
+    compute_sha256,
 };
-use rusqlite::Connection;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn test_crypto_engine(tenant: &str) -> Arc<DriveCryptoEngine> {
     let key = [0x77u8; 32];
     Arc::new(DriveCryptoEngine::derive_for_owner(&key, tenant))
-}
-
-fn unique_temp_db_path(name: &str) -> (std::path::PathBuf, String) {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("ai_backend_drive_test_{name}_{nanos}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("legacy_sync.db").to_str().unwrap().to_string();
-    (dir, db_path)
 }
 
 #[tokio::test]
@@ -162,132 +149,69 @@ async fn test_02_backend_is_stateless_and_local_store_is_ephemeral() {
 }
 
 #[tokio::test]
-async fn test_03_legacy_sqlite_discovery_and_safe_migration_to_drive() {
-    let (temp_dir, db_path) = unique_temp_db_path("03_legacy_mig");
-    let owner = "google:legacy_alice";
-    let token = "valid_drive_token_mig";
+async fn test_03_in_memory_sync_and_drive_restore_without_database() {
+    let owner = "google:stateless_alice";
+    let token = "valid_drive_token_stateless";
 
-    // 1. Create a legacy SQLite database containing legacy tables
-    {
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE local_sync_conversations (
-                id TEXT NOT NULL,
-                owner_subject TEXT NOT NULL,
-                title TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                schema_version INTEGER NOT NULL,
-                deleted INTEGER NOT NULL DEFAULT 0,
-                deleted_at TEXT,
-                is_dirty INTEGER NOT NULL DEFAULT 1,
-                drive_file_id TEXT,
-                messages_json TEXT NOT NULL,
-                PRIMARY KEY (owner_subject, id)
-            );
-            CREATE TABLE local_sync_library (
-                id TEXT NOT NULL,
-                owner_subject TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                mime_type TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                checksum_sha256 TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                conversation_id TEXT,
-                drive_file_id TEXT,
-                deleted INTEGER NOT NULL DEFAULT 0,
-                deleted_at TEXT,
-                schema_version INTEGER NOT NULL,
-                is_dirty INTEGER NOT NULL DEFAULT 1,
-                content BLOB,
-                PRIMARY KEY (owner_subject, id)
-            );
-            CREATE TABLE local_sync_metadata (
-                owner_subject TEXT PRIMARY KEY,
-                last_sync_time TEXT,
-                last_error TEXT
-            );",
-        )
-        .unwrap();
-
-        // Insert legacy conversation
-        let messages = vec![SyncMessage::new(
-            "legacy_msg_1".to_string(),
-            "legacy_conv_1".to_string(),
-            "user".to_string(),
-            "Old legacy message".to_string(),
-        )];
-        let messages_json = serde_json::to_string(&messages).unwrap();
-
-        conn.execute(
-            "INSERT INTO local_sync_conversations (id, owner_subject, title, created_at, updated_at, revision, schema_version, deleted, messages_json)
-             VALUES (?1, ?2, ?3, '2026-10-20T00:00:00Z', '2026-10-20T00:00:00Z', 1, 1, 0, ?4)",
-            rusqlite::params!["legacy_conv_1", owner, "Legacy Chat", messages_json],
-        ).unwrap();
-
-        // Insert legacy library item
-        let legacy_content = b"LEGACY_BINARY_CONTENT";
-        conn.execute(
-            "INSERT INTO local_sync_library (id, owner_subject, filename, mime_type, size_bytes, checksum_sha256, created_at, updated_at, deleted, schema_version, content)
-             VALUES (?1, ?2, ?3, 'text/plain', ?4, ?5, '2026-10-20T00:00:00Z', '2026-10-20T00:00:00Z', 0, 1, ?6)",
-            rusqlite::params![
-                "legacy_lib_1",
-                owner,
-                "legacy.txt",
-                legacy_content.len() as i64,
-                compute_sha256(legacy_content),
-                legacy_content.to_vec(),
-            ],
-        ).unwrap();
-    }
-
-    // 2. Inspect legacy database
-    let conn_arc = Arc::new(std::sync::Mutex::new(Connection::open(&db_path).unwrap()));
-    {
-        let conn = conn_arc.lock().unwrap();
-        let inspection = inspect_legacy_sqlite(&conn).unwrap();
-        assert!(inspection.has_legacy_tables);
-        assert_eq!(inspection.conversation_count, 1);
-        assert_eq!(inspection.library_item_count, 1);
-    }
-
-    // 3. Migrate legacy records to Google Drive
     let mock_drive = Arc::new(MockDriveClient::new());
-    let crypto = test_crypto_engine("legacy_alice");
+    let crypto = test_crypto_engine("stateless_alice");
     let local_store = Arc::new(LocalSyncStore::new());
     let sync_engine = SyncEngine::new(mock_drive.clone(), crypto.clone(), local_store, true);
 
-    let mig_result = migrate_legacy_sqlite_to_drive(conn_arc.clone(), owner, token, &sync_engine)
+    // 1. Create and persist conversation directly to Drive via memory-only store
+    let mut conv = SyncConversation::new(
+        "stateless_conv_1".to_string(),
+        owner.to_string(),
+        "Stateless Chat".to_string(),
+    );
+    conv.messages.push(SyncMessage::new(
+        "stateless_msg_1".to_string(),
+        "stateless_conv_1".to_string(),
+        "user".to_string(),
+        "Hello from zero-db architecture".to_string(),
+    ));
+
+    sync_engine
+        .persist_conversation_to_drive(owner, conv, token)
         .await
-        .expect("Migration must succeed");
+        .expect("Persist must succeed");
 
-    assert_eq!(mig_result.uploaded_conversations, 1);
-    assert_eq!(mig_result.uploaded_library_items, 1);
+    // 2. Persist library item directly to Drive
+    let content = b"PURE_IN_MEMORY_CONTENT";
+    let lib_item = LibraryItem::new(
+        "stateless_lib_1".to_string(),
+        owner.to_string(),
+        "test.txt".to_string(),
+        "text/plain".to_string(),
+        content.len() as u64,
+        compute_sha256(content),
+        None,
+    );
+    sync_engine
+        .persist_library_item_to_drive(owner, lib_item, content.to_vec(), token)
+        .await
+        .expect("Library persist must succeed");
 
-    // 4. Verify data is now readable directly from Google Drive
+    // 3. Verify cold-start recovery with completely fresh in-memory store (zero database files)
     let fresh_store = Arc::new(LocalSyncStore::new());
     let fresh_engine = SyncEngine::new(mock_drive.clone(), crypto.clone(), fresh_store, true);
 
     let restored_conv = fresh_engine
-        .get_or_hydrate_conversation(owner, "legacy_conv_1", Some(token))
+        .get_or_hydrate_conversation(owner, "stateless_conv_1", Some(token))
         .await
         .unwrap()
-        .expect("Migrated conversation must be accessible on Drive");
-    assert_eq!(restored_conv.title, "Legacy Chat");
-    assert_eq!(restored_conv.messages[0].content, "Old legacy message");
+        .expect("Conversation must be restored directly from Drive");
+    assert_eq!(restored_conv.title, "Stateless Chat");
+    assert_eq!(
+        restored_conv.messages[0].content,
+        "Hello from zero-db architecture"
+    );
 
     let restored_content = fresh_engine
-        .get_library_item_content(owner, "legacy_lib_1", Some(token))
+        .get_library_item_content(owner, "stateless_lib_1", Some(token))
         .await
         .unwrap();
-    assert_eq!(restored_content.as_slice(), b"LEGACY_BINARY_CONTENT");
-
-    // 5. Verify original SQLite file is preserved and not deleted
-    assert!(std::path::Path::new(&db_path).exists());
-
-    let _ = std::fs::remove_dir_all(temp_dir);
+    assert_eq!(restored_content.as_slice(), b"PURE_IN_MEMORY_CONTENT");
 }
 
 #[tokio::test]

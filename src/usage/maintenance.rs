@@ -117,7 +117,6 @@ impl RetentionMaintenanceWorker {
             info!(
                 records_pruned = total_pruned,
                 prune_batches,
-                spool_drained = drain_res.spool.succeeded,
                 retry_drained = drain_res.sqlite.succeeded,
                 duration_ms,
                 "Autonomous retention and retry maintenance cycle completed"
@@ -132,7 +131,7 @@ impl RetentionMaintenanceWorker {
         MaintenanceRunSummary {
             records_pruned: total_pruned,
             prune_batches,
-            spool_recovered: drain_res.spool.succeeded,
+            spool_recovered: 0,
             retry_recovered: drain_res.sqlite.succeeded,
             duration_ms,
         }

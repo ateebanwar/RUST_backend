@@ -27,6 +27,7 @@ pub struct MockProviderAdapter {
     pub call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub failures_remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub transient_mode: bool,
+    pub stream_error: Option<ProviderError>,
 }
 
 impl MockProviderAdapter {
@@ -80,6 +81,7 @@ impl MockProviderAdapter {
             call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failures_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             transient_mode: false,
+            stream_error: None,
         }
     }
 
@@ -150,6 +152,12 @@ impl MockProviderAdapter {
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self.should_fail_with = Some(err);
         self.transient_mode = true;
+        self
+    }
+
+    /// Configure error yielded during streaming generation.
+    pub fn with_stream_error(mut self, err: ProviderError) -> Self {
+        self.stream_error = Some(err);
         self
     }
 
@@ -291,11 +299,12 @@ impl ProviderAdapter for MockProviderAdapter {
                 }));
 
             let chunk_delay = self.chunk_delay;
+            let stream_error = self.stream_error.clone();
             let stream: ProviderStream = if let Some(delay) = chunk_delay {
                 let stream_chunks = self.stream_chunks.clone();
                 let unfold_stream = futures_util::stream::unfold(
-                    (0usize, stream_chunks, stream_usage),
-                    move |(idx, chunks, usage)| async move {
+                    (0usize, stream_chunks, stream_usage, stream_error),
+                    move |(idx, chunks, usage, err_opt)| async move {
                         tokio::time::sleep(delay).await;
                         if idx < chunks.len() {
                             let delta = chunks[idx].clone();
@@ -305,17 +314,21 @@ impl ProviderAdapter for MockProviderAdapter {
                                     is_done: false,
                                     usage: None,
                                 }),
-                                (idx + 1, chunks, usage),
+                                (idx + 1, chunks, usage, err_opt),
                             ))
                         } else if idx == chunks.len() {
-                            Some((
-                                Ok(StreamChunk {
-                                    delta: String::new(),
-                                    is_done: true,
-                                    usage,
-                                }),
-                                (idx + 1, chunks, None),
-                            ))
+                            if let Some(err) = err_opt {
+                                Some((Err(err), (idx + 1, chunks, None, None)))
+                            } else {
+                                Some((
+                                    Ok(StreamChunk {
+                                        delta: String::new(),
+                                        is_done: true,
+                                        usage,
+                                    }),
+                                    (idx + 1, chunks, None, None),
+                                ))
+                            }
                         } else {
                             None
                         }
@@ -335,11 +348,15 @@ impl ProviderAdapter for MockProviderAdapter {
                     })
                     .collect();
 
-                chunks.push(Ok(StreamChunk {
-                    delta: String::new(),
-                    is_done: true,
-                    usage: stream_usage,
-                }));
+                if let Some(err) = stream_error {
+                    chunks.push(Err(err));
+                } else {
+                    chunks.push(Ok(StreamChunk {
+                        delta: String::new(),
+                        is_done: true,
+                        usage: stream_usage,
+                    }));
+                }
 
                 Box::pin(futures_util::stream::iter(chunks))
             };

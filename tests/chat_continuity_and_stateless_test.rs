@@ -138,7 +138,6 @@ async fn test_chat_continuity_across_provider_switching() {
     config.drive_encryption_key =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
     config.google_drive_sync_enabled = true;
-    config.database_path = ":memory:".to_string();
 
     let state = setup_multi_provider_state(config);
     let (base_url, _handle, _mock_drive, sync_engine) = spawn_chat_test_backend(state).await;
@@ -247,7 +246,6 @@ async fn test_streaming_chat_continuity_and_drive_persistence() {
     config.drive_encryption_key =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
     config.google_drive_sync_enabled = true;
-    config.database_path = ":memory:".to_string();
 
     let state = setup_multi_provider_state(config);
     let (base_url, _handle, _mock_drive, sync_engine) = spawn_chat_test_backend(state).await;
@@ -311,7 +309,6 @@ async fn test_cold_start_recovery_from_drive() {
     config.drive_encryption_key =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
     config.google_drive_sync_enabled = true;
-    config.database_path = ":memory:".to_string();
 
     let conv_id = "conv-cold-start-recovery";
     let drive_token = "valid_cold_start_token";
@@ -435,9 +432,7 @@ async fn test_cold_start_recovery_from_drive() {
 
 #[tokio::test]
 async fn test_stateless_and_memory_only_backend() {
-    let mut config = AppConfig::default_local();
-    config.database_path = ":memory:".to_string();
-    config.usage_spool_path = "/tmp/ephemeral_test_spool.log".to_string();
+    let config = AppConfig::default_local();
 
     let state = setup_multi_provider_state(config);
     let (base_url, _handle, _mock_drive, _sync_engine) = spawn_chat_test_backend(state).await;

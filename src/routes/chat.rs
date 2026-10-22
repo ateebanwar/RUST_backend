@@ -225,10 +225,13 @@ pub async fn chat_completions(
                 .await;
 
             // Automatically persist updated conversation turns back to Google Drive
-            if let Some((owner, token_str, mut existing_conv, new_user_msgs)) = conv_context
-                && !token_str.is_empty()
-                && state.sync_engine.crypto().is_configured()
-            {
+            if let Some((owner, token_str, mut existing_conv, new_user_msgs)) = conv_context {
+                if token_str.is_empty() || !state.sync_engine.crypto().is_configured() {
+                    return Err(AppError::UpstreamFailure(
+                        "Google Drive persistence failed: Drive token is empty or encryption key not configured".to_string(),
+                    )
+                    .to_response_with_id(&req_id));
+                }
                 for msg in new_user_msgs {
                     existing_conv.messages.push(crate::drive::SyncMessage::new(
                         format!("msg_{}", generate_msg_id()),
@@ -245,10 +248,14 @@ pub async fn chat_completions(
                 ));
                 existing_conv.revision += 1;
                 existing_conv.updated_at = crate::drive::chrono_like_now();
-                let _ = state
+                state
                     .sync_engine
                     .persist_conversation_to_drive(&owner, existing_conv, &token_str)
-                    .await;
+                    .await
+                    .map_err(|e| {
+                        AppError::UpstreamFailure(format!("Google Drive persistence failed: {e}"))
+                            .to_response_with_id(&req_id)
+                    })?;
             }
 
             Ok((StatusCode::OK, Json(response)))
@@ -361,12 +368,29 @@ struct StreamContext {
     sync_engine: Arc<crate::drive::SyncEngine>,
 }
 
-fn persist_streamed_conversation(mut stream_ctx: StreamContext) {
+enum PersistResult {
+    Saved {
+        conversation_id: String,
+        revision: u64,
+    },
+    SaveFailed {
+        conversation_id: String,
+        error: String,
+    },
+    NotRequested,
+}
+
+async fn execute_persistence(mut stream_ctx: StreamContext) -> PersistResult {
     if let Some((owner, token_str, mut existing_conv, new_user_msgs)) =
         stream_ctx.conv_context.take()
-        && !token_str.is_empty()
-        && stream_ctx.sync_engine.crypto().is_configured()
     {
+        if token_str.is_empty() || !stream_ctx.sync_engine.crypto().is_configured() {
+            return PersistResult::SaveFailed {
+                conversation_id: existing_conv.id,
+                error: "Google Drive sync requested but Drive token is empty or encryption key not configured".to_string(),
+            };
+        }
+
         for msg in new_user_msgs {
             existing_conv.messages.push(crate::drive::SyncMessage::new(
                 format!("msg_{}", generate_msg_id()),
@@ -383,12 +407,92 @@ fn persist_streamed_conversation(mut stream_ctx: StreamContext) {
         ));
         existing_conv.revision += 1;
         existing_conv.updated_at = crate::drive::chrono_like_now();
-        let se = stream_ctx.sync_engine;
-        tokio::spawn(async move {
-            let _ = se
-                .persist_conversation_to_drive(&owner, existing_conv, &token_str)
-                .await;
-        });
+
+        let conv_id = existing_conv.id.clone();
+        let _rev = existing_conv.revision;
+
+        match stream_ctx
+            .sync_engine
+            .persist_conversation_to_drive(&owner, existing_conv, &token_str)
+            .await
+        {
+            Ok(saved_conv) => PersistResult::Saved {
+                conversation_id: saved_conv.id,
+                revision: saved_conv.revision,
+            },
+            Err(e) => PersistResult::SaveFailed {
+                conversation_id: conv_id,
+                error: e.to_string(),
+            },
+        }
+    } else {
+        PersistResult::NotRequested
+    }
+}
+
+fn create_terminal_events(
+    persist_res: PersistResult,
+    guard: Arc<StreamFinalizationGuard>,
+) -> (Event, SseStreamState) {
+    match persist_res {
+        PersistResult::Saved {
+            conversation_id,
+            revision,
+        } => {
+            let done_ev = Event::default().event("done").data(
+                json!({
+                    "status": "completed",
+                    "saved": true,
+                    "conversation_id": conversation_id,
+                    "revision": revision,
+                })
+                .to_string(),
+            );
+            (done_ev, SseStreamState::Terminated { _guard: guard })
+        }
+        PersistResult::SaveFailed {
+            conversation_id,
+            error,
+        } => {
+            let save_err_ev = Event::default().event("save_error").data(
+                json!({
+                    "code": "DRIVE_PERSISTENCE_FAILED",
+                    "message": "Response generated successfully, but Google Drive persistence failed.",
+                    "conversation_id": conversation_id,
+                    "retryable": true,
+                    "details": {
+                        "error": error
+                    }
+                })
+                .to_string(),
+            );
+            let done_ev = Event::default().event("done").data(
+                json!({
+                    "status": "completed_save_failed",
+                    "saved": false,
+                    "conversation_id": conversation_id,
+                    "error": {
+                        "code": "DRIVE_PERSISTENCE_FAILED",
+                        "message": error
+                    }
+                })
+                .to_string(),
+            );
+            (
+                save_err_ev,
+                SseStreamState::EmitTerminalDone { done_ev, guard },
+            )
+        }
+        PersistResult::NotRequested => {
+            let done_ev = Event::default().event("done").data(
+                json!({
+                    "status": "completed",
+                    "saved": false,
+                })
+                .to_string(),
+            );
+            (done_ev, SseStreamState::Terminated { _guard: guard })
+        }
     }
 }
 
@@ -403,6 +507,10 @@ enum SseStreamState {
         inner: ProviderStream,
         guard: Arc<StreamFinalizationGuard>,
         stream_ctx: StreamContext,
+    },
+    EmitTerminalDone {
+        done_ev: Event,
+        guard: Arc<StreamFinalizationGuard>,
     },
     Terminated {
         _guard: Arc<StreamFinalizationGuard>,
@@ -580,12 +688,13 @@ pub async fn chat_stream(
                             });
                         }
 
-                        persist_streamed_conversation(stream_ctx);
+                        if !chunk.delta.is_empty() {
+                            stream_ctx.accumulated_content.push_str(&chunk.delta);
+                        }
 
-                        let done_ev = Event::default()
-                            .event("done")
-                            .data(json!({ "status": "completed" }).to_string());
-                        Some((Ok(done_ev), SseStreamState::Terminated { _guard: guard }))
+                        let persist_res = execute_persistence(stream_ctx).await;
+                        let (first_ev, next_state) = create_terminal_events(persist_res, guard);
+                        Some((Ok(first_ev), next_state))
                     } else {
                         stream_ctx.accumulated_content.push_str(&chunk.delta);
                         let chunk_ev = Event::default()
@@ -672,14 +781,14 @@ pub async fn chat_stream(
                         });
                     }
 
-                    persist_streamed_conversation(stream_ctx);
-
-                    let done_ev = Event::default()
-                        .event("done")
-                        .data(json!({ "status": "completed" }).to_string());
-                    Some((Ok(done_ev), SseStreamState::Terminated { _guard: guard }))
+                    let persist_res = execute_persistence(stream_ctx).await;
+                    let (first_ev, next_state) = create_terminal_events(persist_res, guard);
+                    Some((Ok(first_ev), next_state))
                 }
             },
+            SseStreamState::EmitTerminalDone { done_ev, guard } => {
+                Some((Ok(done_ev), SseStreamState::Terminated { _guard: guard }))
+            }
             SseStreamState::Terminated { .. } => None,
         }
     });

@@ -113,7 +113,7 @@ fn test_request_outcome_variants_and_conversions() {
 // =========================================================================
 
 #[tokio::test]
-async fn test_sqlite_storage_migration_and_persistence() {
+async fn test_in_memory_storage_and_zero_disk_persistence() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -121,7 +121,7 @@ async fn test_sqlite_storage_migration_and_persistence() {
     let temp_dir = std::env::temp_dir().join(format!("ai_backend_test_{now}"));
     let db_path = temp_dir.join("test_usage.db").to_str().unwrap().to_string();
 
-    // 1. Initialize store and verify schema migration runs cleanly
+    // 1. Initialize store and verify in-memory recording
     {
         let storage = UsageStorage::new(&db_path).expect("Storage init must succeed");
         let record = UsageRecord {
@@ -144,12 +144,8 @@ async fn test_sqlite_storage_migration_and_persistence() {
         };
 
         storage.record(record).await.expect("Insert must succeed");
-    }
 
-    // 2. Reopen store from disk and verify persistence across restart
-    {
-        let reopened = UsageStorage::new(&db_path).expect("Reopen must succeed");
-        let summary = reopened
+        let summary = storage
             .get_summary(UsageQueryFilter::default())
             .await
             .expect("Summary query must succeed");
@@ -159,7 +155,24 @@ async fn test_sqlite_storage_migration_and_persistence() {
         assert_eq!(summary.total_tokens, 30);
     }
 
-    // Cleanup temp dir
+    // 2. Strict Zero-Database Verification: No database file was created on disk!
+    assert!(
+        !std::path::Path::new(&db_path).exists(),
+        "FATAL: In-memory store must NEVER create a database file on disk!"
+    );
+
+    // 3. New instance starts clean (zero persistence across restarts)
+    {
+        let fresh = UsageStorage::new(&db_path).expect("Init must succeed");
+        let summary = fresh
+            .get_summary(UsageQueryFilter::default())
+            .await
+            .expect("Summary query must succeed");
+
+        assert_eq!(summary.total_requests, 0);
+    }
+
+    // Cleanup temp dir if created
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 

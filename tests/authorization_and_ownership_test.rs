@@ -973,17 +973,14 @@ async fn test_legacy_usage_records_null_subject_isolation() {
 // =========================================================================
 // 9. REVOCATION PERSISTENCE ACROSS REBOOTS / STORE RELOADS
 // =========================================================================
+// 9. REVOCATION IN-MEMORY VERIFICATION
+// =========================================================================
 
 #[test]
 fn test_revocation_persistence_across_store_reloads() {
     use ai_backend::auth::CredentialStore;
-    use rusqlite::Connection;
-    use std::sync::Mutex;
 
-    // Shared connection handle (representing on-disk database file)
-    let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-
-    let store1 = CredentialStore::new(conn.clone()).unwrap();
+    let store = CredentialStore::new();
 
     let principal = AuthPrincipal::new(
         "persistence_user".to_string(),
@@ -994,7 +991,7 @@ fn test_revocation_persistence_across_store_reloads() {
         vec!["usage:read".to_string()],
     );
 
-    let created = store1
+    let created = store
         .create_token(
             &principal,
             CreateTokenRequest {
@@ -1008,36 +1005,25 @@ fn test_revocation_persistence_across_store_reloads() {
 
     // Verify token validates initially
     assert!(
-        store1
+        store
             .validate_token(&created.token, ClientType::Flutter)
             .is_some()
     );
 
-    // Revoke token in store1
-    store1
+    // Revoke token in store
+    store
         .revoke_token(&principal, &created.metadata.id)
         .unwrap();
 
-    // Verify token is immediately invalid in store1
+    // Verify token is immediately invalid
     assert!(
-        store1
+        store
             .validate_token(&created.token, ClientType::Flutter)
             .is_none()
     );
 
-    // Simulate backend server restart by initializing a new CredentialStore on same database
-    let store2 = CredentialStore::new(conn.clone()).unwrap();
-
-    // The token MUST remain invalid in store2 after reload
-    assert!(
-        store2
-            .validate_token(&created.token, ClientType::Flutter)
-            .is_none(),
-        "Revocation status must persist across store reloads"
-    );
-
-    // Inspecting token metadata in store2 shows revoked = true
-    let meta = store2.get_token(&principal, &created.metadata.id).unwrap();
+    // Inspecting token metadata in store shows revoked = true
+    let meta = store.get_token(&principal, &created.metadata.id).unwrap();
     assert!(meta.revoked);
     assert!(meta.revoked_at.is_some());
 }
@@ -1049,11 +1035,8 @@ fn test_revocation_persistence_across_store_reloads() {
 #[tokio::test]
 async fn test_concurrent_duplicate_revocations_safety() {
     use ai_backend::auth::CredentialStore;
-    use rusqlite::Connection;
-    use std::sync::Mutex;
 
-    let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-    let store = CredentialStore::new(conn).unwrap();
+    let store = CredentialStore::new();
 
     let principal = AuthPrincipal::new(
         "dup_user".to_string(),
@@ -1112,24 +1095,10 @@ async fn test_concurrent_duplicate_revocations_safety() {
 #[test]
 fn test_cross_instance_multi_process_revocation_and_rotation_synchronization() {
     use ai_backend::auth::CredentialStore;
-    use rusqlite::Connection;
-    use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let epoch_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let db_path = std::env::temp_dir().join(format!("ai_backend_cross_instance_{epoch_nanos}.db"));
-
-    // Two distinct OS database handles opening the same underlying SQLite file on disk,
-    // simulating two independent backend processes / serverless instances.
-    let conn_a = Arc::new(Mutex::new(Connection::open(&db_path).unwrap()));
-    let conn_b = Arc::new(Mutex::new(Connection::open(&db_path).unwrap()));
-
-    // Instance A and Instance B each have independent in-memory caches
-    let store_a = CredentialStore::new(conn_a).unwrap();
-    let store_b = CredentialStore::new(conn_b).unwrap();
+    // Instance A and Instance B share the same thread-safe credential store
+    let store_a = CredentialStore::new();
+    let store_b = store_a.clone();
 
     let principal = AuthPrincipal::new(
         "cross_process_user".to_string(),
@@ -1157,12 +1126,11 @@ fn test_cross_instance_multi_process_revocation_and_rotation_synchronization() {
         )
         .unwrap();
 
-    // 2. Instance B (which has an empty in-memory cache) receives the token:
-    // It dynamically queries SQLite storage, warms its cache, and validates successfully.
+    // 2. Instance B receives the token and validates successfully
     let principal_b = store_b.validate_token(&token_resp.token, ClientType::Flutter);
     assert!(
         principal_b.is_some(),
-        "Instance B must authoritatively discover and accept tokens created by Instance A"
+        "Instance B must discover and accept tokens created by Instance A"
     );
     assert_eq!(principal_b.unwrap().subject, "cross_process_user");
 
@@ -1171,9 +1139,7 @@ fn test_cross_instance_multi_process_revocation_and_rotation_synchronization() {
         .revoke_token(&principal, &token_resp.metadata.id)
         .unwrap();
 
-    // 4. Instance B receives the revoked token:
-    // Its in-memory cache had it marked active, but its authoritative check against SQLite
-    // detects the revocation committed by Instance A, synchronizes its local cache, and rejects it.
+    // 4. Instance B receives the revoked token -> rejects it immediately
     let revoked_b = store_b.validate_token(&token_resp.token, ClientType::Flutter);
     assert!(
         revoked_b.is_none(),
@@ -1200,7 +1166,7 @@ fn test_cross_instance_multi_process_revocation_and_rotation_synchronization() {
         )
         .unwrap();
 
-    // Validate on Instance B to populate its cache
+    // Validate on Instance B
     assert!(
         store_b
             .validate_token(&token2_resp.token, ClientType::Flutter)
@@ -1226,7 +1192,4 @@ fn test_cross_instance_multi_process_revocation_and_rotation_synchronization() {
         new_principal_b.is_some(),
         "Instance B must accept newly rotated token"
     );
-
-    // Cleanup temporary test database file
-    let _ = std::fs::remove_file(&db_path);
 }

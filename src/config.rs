@@ -113,8 +113,6 @@ pub struct AppConfig {
     pub google_jwks_url: Option<String>,
     /// Explicit override for requiring authentication in non-production (loaded from AUTH_REQUIRED).
     pub auth_required: Option<bool>,
-    /// Path to persistent SQLite database for usage tracking (loaded from DATABASE_PATH).
-    pub database_path: String,
     /// Usage history retention window in days (loaded from USAGE_RETENTION_DAYS).
     pub usage_retention_days: Option<u64>,
     /// Maximum retries per candidate for transient errors (loaded from MAX_RETRIES).
@@ -137,10 +135,6 @@ pub struct AppConfig {
     pub usage_cleanup_interval_secs: u64,
     /// Bounded batch deletion limit for autonomous usage retention cleanup (loaded from USAGE_CLEANUP_BATCH_SIZE, default 1000).
     pub usage_cleanup_batch_size: usize,
-    /// Path to independent local disk spool for durable usage fallback (loaded from USAGE_SPOOL_PATH, default "data/usage_spool.log").
-    pub usage_spool_path: String,
-    /// Maximum capacity ceiling in bytes for independent usage spool (loaded from USAGE_MAX_SPOOL_BYTES, default 10MB).
-    pub usage_max_spool_bytes: u64,
 
     // --- Phase 13: Abuse Prevention and Rate Limiting ---
     /// Whether rate limiting and abuse controls are actively enforced (loaded from RATE_LIMIT_ENABLED, default true).
@@ -214,7 +208,6 @@ impl AppConfig {
             google_client_ids: Vec::new(),
             google_jwks_url: None,
             auth_required: None,
-            database_path: "data/usage.db".to_string(),
             usage_retention_days: None,
             max_retries: 1,
             max_failover_candidates: 3,
@@ -226,8 +219,6 @@ impl AppConfig {
             allowed_hosts: Vec::new(),
             usage_cleanup_interval_secs: 3600,
             usage_cleanup_batch_size: 1000,
-            usage_spool_path: "data/usage_spool.log".to_string(),
-            usage_max_spool_bytes: 10 * 1024 * 1024, // 10 MB default ceiling
             rate_limit_enabled: true,
             rate_limit_ip_burst: 100,
             rate_limit_ip_rate: 20.0,
@@ -261,12 +252,10 @@ impl AppConfig {
         }
     }
 
-    /// Default serverless configuration with in-memory usage storage and ephemeral spooling.
+    /// Default serverless configuration with in-memory usage storage.
     pub fn default_serverless() -> Self {
         let mut cfg = Self::default_local();
         cfg.deployment_mode = DeploymentMode::Serverless;
-        cfg.database_path = ":memory:".to_string();
-        cfg.usage_spool_path = "/tmp/usage_spool.log".to_string();
         cfg
     }
 
@@ -442,12 +431,6 @@ impl AppConfig {
             config.auth_required = Some(auth_req);
         }
 
-        if let Some(db) = get_var("DATABASE_PATH") {
-            config.database_path = db;
-        } else if config.deployment_mode == DeploymentMode::Serverless {
-            config.database_path = ":memory:".to_string();
-        }
-
         if let Some(days) =
             get_var("USAGE_RETENTION_DAYS").and_then(|r| r.trim().parse::<u64>().ok())
         {
@@ -511,18 +494,6 @@ impl AppConfig {
             get_var("USAGE_CLEANUP_BATCH_SIZE").and_then(|r| r.trim().parse::<usize>().ok())
         {
             config.usage_cleanup_batch_size = batch;
-        }
-
-        if let Some(spool) = get_var("USAGE_SPOOL_PATH") {
-            config.usage_spool_path = spool;
-        } else if config.deployment_mode == DeploymentMode::Serverless {
-            config.usage_spool_path = "/tmp/usage_spool.log".to_string();
-        }
-
-        if let Some(bytes) =
-            get_var("USAGE_MAX_SPOOL_BYTES").and_then(|r| r.trim().parse::<u64>().ok())
-        {
-            config.usage_max_spool_bytes = bytes;
         }
 
         if let Some(rle) = get_var("RATE_LIMIT_ENABLED").and_then(|r| r.trim().parse::<bool>().ok())
@@ -942,22 +913,6 @@ impl AppConfig {
             });
         }
 
-        if self.usage_spool_path.trim().is_empty() {
-            return Err(ConfigError::InvalidValue {
-                key: "USAGE_SPOOL_PATH",
-                value: self.usage_spool_path.clone(),
-                reason: "USAGE_SPOOL_PATH cannot be empty",
-            });
-        }
-
-        if self.usage_max_spool_bytes < 1024 || self.usage_max_spool_bytes > 1_000_000_000 {
-            return Err(ConfigError::InvalidValue {
-                key: "USAGE_MAX_SPOOL_BYTES",
-                value: self.usage_max_spool_bytes.to_string(),
-                reason: "USAGE_MAX_SPOOL_BYTES must be between 1 KB (1024) and 1 GB (1,000,000,000)",
-            });
-        }
-
         // --- Phase 13: Rate limiting validation ---
         if self.rate_limit_ip_burst == 0 {
             return Err(ConfigError::InvalidValue {
@@ -1135,7 +1090,6 @@ impl fmt::Debug for AppConfig {
             .field("google_client_ids", &self.google_client_ids)
             .field("google_jwks_url", &self.google_jwks_url)
             .field("auth_required", &self.auth_required)
-            .field("database_path", &self.database_path)
             .field("usage_retention_days", &self.usage_retention_days)
             .field("max_retries", &self.max_retries)
             .field("max_failover_candidates", &self.max_failover_candidates)
@@ -1153,8 +1107,6 @@ impl fmt::Debug for AppConfig {
                 &self.usage_cleanup_interval_secs,
             )
             .field("usage_cleanup_batch_size", &self.usage_cleanup_batch_size)
-            .field("usage_spool_path", &self.usage_spool_path)
-            .field("usage_max_spool_bytes", &self.usage_max_spool_bytes)
             .field("rate_limit_enabled", &self.rate_limit_enabled)
             .field("rate_limit_ip_burst", &self.rate_limit_ip_burst)
             .field("rate_limit_ip_rate", &self.rate_limit_ip_rate)

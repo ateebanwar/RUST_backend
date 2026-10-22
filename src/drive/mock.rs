@@ -35,6 +35,8 @@ pub struct MockDriveClient {
     inject_quota_exceeded: Arc<RwLock<bool>>,
     inject_rate_limited: Arc<RwLock<Option<u64>>>,
     inject_transient_failures: Arc<AtomicU32>,
+    inject_manifest_failure: Arc<RwLock<bool>>,
+    inject_upload_failure: Arc<RwLock<bool>>,
 }
 
 impl Default for MockDriveClient {
@@ -54,6 +56,8 @@ impl MockDriveClient {
             inject_quota_exceeded: Arc::new(RwLock::new(false)),
             inject_rate_limited: Arc::new(RwLock::new(None)),
             inject_transient_failures: Arc::new(AtomicU32::new(0)),
+            inject_manifest_failure: Arc::new(RwLock::new(false)),
+            inject_upload_failure: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -81,6 +85,16 @@ impl MockDriveClient {
     pub fn set_transient_failures(&self, count: u32) {
         self.inject_transient_failures
             .store(count, Ordering::SeqCst);
+    }
+
+    /// Configure simulated manifest.json update failure after blob upload.
+    pub async fn set_inject_manifest_failure(&self, inject: bool) {
+        *self.inject_manifest_failure.write().await = inject;
+    }
+
+    /// Configure simulated failure on file uploads only.
+    pub async fn set_inject_upload_failure(&self, inject: bool) {
+        *self.inject_upload_failure.write().await = inject;
     }
 
     /// Get total number of files currently stored.
@@ -188,6 +202,20 @@ impl DriveClient for MockDriveClient {
     ) -> BoxedDriveFuture<'a, DriveFileMetadata> {
         Box::pin(async move {
             self.check_injections(token).await?;
+
+            if *self.inject_upload_failure.read().await {
+                return Err(DriveError::QuotaExceeded(
+                    "Simulated Google Drive upload quota reached (403)".to_string(),
+                ));
+            }
+
+            if *self.inject_manifest_failure.read().await
+                && (name == "sync_manifest.json" || name == "manifest.json")
+            {
+                return Err(DriveError::NetworkError(
+                    "Simulated manifest commit failure (HTTP 500)".to_string(),
+                ));
+            }
 
             let now = crate::drive::models::chrono_like_now();
             let mut lock = self.files.write().await;

@@ -2,6 +2,57 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Final Master Pass: Strict Zero-Database Architecture & Streaming Save Safety Contract
+
+### Strict Zero-Database Architecture (Eradication of SQLite & Local Spool Files)
+- **Zero Local Database Files:**
+  - Completely eradicated `rusqlite` dependency from `Cargo.toml`.
+  - Removed all SQLite table migrations, queries, and file-based connection handling.
+  - Removed `database_path`, `usage_spool_path`, and `usage_max_spool_bytes` from `AppConfig`, `.env` parser, defaults, validation, and debug representations.
+  - Completely deleted `src/usage/spool.rs` and `src/drive/migration.rs`.
+- **Pure In-Memory Telemetry with Bounded Capacity:**
+  - Rewrote `UsageStorage` (`src/usage/storage.rs`) to operate 100% in RAM via thread-safe `Arc<RwLock<Vec<UsageRecord>>>`.
+  - Enforced strict FIFO bounded capacity (`MAX_IN_MEMORY_USAGE_RECORDS = 10_000`) preventing memory exhaustion under high throughput.
+  - Added scheduled in-memory retry tracking with monotonic timestamps (`next_retry_at = now + 5s`).
+  - Rewrote `CredentialStore` (`src/auth/credential_store.rs`) to pure in-memory `Arc<RwLock<HashMap<String, StoredCredential>>>` with constant-time token validation and IDOR protection.
+  - Refactored `LocalSyncStore` (`src/drive/local_store.rs`) as a transient in-memory working cache (`is_persistent() -> false`).
+- **Google Drive as Sole User Data Store:**
+  - Reaffirmed Google Drive's hidden `appDataFolder` as the sole permanent source of truth for all user conversations, messages, library items, and manifests.
+  - Ephemeral runtime creates exactly 0 database files and 0 disk spool files across daemon, local, and serverless modes.
+  - Validated by new dedicated regression suite `tests/zero_database_regression_test.rs` (4/4 passed).
+
+### Streaming Save Safety Contract (No False Save Acknowledgements)
+- **Safe Persistence Protocol (`src/routes/chat.rs`):**
+  - Audited and updated SSE streaming chat: client never receives `event: done` with `saved: true` until Google Drive persistence succeeds.
+  - When Drive persistence fails on streaming completions:
+    1. Emits `event: save_error` with `code: "DRIVE_PERSISTENCE_FAILED"` and retryable flag.
+    2. Emits terminal `event: done` with `status: "completed_save_failed"` and `saved: false`.
+  - Negative assertion verified: no event claiming `saved: true` is ever emitted when persistence fails.
+  - Buffered completions fail closed with HTTP 502 Bad Gateway (`UPSTREAM_FAILURE`) if Google Drive persistence fails.
+- **Comprehensive Failure Injection Test Suite (`tests/streaming_safety_and_failure_injection_test.rs`):**
+  - Implemented 10 comprehensive failure injection scenarios:
+    1. Drive upload success: confirms terminal `done` with `saved: true` and local store update.
+    2. Drive upload quota/network failure: emits `event: save_error` followed by `completed_save_failed` (`saved: false`).
+    3. Manifest revision update failure after blob upload: handles commit failure safely.
+    4. Provider failure during chunk generation: emits `event: error` and prevents any save event.
+    5. Client stream disconnect/cancellation: drop guard finalizes usage without false save acknowledgement.
+    6. Repeated requests: idempotent message deduplication prevents duplicate turns.
+    7. Concurrent updates and revision conflicts: handles concurrent turn progression.
+    8. Missing/invalid Drive authorization: fails closed with HTTP 401 Unauthorized.
+    9. Buffered completion Drive failure: fails closed with HTTP 502 Bad Gateway (`UPSTREAM_FAILURE`).
+    10. Stateless streaming chat (no `conversation_id`): emits `status: "completed"`, `saved: false`.
+  - All 10/10 tests passing in ~0.10s.
+
+### Full Quality & Verification Suite
+- `cargo fmt --check`: Clean (0 diffs).
+- `cargo check --all-targets --all-features`: Clean (0 errors, 0 warnings).
+- `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+- `cargo test --all-targets --all-features`: 100% passing across all 25+ test suites (0 failures).
+- `cargo build --release`: Clean release build in 1m 21s.
+- Zero secrets detected in diff or codebase.
+- Note: Genuine live Google Drive interaction is intentionally postponed until front-end UI and OAuth flows are connected.
+
+
 ## 2026-10-22 — Final Backend Completion & Verification Directive: Multi-Provider Chat Continuity, Zero-Disk Serverless Guarantee & Google Drive Live Integration
 
 ### Implemented & Reconciled Capabilities

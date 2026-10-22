@@ -1,22 +1,22 @@
 //! Dynamic Personal Access Token & Credential Lifecycle Manager.
 //!
-//! Enforces:
-//! 1. Cryptographically secure token generation (`ring::rand`).
-//! 2. One-way SHA-256 storage hashing — secrets are never persisted in plaintext.
-//! 3. Single-exposure token semantics — plaintext returned once upon creation or rotation.
-//! 4. Masked credential representations (`pat_a1b2...ef01`) for list/inspection endpoints.
-//! 5. Strict resource ownership and tenant isolation (cross-user access/revocation blocked).
-//! 6. Privilege escalation defense — callers cannot grant scopes exceeding their own.
-//! 7. Immediate, atomic revocation and rotation invalidation.
+//! Conforms strictly to zero-database architecture:
+//! - Operates 100% in memory with zero SQLite, zero disk files, zero persistence.
+//! - Cryptographically secure token generation (`ring::rand`).
+//! - One-way SHA-256 storage hashing — secrets are never stored in plaintext.
+//! - Single-exposure token semantics — plaintext returned once upon creation or rotation.
+//! - Masked credential representations (`pat_a1b2...ef01`) for list/inspection endpoints.
+//! - Strict resource ownership and tenant isolation (cross-user access/revocation blocked).
+//! - Privilege escalation defense — callers cannot grant scopes exceeding their own.
+//! - Immediate, atomic revocation and rotation invalidation.
 
 use super::pat::{constant_time_eq_32, generate_secure_pat, hash_token};
 use super::principal::{AuthPrincipal, AuthRole, AuthType, ClientType};
 use crate::errors::AppError;
 use crate::security::mask_credential;
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Non-secret metadata representing a configured or dynamic credential.
@@ -85,122 +85,29 @@ pub struct RotateTokenResponse {
     pub metadata: CredentialMetadata,
 }
 
-/// Thread-safe storage engine for dynamic Personal Access Tokens.
+/// Thread-safe in-memory storage engine for dynamic Personal Access Tokens.
 #[derive(Clone)]
 pub struct CredentialStore {
-    conn: Arc<Mutex<Connection>>,
     cache: Arc<RwLock<HashMap<String, CachedCredential>>>,
 }
 
+impl Default for CredentialStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CredentialStore {
-    /// Initialize with an existing SQLite connection handle.
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Result<Self, AppError> {
-        let store = Self {
-            conn,
+    /// Initialize a new in-memory CredentialStore.
+    pub fn new() -> Self {
+        Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
-        };
-        store.run_migrations()?;
-        store.refresh_cache()?;
-        Ok(store)
-    }
-
-    /// Initialize SQLite table schema and indexes.
-    fn run_migrations(&self) -> Result<(), AppError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| AppError::InternalError(format!("CredentialStore lock error: {e}")))?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS credentials (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                owner_subject TEXT NOT NULL,
-                token_hash BLOB NOT NULL,
-                masked_token TEXT NOT NULL,
-                roles_json TEXT NOT NULL,
-                scopes_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER,
-                revoked INTEGER NOT NULL DEFAULT 0,
-                revoked_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_credentials_owner ON credentials(owner_subject);
-            CREATE INDEX IF NOT EXISTS idx_credentials_revoked ON credentials(revoked);
-            CREATE INDEX IF NOT EXISTS idx_credentials_token_hash ON credentials(token_hash);",
-        )
-        .map_err(|e| {
-            AppError::InternalError(format!("Failed to create credentials schema: {e}"))
-        })?;
-
-        Ok(())
-    }
-
-    /// Refresh in-memory validation cache from database.
-    fn refresh_cache(&self) -> Result<(), AppError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| AppError::InternalError(format!("CredentialStore lock error: {e}")))?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, owner_subject, token_hash, masked_token, roles_json, scopes_json, created_at, expires_at, revoked, revoked_at FROM credentials",
-            )
-            .map_err(|e| AppError::InternalError(format!("Failed to prepare cache load: {e}")))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let owner_subject: String = row.get(2)?;
-                let token_hash_bytes: Vec<u8> = row.get(3)?;
-                let masked_token: String = row.get(4)?;
-                let roles_json: String = row.get(5)?;
-                let scopes_json: String = row.get(6)?;
-                let created_at: i64 = row.get(7)?;
-                let expires_at: Option<i64> = row.get(8)?;
-                let revoked_int: i64 = row.get(9)?;
-                let revoked_at: Option<i64> = row.get(10)?;
-
-                let mut token_hash = [0u8; 32];
-                if token_hash_bytes.len() == 32 {
-                    token_hash.copy_from_slice(&token_hash_bytes);
-                }
-
-                let roles: Vec<AuthRole> = serde_json::from_str(&roles_json).unwrap_or_default();
-                let scopes: Vec<String> = serde_json::from_str(&scopes_json).unwrap_or_default();
-
-                Ok(CachedCredential {
-                    metadata: CredentialMetadata {
-                        id,
-                        name,
-                        owner_subject,
-                        masked_token,
-                        roles,
-                        scopes,
-                        created_at: created_at as u64,
-                        expires_at: expires_at.map(|v| v as u64),
-                        revoked: revoked_int != 0,
-                        revoked_at: revoked_at.map(|v| v as u64),
-                    },
-                    token_hash,
-                })
-            })
-            .map_err(|e| AppError::InternalError(format!("Failed to query credentials: {e}")))?;
-
-        let mut new_cache = HashMap::new();
-        for item in rows.flatten() {
-            new_cache.insert(item.metadata.id.clone(), item);
         }
+    }
 
-        let mut cache_lock = self
-            .cache
-            .write()
-            .map_err(|e| AppError::InternalError(format!("Cache write lock poisoned: {e}")))?;
-        *cache_lock = new_cache;
-
-        Ok(())
+    /// Compatibility constructor for tests or callers previously passing connection handles.
+    pub fn new_with_conn<T>(_conn: T) -> Result<Self, AppError> {
+        Ok(Self::new())
     }
 
     /// Create a new Personal Access Token for the authenticated principal.
@@ -218,27 +125,44 @@ impl CredentialStore {
 
         // Scope privilege escalation check:
         // A non-admin user cannot grant scopes they do not possess themselves.
-        let granted_scopes = if let Some(requested_scopes) = req.scopes {
-            if !caller.is_admin() && !caller.has_scope("*") {
-                for s in &requested_scopes {
-                    if !caller.has_scope(s) {
-                        return Err(AppError::Forbidden(format!(
-                            "Privilege escalation denied: Caller cannot grant scope '{s}' which they do not possess"
-                        )));
-                    }
+        if !caller.is_admin() {
+            for s in req.scopes.as_deref().unwrap_or_default() {
+                if !caller.has_scope(s) {
+                    return Err(AppError::Forbidden(format!(
+                        "Privilege escalation denied: caller lacks scope '{s}' and cannot grant it"
+                    )));
                 }
             }
-            requested_scopes
-        } else {
-            // Default to caller's scopes if not specified
-            caller.scopes.clone()
+        }
+
+        // Target subject determination:
+        // Admin callers can create tokens on behalf of another subject.
+        // Non-admin callers cannot create tokens for anyone other than themselves.
+        let target_subject = match req.owner_subject {
+            Some(target) => {
+                let target_trimmed = target.trim();
+                if target_trimmed.is_empty() {
+                    return Err(AppError::InvalidRequest(
+                        "owner_subject cannot be empty".to_string(),
+                    ));
+                }
+                if target_trimmed != caller.subject && !caller.is_admin() {
+                    return Err(AppError::Forbidden(
+                        "Only administrators may create credentials on behalf of other subjects"
+                            .to_string(),
+                    ));
+                }
+                target_trimmed.to_string()
+            }
+            None => caller.subject.clone(),
         };
 
-        let raw_token = generate_secure_pat().map_err(|_| {
-            AppError::InternalError("Failed to generate secure random token".to_string())
-        })?;
-        let token_hash = hash_token(&raw_token);
-        let masked = mask_credential(&raw_token);
+        let granted_scopes = req.scopes.unwrap_or_else(|| caller.scopes.clone());
+        let granted_roles = if caller.is_admin() && target_subject != caller.subject {
+            vec![AuthRole::User]
+        } else {
+            caller.roles.clone()
+        };
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -247,46 +171,23 @@ impl CredentialStore {
 
         let expires_at = req.expires_in_secs.map(|secs| now.saturating_add(secs));
 
-        let mut id_bytes = [0u8; 8];
-        id_bytes.copy_from_slice(&token_hash[0..8]);
-        let rand_val = u64::from_le_bytes(id_bytes);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let cred_id = format!("cred_{:016x}", nanos ^ rand_val);
-
-        // Subject ownership & IDOR resolution
-        let owner_subject = match req.owner_subject {
-            Some(target) => {
-                let trimmed = target.trim();
-                if trimmed.is_empty() {
-                    caller.subject.clone()
-                } else {
-                    if !caller.is_admin() && trimmed != caller.subject {
-                        return Err(AppError::Forbidden(format!(
-                            "IDOR violation: Principal '{}' is forbidden from creating tokens for subject '{trimmed}'",
-                            caller.subject
-                        )));
-                    }
-                    trimmed.to_string()
-                }
-            }
-            None => caller.subject.clone(),
-        };
-
-        let assigned_roles = if caller.is_admin() && owner_subject != caller.subject {
-            vec![AuthRole::User]
-        } else {
-            caller.roles.clone()
-        };
+        // Generate 64-hex-character token
+        let token_plaintext = generate_secure_pat().map_err(|_| {
+            AppError::InternalError("Failed to generate secure random token".to_string())
+        })?;
+        let token_hash = hash_token(&token_plaintext);
+        let rand_id = generate_secure_pat().map_err(|_| {
+            AppError::InternalError("Failed to generate secure random ID".to_string())
+        })?;
+        let cred_id = format!("cred_{}", &rand_id[..20]);
+        let masked = mask_credential(&token_plaintext);
 
         let metadata = CredentialMetadata {
             id: cred_id.clone(),
             name: name_trimmed.to_string(),
-            owner_subject,
+            owner_subject: target_subject,
             masked_token: masked,
-            roles: assigned_roles,
+            roles: granted_roles,
             scopes: granted_scopes,
             created_at: now,
             expires_at,
@@ -294,498 +195,216 @@ impl CredentialStore {
             revoked_at: None,
         };
 
-        // Write to database
-        {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| AppError::InternalError(format!("Database lock error: {e}")))?;
+        let cached = CachedCredential {
+            metadata: metadata.clone(),
+            token_hash,
+        };
 
-            let roles_json = serde_json::to_string(&metadata.roles)
-                .map_err(|e| AppError::InternalError(e.to_string()))?;
-            let scopes_json = serde_json::to_string(&metadata.scopes)
-                .map_err(|e| AppError::InternalError(e.to_string()))?;
-
-            conn.execute(
-                "INSERT INTO credentials (
-                    id, name, owner_subject, token_hash, masked_token, roles_json, scopes_json, created_at, expires_at, revoked, revoked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL)",
-                params![
-                    metadata.id,
-                    metadata.name,
-                    metadata.owner_subject,
-                    token_hash.as_slice(),
-                    metadata.masked_token,
-                    roles_json,
-                    scopes_json,
-                    metadata.created_at as i64,
-                    metadata.expires_at.map(|v| v as i64),
-                ],
-            )
-            .map_err(|e| AppError::InternalError(format!("Failed to insert credential: {e}")))?;
-        }
-
-        // Update in-memory cache
-        {
-            let mut cache_lock = self
-                .cache
-                .write()
-                .map_err(|e| AppError::InternalError(format!("Cache lock error: {e}")))?;
-            cache_lock.insert(
-                metadata.id.clone(),
-                CachedCredential {
-                    metadata: metadata.clone(),
-                    token_hash,
-                },
-            );
-        }
+        let mut cache_lock = self
+            .cache
+            .write()
+            .map_err(|e| AppError::InternalError(format!("Cache write lock error: {e}")))?;
+        cache_lock.insert(cred_id, cached);
 
         Ok(CreateTokenResponse {
-            token: raw_token,
+            token: token_plaintext,
             metadata,
         })
     }
 
-    /// List credentials with tenant isolation.
-    ///
-    /// Standard users see strictly their own credentials.
-    /// Attempting to view another user's credentials returns 403 Forbidden.
+    /// List credentials belonging to the caller (or all credentials for admin).
     pub fn list_tokens(
         &self,
         caller: &AuthPrincipal,
-        filter_owner: Option<&str>,
+        target_subject: Option<&str>,
     ) -> Result<Vec<CredentialMetadata>, AppError> {
-        let target_subject = match filter_owner {
-            Some(requested) => {
-                if !caller.is_admin() && requested != caller.subject {
-                    return Err(AppError::Forbidden(format!(
-                        "IDOR violation: Principal '{}' is forbidden from listing credentials for subject '{requested}'",
-                        caller.subject
-                    )));
-                }
-                Some(requested.to_string())
-            }
-            None => {
-                if caller.is_admin() {
-                    None // Admin viewing all
-                } else {
-                    Some(caller.subject.clone()) // User viewing own
-                }
-            }
-        };
-
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| AppError::InternalError(format!("Database lock error: {e}")))?;
-
-        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match target_subject {
-            Some(ref target) => (
-                "SELECT id, name, owner_subject, masked_token, roles_json, scopes_json, created_at, expires_at, revoked, revoked_at FROM credentials WHERE owner_subject = ?1 ORDER BY created_at DESC",
-                vec![Box::new(target.clone())],
-            ),
-            None => (
-                "SELECT id, name, owner_subject, masked_token, roles_json, scopes_json, created_at, expires_at, revoked, revoked_at FROM credentials ORDER BY created_at DESC",
-                Vec::new(),
-            ),
-        };
-
-        let rusqlite_params: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
-
-        let mut stmt = conn.prepare(sql).map_err(|e| {
-            AppError::InternalError(format!("Failed to prepare list tokens query: {e}"))
-        })?;
-
-        let rows = stmt
-            .query_map(rusqlite_params.as_slice(), |row| {
-                let id: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let owner_subject: String = row.get(2)?;
-                let masked_token: String = row.get(3)?;
-                let roles_json: String = row.get(4)?;
-                let scopes_json: String = row.get(5)?;
-                let created_at: i64 = row.get(6)?;
-                let expires_at: Option<i64> = row.get(7)?;
-                let revoked_int: i64 = row.get(8)?;
-                let revoked_at: Option<i64> = row.get(9)?;
-
-                let roles: Vec<AuthRole> = serde_json::from_str(&roles_json).unwrap_or_default();
-                let scopes: Vec<String> = serde_json::from_str(&scopes_json).unwrap_or_default();
-
-                Ok(CredentialMetadata {
-                    id,
-                    name,
-                    owner_subject,
-                    masked_token,
-                    roles,
-                    scopes,
-                    created_at: created_at as u64,
-                    expires_at: expires_at.map(|v| v as u64),
-                    revoked: revoked_int != 0,
-                    revoked_at: revoked_at.map(|v| v as u64),
-                })
-            })
-            .map_err(|e| {
-                AppError::InternalError(format!("Failed to execute list tokens query: {e}"))
-            })?;
+        let cache_lock = self
+            .cache
+            .read()
+            .map_err(|e| AppError::InternalError(format!("Cache read lock error: {e}")))?;
 
         let mut results = Vec::new();
-        for r in rows.flatten() {
-            results.push(r);
+        for item in cache_lock.values() {
+            if let Some(target) = target_subject {
+                if item.metadata.owner_subject == target
+                    && (caller.is_admin() || caller.subject == target)
+                {
+                    results.push(item.metadata.clone());
+                }
+            } else if caller.is_admin() || item.metadata.owner_subject == caller.subject {
+                results.push(item.metadata.clone());
+            }
         }
+
+        results.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(results)
     }
 
-    /// Retrieve metadata for an individual credential with ownership enforcement.
+    /// Get non-secret metadata for a specific credential ID with IDOR protection.
+    pub fn get_token_metadata(
+        &self,
+        caller: &AuthPrincipal,
+        token_id: &str,
+    ) -> Result<CredentialMetadata, AppError> {
+        let cache_lock = self
+            .cache
+            .read()
+            .map_err(|e| AppError::InternalError(format!("Cache read lock error: {e}")))?;
+
+        match cache_lock.get(token_id) {
+            Some(item) => {
+                if !caller.is_admin() && item.metadata.owner_subject != caller.subject {
+                    return Err(AppError::NotFound(format!(
+                        "Credential '{token_id}' not found"
+                    )));
+                }
+                Ok(item.metadata.clone())
+            }
+            None => Err(AppError::NotFound(format!(
+                "Credential '{token_id}' not found"
+            ))),
+        }
+    }
+
+    /// Alias for get_token_metadata.
     pub fn get_token(
         &self,
         caller: &AuthPrincipal,
         token_id: &str,
     ) -> Result<CredentialMetadata, AppError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| AppError::InternalError(format!("Database lock error: {e}")))?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, owner_subject, masked_token, roles_json, scopes_json, created_at, expires_at, revoked, revoked_at FROM credentials WHERE id = ?1",
-            )
-            .map_err(|e| AppError::InternalError(format!("Failed to prepare get token query: {e}")))?;
-
-        let maybe_row = stmt.query_row(params![token_id], |row| {
-            let id: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let owner_subject: String = row.get(2)?;
-            let masked_token: String = row.get(3)?;
-            let roles_json: String = row.get(4)?;
-            let scopes_json: String = row.get(5)?;
-            let created_at: i64 = row.get(6)?;
-            let expires_at: Option<i64> = row.get(7)?;
-            let revoked_int: i64 = row.get(8)?;
-            let revoked_at: Option<i64> = row.get(9)?;
-
-            let roles: Vec<AuthRole> = serde_json::from_str(&roles_json).unwrap_or_default();
-            let scopes: Vec<String> = serde_json::from_str(&scopes_json).unwrap_or_default();
-
-            Ok(CredentialMetadata {
-                id,
-                name,
-                owner_subject,
-                masked_token,
-                roles,
-                scopes,
-                created_at: created_at as u64,
-                expires_at: expires_at.map(|v| v as u64),
-                revoked: revoked_int != 0,
-                revoked_at: revoked_at.map(|v| v as u64),
-            })
-        });
-
-        let meta = match maybe_row {
-            Ok(m) => m,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(AppError::NotFound(format!(
-                    "Credential '{token_id}' not found"
-                )));
-            }
-            Err(e) => {
-                return Err(AppError::InternalError(format!(
-                    "Database query error: {e}"
-                )));
-            }
-        };
-
-        if !caller.is_admin() && meta.owner_subject != caller.subject {
-            // Return 404 to prevent resource existence enumeration (IDOR mitigation)
-            return Err(AppError::NotFound(format!(
-                "Credential '{token_id}' not found"
-            )));
-        }
-
-        // Keep local memory cache updated
-        if let Ok(mut cache_lock) = self.cache.write()
-            && let Some(entry) = cache_lock.get_mut(token_id)
-        {
-            entry.metadata = meta.clone();
-        }
-
-        Ok(meta)
+        self.get_token_metadata(caller, token_id)
     }
 
-    /// Revoke a credential immediately.
-    pub fn revoke_token(&self, caller: &AuthPrincipal, token_id: &str) -> Result<(), AppError> {
-        // Enforce ownership
-        let cred_meta = self.get_token(caller, token_id)?;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Update database
-        {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| AppError::InternalError(format!("Database lock error: {e}")))?;
-
-            conn.execute(
-                "UPDATE credentials SET revoked = 1, revoked_at = ?1 WHERE id = ?2",
-                params![now as i64, cred_meta.id],
-            )
-            .map_err(|e| AppError::InternalError(format!("Failed to revoke credential: {e}")))?;
-        }
-
-        // Atomically update in-memory cache
-        {
-            let mut cache_lock = self
-                .cache
-                .write()
-                .map_err(|e| AppError::InternalError(format!("Cache lock error: {e}")))?;
-            if let Some(c) = cache_lock.get_mut(&cred_meta.id) {
-                c.metadata.revoked = true;
-                c.metadata.revoked_at = Some(now);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Rotate a credential: atomically revokes old token and generates new plaintext token once.
+    /// Rotate an existing Personal Access Token.
     pub fn rotate_token(
         &self,
         caller: &AuthPrincipal,
         token_id: &str,
     ) -> Result<RotateTokenResponse, AppError> {
-        let cred_meta = self.get_token(caller, token_id)?;
+        let mut cache_lock = self
+            .cache
+            .write()
+            .map_err(|e| AppError::InternalError(format!("Cache write lock error: {e}")))?;
 
-        let new_raw_token = generate_secure_pat().map_err(|_| {
+        let item = match cache_lock.get_mut(token_id) {
+            Some(i) => i,
+            None => {
+                return Err(AppError::NotFound(format!(
+                    "Credential '{token_id}' not found"
+                )));
+            }
+        };
+
+        if !caller.is_admin() && item.metadata.owner_subject != caller.subject {
+            return Err(AppError::NotFound(format!(
+                "Credential '{token_id}' not found"
+            )));
+        }
+
+        if item.metadata.revoked {
+            return Err(AppError::InvalidRequest(format!(
+                "Credential '{token_id}' has already been revoked and cannot be rotated"
+            )));
+        }
+
+        let new_token = generate_secure_pat().map_err(|_| {
             AppError::InternalError("Failed to generate secure random token".to_string())
         })?;
-        let new_hash = hash_token(&new_raw_token);
-        let new_masked = mask_credential(&new_raw_token);
+        let new_hash = hash_token(&new_token);
+        let new_masked = mask_credential(&new_token);
 
-        // Update database
-        {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| AppError::InternalError(format!("Database lock error: {e}")))?;
-
-            conn.execute(
-                "UPDATE credentials SET token_hash = ?1, masked_token = ?2, revoked = 0, revoked_at = NULL WHERE id = ?3",
-                params![new_hash.as_slice(), new_masked, cred_meta.id],
-            )
-            .map_err(|e| AppError::InternalError(format!("Failed to rotate credential: {e}")))?;
-        }
-
-        let mut updated_meta = cred_meta;
-        updated_meta.masked_token = new_masked;
-        updated_meta.revoked = false;
-        updated_meta.revoked_at = None;
-
-        // Update in-memory cache
-        {
-            let mut cache_lock = self
-                .cache
-                .write()
-                .map_err(|e| AppError::InternalError(format!("Cache lock error: {e}")))?;
-            if let Some(c) = cache_lock.get_mut(&updated_meta.id) {
-                c.metadata = updated_meta.clone();
-                c.token_hash = new_hash;
-            }
-        }
+        item.token_hash = new_hash;
+        item.metadata.masked_token = new_masked;
 
         Ok(RotateTokenResponse {
-            new_token: new_raw_token,
-            metadata: updated_meta,
+            new_token,
+            metadata: item.metadata.clone(),
         })
     }
 
-    /// Validate a candidate token against active credentials in constant time.
-    ///
-    /// Checks local memory cache for sub-microsecond evaluation and authoritatively
-    /// synchronizes with the persistent SQLite database, guaranteeing cross-instance
-    /// and multi-process revocation consistency.
-    pub fn validate_token(
-        &self,
-        candidate: &str,
-        client_type: ClientType,
-    ) -> Option<AuthPrincipal> {
-        let trimmed = candidate.trim();
-        if trimmed.is_empty() {
-            return None;
+    /// Revoke a Personal Access Token immediately.
+    pub fn revoke_token(&self, caller: &AuthPrincipal, token_id: &str) -> Result<(), AppError> {
+        let mut cache_lock = self
+            .cache
+            .write()
+            .map_err(|e| AppError::InternalError(format!("Cache write lock error: {e}")))?;
+
+        let item = match cache_lock.get_mut(token_id) {
+            Some(i) => i,
+            None => {
+                return Err(AppError::NotFound(format!(
+                    "Credential '{token_id}' not found"
+                )));
+            }
+        };
+
+        if !caller.is_admin() && item.metadata.owner_subject != caller.subject {
+            return Err(AppError::NotFound(format!(
+                "Credential '{token_id}' not found"
+            )));
         }
 
-        let cand_hash = hash_token(trimmed);
+        if item.metadata.revoked {
+            return Ok(());
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // 1. Search in-memory cache with constant-time equality check
-        let cache_match: Option<CredentialMetadata> = {
-            let cache_lock = self.cache.read().ok()?;
-            let mut matched = None;
-            for cred in cache_lock.values() {
-                if constant_time_eq_32(&cand_hash, &cred.token_hash) {
-                    matched = Some(cred.metadata.clone());
-                    break;
-                }
-            }
-            matched
-        };
+        item.metadata.revoked = true;
+        item.metadata.revoked_at = Some(now);
 
-        let target_metadata = match cache_match {
-            Some(cached_meta) => {
-                // If local cache already marks it revoked, reject immediately with zero DB query
-                if cached_meta.revoked {
+        Ok(())
+    }
+
+    /// Validate an incoming token in constant time.
+    pub fn validate_token(
+        &self,
+        token_plaintext: &str,
+        candidate_client_type: ClientType,
+    ) -> Option<AuthPrincipal> {
+        let incoming_hash = hash_token(token_plaintext);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let cache_lock = self.cache.read().ok()?;
+
+        for item in cache_lock.values() {
+            if constant_time_eq_32(&item.token_hash, &incoming_hash) {
+                if item.metadata.revoked {
                     return None;
                 }
-                // If expired, reject immediately
-                if let Some(exp) = cached_meta.expires_at
-                    && exp <= now
+                if item.metadata.expires_at.is_some_and(|exp| now > exp) {
+                    return None;
+                }
+
+                let client_type = if candidate_client_type != ClientType::CustomIde {
+                    candidate_client_type
+                } else if item.metadata.name.to_lowercase().contains("vscode") {
+                    ClientType::VscodeExtension
+                } else if item.metadata.name.to_lowercase().contains("flutter")
+                    || item.metadata.name.to_lowercase().contains("mobile")
                 {
-                    return None;
-                }
-
-                // Authoritative check against persistent SQLite database to guarantee cross-process revocation consistency
-                let db_status: Option<(Vec<u8>, bool, Option<i64>)> = {
-                    let conn = self.conn.lock().ok()?;
-                    conn.query_row(
-                        "SELECT token_hash, revoked, revoked_at FROM credentials WHERE id = ?1",
-                        params![cached_meta.id],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get::<_, i64>(1)? != 0,
-                                row.get::<_, Option<i64>>(2)?,
-                            ))
-                        },
-                    )
-                    .ok()
+                    ClientType::Flutter
+                } else {
+                    candidate_client_type
                 };
 
-                match db_status {
-                    Some((db_hash, false, _))
-                        if constant_time_eq_32(
-                            &cand_hash,
-                            &db_hash.as_slice().try_into().unwrap_or([0u8; 32]),
-                        ) =>
-                    {
-                        // Authoritatively confirmed active and matching current hash
-                        cached_meta
-                    }
-                    Some((new_db_hash, is_revoked, revoked_at)) => {
-                        // Either revoked in DB or rotated (db_hash no longer matches cand_hash)
-                        if let Ok(mut cache_write) = self.cache.write()
-                            && let Some(entry) = cache_write.get_mut(&cached_meta.id)
-                        {
-                            if is_revoked {
-                                entry.metadata.revoked = true;
-                                entry.metadata.revoked_at = revoked_at.map(|v| v as u64);
-                            }
-                            if new_db_hash.len() == 32 {
-                                entry.token_hash.copy_from_slice(&new_db_hash);
-                            }
-                        }
-                        return None;
-                    }
-                    None => {
-                        // Record was removed from database; evict from cache and reject
-                        if let Ok(mut cache_write) = self.cache.write() {
-                            cache_write.remove(&cached_meta.id);
-                        }
-                        return None;
-                    }
-                }
+                return Some(AuthPrincipal::new(
+                    item.metadata.owner_subject.clone(),
+                    AuthType::PersonalAccessToken,
+                    client_type,
+                    None,
+                    item.metadata.roles.clone(),
+                    item.metadata.scopes.clone(),
+                ));
             }
-            None => {
-                // 2. Token not found in local memory cache: check persistent SQLite database
-                // in case the credential was created by another process or instance
-                let db_found: Option<CredentialMetadata> = {
-                    let conn = self.conn.lock().ok()?;
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id, name, owner_subject, token_hash, masked_token, roles_json, scopes_json, created_at, expires_at, revoked, revoked_at FROM credentials WHERE token_hash = ?1",
-                        )
-                        .ok()?;
-                    let mut rows = stmt.query(params![cand_hash.as_slice()]).ok()?;
-                    if let Some(row) = rows.next().ok()? {
-                        let id: String = row.get(0).ok()?;
-                        let name: String = row.get(1).ok()?;
-                        let owner_subject: String = row.get(2).ok()?;
-                        let token_hash_bytes: Vec<u8> = row.get(3).ok()?;
-                        let masked_token: String = row.get(4).ok()?;
-                        let roles_json: String = row.get(5).ok()?;
-                        let scopes_json: String = row.get(6).ok()?;
-                        let created_at: i64 = row.get(7).ok()?;
-                        let expires_at: Option<i64> = row.get(8).ok()?;
-                        let revoked_int: i64 = row.get(9).ok()?;
-                        let revoked_at: Option<i64> = row.get(10).ok()?;
+        }
 
-                        let mut token_hash_arr = [0u8; 32];
-                        if token_hash_bytes.len() == 32 {
-                            token_hash_arr.copy_from_slice(&token_hash_bytes);
-                        }
-
-                        let roles: Vec<AuthRole> =
-                            serde_json::from_str(&roles_json).unwrap_or_default();
-                        let scopes: Vec<String> =
-                            serde_json::from_str(&scopes_json).unwrap_or_default();
-
-                        let metadata = CredentialMetadata {
-                            id: id.clone(),
-                            name,
-                            owner_subject,
-                            masked_token,
-                            roles,
-                            scopes,
-                            created_at: created_at as u64,
-                            expires_at: expires_at.map(|v| v as u64),
-                            revoked: revoked_int != 0,
-                            revoked_at: revoked_at.map(|v| v as u64),
-                        };
-
-                        // Warm local cache with the newly discovered credential
-                        if let Ok(mut cache_write) = self.cache.write() {
-                            cache_write.insert(
-                                id,
-                                CachedCredential {
-                                    metadata: metadata.clone(),
-                                    token_hash: token_hash_arr,
-                                },
-                            );
-                        }
-
-                        Some(metadata)
-                    } else {
-                        None
-                    }
-                };
-
-                let meta = db_found?;
-                if meta.revoked {
-                    return None;
-                }
-                if let Some(exp) = meta.expires_at
-                    && exp <= now
-                {
-                    return None;
-                }
-                meta
-            }
-        };
-
-        Some(AuthPrincipal::new(
-            target_metadata.owner_subject,
-            AuthType::PersonalAccessToken,
-            client_type,
-            None,
-            target_metadata.roles,
-            target_metadata.scopes,
-        ))
+        None
     }
 }

@@ -163,7 +163,6 @@ fn test_valid_configuration_accepted() {
         groq_base_url: None,
         openrouter_api_key: None,
         gemini_api_key: None,
-        database_path: "data/usage.db".to_string(),
         usage_retention_days: None,
         max_retries: 1,
         max_failover_candidates: 3,
@@ -175,8 +174,6 @@ fn test_valid_configuration_accepted() {
         allowed_hosts: Vec::new(),
         usage_cleanup_interval_secs: 3600,
         usage_cleanup_batch_size: 1000,
-        usage_spool_path: "data/usage_spool.log".to_string(),
-        usage_max_spool_bytes: 10 * 1024 * 1024,
         ..AppConfig::default_local()
     };
     assert!(config.validate().is_ok());

@@ -10,7 +10,6 @@
 pub mod client;
 pub mod crypto;
 pub mod local_store;
-pub mod migration;
 pub mod mock;
 pub mod models;
 pub mod sync_engine;
@@ -18,9 +17,6 @@ pub mod sync_engine;
 pub use client::{DriveClient, DriveError, DriveFileMetadata, GoogleDriveClient};
 pub use crypto::{DriveCryptoEngine, compute_sha256, decode_base64, encode_base64};
 pub use local_store::{LocalStoreError, LocalSyncStore};
-pub use migration::{
-    LegacyInspectionResult, inspect_legacy_sqlite, migrate_legacy_sqlite_to_drive,
-};
 pub use mock::MockDriveClient;
 pub use models::{
     CURRENT_SCHEMA_VERSION, ConversationIndexEntry, CreateConversationRequest,

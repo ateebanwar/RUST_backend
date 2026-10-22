@@ -12,17 +12,14 @@
 //! - Safe logout: Clears in-memory session without affecting remote Drive objects.
 
 use super::models::{LibraryItem, SyncConversation, chrono_like_now};
-use rusqlite::Connection;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Errors occurring in LocalSyncStore operations.
 #[derive(Debug)]
 pub enum LocalStoreError {
     ConnectionError(String),
-    MigrationError(String),
-    SqliteError(String),
     SerializationError(String),
     LockError(String),
 }
@@ -31,8 +28,6 @@ impl std::fmt::Display for LocalStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ConnectionError(msg) => write!(f, "Connection failure: {msg}"),
-            Self::MigrationError(msg) => write!(f, "Migration failure: {msg}"),
-            Self::SqliteError(msg) => write!(f, "Database failure: {msg}"),
             Self::SerializationError(msg) => write!(f, "Serialization failure: {msg}"),
             Self::LockError(msg) => write!(f, "Lock acquisition failure: {msg}"),
         }
@@ -40,12 +35,6 @@ impl std::fmt::Display for LocalStoreError {
 }
 
 impl std::error::Error for LocalStoreError {}
-
-impl From<rusqlite::Error> for LocalStoreError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::SqliteError(e.to_string())
-    }
-}
 
 impl From<serde_json::Error> for LocalStoreError {
     fn from(e: serde_json::Error) -> Self {
@@ -132,11 +121,6 @@ impl LocalSyncStore {
     /// Per Master Directive §2 & §13, backend database persistence of user content
     /// is eliminated in favor of Google Drive. Returns an ephemeral in-memory store.
     pub fn open(_db_path: &str) -> Result<Self, LocalStoreError> {
-        Ok(Self::new())
-    }
-
-    /// Backwards-compatible constructor from existing connection handle.
-    pub fn from_connection(_conn: Arc<Mutex<Connection>>) -> Result<Self, LocalStoreError> {
         Ok(Self::new())
     }
 

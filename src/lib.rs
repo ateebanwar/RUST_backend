@@ -64,10 +64,7 @@ pub struct AppState {
     pub start_time: std::time::Instant,
 }
 
-fn default_sync_engine(
-    config: &AppConfig,
-    _conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
-) -> Arc<crate::drive::SyncEngine> {
+fn default_sync_engine(config: &AppConfig) -> Arc<crate::drive::SyncEngine> {
     let drive_crypto = if let Some(hex_key) = &config.drive_encryption_key {
         match crate::drive::DriveCryptoEngine::from_hex(hex_key) {
             Ok(engine) => Arc::new(engine),
@@ -105,30 +102,9 @@ impl AppState {
         let providers = Arc::new(ProviderRegistry::new());
         let quota = Arc::new(QuotaService::new());
 
-        let usage_storage = match UsageStorage::new(&config.database_path) {
-            Ok(s) => Arc::new(s),
-            Err(err) => {
-                tracing::error!(
-                    path = %config.database_path,
-                    error = %err,
-                    "Failed to initialize SQLite usage storage at configured path, falling back to in-memory store"
-                );
-                Arc::new(
-                    UsageStorage::new(":memory:")
-                        .expect("Failed to initialize fallback in-memory SQLite storage"),
-                )
-            }
-        };
-        let usage_spool = Arc::new(crate::usage::UsageSpooler::new(
-            &config.usage_spool_path,
-            config.usage_max_spool_bytes,
-        ));
-        let usage = Arc::new(UsageService::with_spool(usage_storage.clone(), usage_spool));
-
-        let credentials = Arc::new(
-            crate::auth::CredentialStore::new(usage_storage.conn())
-                .expect("Failed to initialize CredentialStore"),
-        );
+        let usage_storage = Arc::new(UsageStorage::new_in_memory());
+        let usage = Arc::new(UsageService::new(usage_storage.clone()));
+        let credentials = Arc::new(crate::auth::CredentialStore::new());
         let auth =
             Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
 
@@ -259,7 +235,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config, Some(usage_storage.conn())),
+            sync_engine: default_sync_engine(&config),
             start_time: std::time::Instant::now(),
         }
     }
@@ -271,12 +247,9 @@ impl AppState {
     ) -> Self {
         let providers = Arc::new(ProviderRegistry::new());
         let quota = Arc::new(QuotaService::new());
-        let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
+        let storage = Arc::new(UsageStorage::new_in_memory());
         let usage = Arc::new(UsageService::new(storage.clone()));
-        let credentials = Arc::new(
-            crate::auth::CredentialStore::new(storage.conn())
-                .expect("In-memory CredentialStore failed"),
-        );
+        let credentials = Arc::new(crate::auth::CredentialStore::new());
         let auth =
             Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
         let inference = Arc::new(
@@ -305,7 +278,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config, Some(storage.conn())),
+            sync_engine: default_sync_engine(&config),
             start_time: std::time::Instant::now(),
         }
     }
@@ -317,12 +290,9 @@ impl AppState {
         router: Arc<ModelRouter>,
     ) -> Self {
         let quota = Arc::new(QuotaService::new());
-        let storage = Arc::new(UsageStorage::new(":memory:").expect("In-memory storage failed"));
+        let storage = Arc::new(UsageStorage::new_in_memory());
         let usage = Arc::new(UsageService::new(storage.clone()));
-        let credentials = Arc::new(
-            crate::auth::CredentialStore::new(storage.conn())
-                .expect("In-memory CredentialStore failed"),
-        );
+        let credentials = Arc::new(crate::auth::CredentialStore::new());
         let auth =
             Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
         let inference = Arc::new(
@@ -351,7 +321,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config, Some(storage.conn())),
+            sync_engine: default_sync_engine(&config),
             start_time: std::time::Instant::now(),
         }
     }
@@ -364,10 +334,7 @@ impl AppState {
         usage: Arc<UsageService>,
         quota: Arc<QuotaService>,
     ) -> Self {
-        let credentials = Arc::new(
-            crate::auth::CredentialStore::new(usage.storage().conn())
-                .expect("Failed to initialize CredentialStore"),
-        );
+        let credentials = Arc::new(crate::auth::CredentialStore::new());
         let auth =
             Arc::new(AuthService::new(config.clone()).with_credential_store(credentials.clone()));
         let inference = Arc::new(
@@ -395,7 +362,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
-            sync_engine: default_sync_engine(&config, Some(usage.storage().conn())),
+            sync_engine: default_sync_engine(&config),
             usage,
             start_time: std::time::Instant::now(),
         }
