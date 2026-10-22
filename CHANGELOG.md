@@ -2,6 +2,49 @@
 
 All notable project changes, architectural decisions, and document synchronizations are recorded chronologically in this file.
 
+## 2026-10-22 — Phase 15: Production-Grade Google Drive Integration, Chat Sync, Library Sync, Encryption, Restore & Verification
+
+### Implemented, Hardened & Verified
+- **Private `appDataFolder` Isolation & Least-Privilege Scope:**
+  - Standardized Drive sync against Google Drive's hidden `appDataFolder` (`spaces=appDataFolder`) using scope `https://www.googleapis.com/auth/drive.appdata`.
+  - Application files remain completely invisible in standard Google Drive UI, preventing user tampering or accidental deletion.
+- **Zero Paid Database & Ephemeral Token Transit:**
+  - Complete conversational history and Library files reside in user-controlled Google Drive with zero paid external database requirements.
+  - Google OAuth access tokens (`X-Drive-Token`) are passed ephemerally in HTTP headers and are never written to disk, SQLite, or structured logs.
+- **Dyn-Compatible Trait & Mock Drive Client (`src/drive/client.rs`, `src/drive/mock.rs`):**
+  - Dyn-compatible `DriveClient` trait using `BoxedDriveFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DriveError>> + Send + 'a>>`.
+  - Production `GoogleDriveClient` with bounded timeouts, retries, and rate limit awareness.
+  - Thread-safe `MockDriveClient` supporting error injection (401, 403, 404, 429 with `Retry-After`), transient failure recovery, and in-memory simulated Drive storage.
+- **Local In-Memory Multi-Tenant Store (`src/drive/local_store.rs`):**
+  - Thread-safe `LocalSyncStore` managing multi-tenant isolation keyed by `owner_subject`.
+  - Independent collections for Conversations and Library items with dirty-tracking (`is_dirty`).
+- **Authenticated Encryption at Rest with Anti-Transplantation AAD Binding (`src/drive/crypto.rs`):**
+  - AES-256-GCM encryption with 96-bit random nonces (`ring::aead`).
+  - Associated Data (AAD) strictly bound to `owner_subject:resource_id`. Tag verification fails in constant time if ciphertext is transplanted to another owner or resource ID.
+  - Constant-time SHA-256 checksumming and RFC 4648 Base64 encoding/decoding.
+- **Bidirectional Sync & Account Restore (`src/drive/sync_engine.rs`):**
+  - Authoritative `SyncManifest` tracking version and resource indices in `manifest.json`.
+  - Last-Write-Wins (LWW) conflict resolution comparing remote vs local UTC timestamps.
+  - `POST /api/v1/drive/restore` bootstrap recovering entire conversational history and library metadata onto a clean account.
+- **Independent Library Lifecycle (Critical Invariant):**
+  - Soft-deleting a conversation marks `deleted: true` on the conversation record, but **STRICTLY NEVER** deletes associated Library items.
+  - Library items (uploaded files, media, documents) can only be deleted via explicit `DELETE /api/v1/drive/library/{id}` calls.
+- **Path Traversal Sanitization (`src/drive/models.rs`):**
+  - `sanitize_filename` strips directory traversal (`../`, `..\`) and illegal characters, ensuring safe binary downloads.
+- **Default-Off Sync Switch & Safe Logout Semantics:**
+  - Synchronization defaults to disabled (`google_drive_sync_enabled: false`), toggleable via config or `POST /api/v1/drive/config`.
+  - `POST /api/v1/drive/logout` tears down local in-memory state while strictly preserving remote Google Drive data.
+- **Verification Results:**
+  - `cargo fmt --check`: Clean (0 diffs).
+  - `cargo check --all-targets --all-features`: Clean (0 errors).
+  - `cargo clippy --all-targets --all-features -- -D warnings`: Clean (0 warnings).
+  - `cargo test`: 397 passed; 0 failed; 1 ignored across 24 test targets (120 unit + 277 integration).
+  - `cargo audit -n`: Clean (0 vulnerabilities across 183 dependencies).
+  - `gitleaks detect -v`: Clean (0 leaks across git history).
+  - `cargo build --release`: Clean (compiled release binary in 1m 07s).
+
+---
+
 ## 2026-10-22 — Combined Phase 13 & Phase 14: Abuse Prevention, Rate Limiting, SSRF Protection & Zero-Backoff Failover
 
 ### Implemented, Hardened & Verified

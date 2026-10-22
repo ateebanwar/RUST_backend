@@ -179,6 +179,18 @@ pub struct AppConfig {
     pub max_outbound_redirects: usize,
     /// Connect timeout for outbound requests in seconds (loaded from OUTBOUND_CONNECT_TIMEOUT_SECS, default 5).
     pub outbound_connect_timeout_secs: u64,
+
+    // --- Phase 15: Google Drive Chat and Library Synchronization ---
+    /// Whether Google Drive sync is enabled (loaded from GOOGLE_DRIVE_SYNC_ENABLED, default false).
+    pub google_drive_sync_enabled: bool,
+    /// Remote application data folder name in Google Drive (loaded from GOOGLE_DRIVE_FOLDER_NAME, default "ai_backend_app_data").
+    pub google_drive_folder_name: String,
+    /// Timeout for Google Drive API operations in seconds (loaded from GOOGLE_DRIVE_TIMEOUT_SECS, default 30).
+    pub google_drive_timeout_secs: u64,
+    /// Maximum retries for transient Google Drive failures (loaded from GOOGLE_DRIVE_MAX_RETRIES, default 3).
+    pub google_drive_max_retries: u32,
+    /// Optional master key for Drive encryption (loaded from DRIVE_ENCRYPTION_KEY, 64-char hex string).
+    pub drive_encryption_key: Option<String>,
 }
 
 impl AppConfig {
@@ -241,6 +253,11 @@ impl AppConfig {
             local_inference_base_url: None,
             max_outbound_redirects: 0,
             outbound_connect_timeout_secs: 5,
+            google_drive_sync_enabled: false,
+            google_drive_folder_name: "ai_backend_app_data".to_string(),
+            google_drive_timeout_secs: 30,
+            google_drive_max_retries: 3,
+            drive_encryption_key: None,
         }
     }
 
@@ -593,6 +610,32 @@ impl AppConfig {
             get_var("OUTBOUND_CONNECT_TIMEOUT_SECS").and_then(|r| r.trim().parse::<u64>().ok())
         {
             config.outbound_connect_timeout_secs = timeout;
+        }
+
+        if let Some(gdse) =
+            get_var("GOOGLE_DRIVE_SYNC_ENABLED").and_then(|r| r.trim().parse::<bool>().ok())
+        {
+            config.google_drive_sync_enabled = gdse;
+        }
+
+        if let Some(folder) = get_var("GOOGLE_DRIVE_FOLDER_NAME") {
+            config.google_drive_folder_name = folder;
+        }
+
+        if let Some(timeout) =
+            get_var("GOOGLE_DRIVE_TIMEOUT_SECS").and_then(|r| r.trim().parse::<u64>().ok())
+        {
+            config.google_drive_timeout_secs = timeout;
+        }
+
+        if let Some(retries) =
+            get_var("GOOGLE_DRIVE_MAX_RETRIES").and_then(|r| r.trim().parse::<u32>().ok())
+        {
+            config.google_drive_max_retries = retries;
+        }
+
+        if let Some(key) = get_var("DRIVE_ENCRYPTION_KEY") {
+            config.drive_encryption_key = Some(key);
         }
 
         config.validate()?;

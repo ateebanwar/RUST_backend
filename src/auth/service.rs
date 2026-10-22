@@ -247,6 +247,8 @@ impl AuthService {
             Some("usage:read")
         } else if normalized.starts_with("/api/v1/auth/tokens") {
             Some("auth:tokens")
+        } else if normalized.starts_with("/api/v1/drive") {
+            Some("drive")
         } else {
             None
         }

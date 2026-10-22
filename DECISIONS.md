@@ -30,6 +30,10 @@
 | **DEC-017** | Phase 11 Multi-Client Authentication, Google OIDC ID Token Verification, and Constant-Time Credential Validation | **APPROVED** | 2026-10-21 | Authentication & Identity Security |
 | **DEC-018** | Phase 11 Hardening: Query-Parameter Credential Proscription, Route Scope Authorization, and Non-Loopback Bind Protection | **APPROVED** | 2026-10-21 | Authentication & Security Hardening |
 | **DEC-019** | Forensic Security Remediation: Query Percent-Decoding, OIDC azp Claim Validation, Streaming JWKS Limits, and Configuration Precedence | **APPROVED** | 2026-10-21 | Authentication & Security Hardening |
+| **DEC-020** | Phase 11 Hardening & Security Audit Remediation | **APPROVED** | 2026-10-21 | Authentication & Security Hardening |
+| **DEC-021** | Phase 12: Resource Ownership, Dynamic PAT Lifecycle, and Authenticated Secret Management | **APPROVED** | 2026-10-22 | Authorization & Secret Management |
+| **DEC-022** | Combined Phase 13 + Phase 14: Multi-Dimensional Rate Limiting, SSRF Protection, Connection Pinning, and Zero-Backoff Failover | **APPROVED** | 2026-10-22 | Abuse Prevention & Network Security |
+| **DEC-023** | Phase 15: Production-Grade Google Drive Integration, Chat Sync, Library Sync, Encryption, Restore & Verification | **APPROVED** | 2026-10-22 | Drive Persistence, Encryption & Sync |
 
 ---
 
@@ -372,5 +376,23 @@
      - Manual routing invariant is strictly preserved: manual model requests never fail over, returning `RateLimited` with `"RATE_LIMITED"` error code immediately.
      - Local abuse rate limit rejections never trigger upstream provider failover.
 - **Consequences:** All 378 automated tests pass across 24 test targets (110 unit tests + 268 integration tests across 23 integration/benchmark suites) with 0 failures, 0 Clippy warnings, 0 cargo audit vulnerabilities, and 0 secret leaks. Phase 15 (Google Drive Integration) is eligible to begin next upon explicit user authorization.
+
+---
+
+### DEC-023: Phase 15: Production-Grade Google Drive Integration, Chat Sync, Library Sync, Encryption, Restore & Verification
+- **Status:** APPROVED
+- **Date:** 2026-10-22
+- **Context:** Phase 15 mandates production-grade remote persistence to Google Drive private `appDataFolder` without paid databases. It requires: (1) Dyn-compatible, testable `DriveClient` trait with real and mock implementations; (2) In-memory multi-tenant `LocalSyncStore` with dirty tracking; (3) Authenticated encryption (AES-256-GCM) with AAD binding to `owner_subject:resource_id`; (4) Bidirectional synchronization and bootstrap restoration; (5) Multi-tenant isolation; (6) Default-off sync switch (`google_drive_sync_enabled: false`); (7) Safe logout semantics preserving remote Drive data; (8) Independent Chat and Library lifecycles where deleting a conversation NEVER deletes associated library files; (9) Bounded retries and rate limit handling; and (10) Path traversal defenses.
+- **Decisions Made:**
+  1. *Dyn-Compatible Trait with BoxedDriveFuture:* Created `BoxedDriveFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DriveError>> + Send + 'a>>` to make `DriveClient` dyn-compatible without third-party trait macro dependencies.
+  2. *Least-Privilege appDataFolder Sandbox:* Sync operations target strictly the private, hidden `appDataFolder` (`spaces=appDataFolder`) using scope `https://www.googleapis.com/auth/drive.appdata`.
+  3. *Zero Paid Database & Ephemeral Token Transit:* Chat and library content are entirely stored in user Drive; SQLite usage database remains strictly isolated. Tokens passed via `X-Drive-Token` are never written to disk or logs.
+  4. *Anti-Transplantation AAD Binding:* Cryptographic engine binds AES-256-GCM to `owner_subject:resource_id`, preventing ciphertext from being decrypted under a different owner or resource ID.
+  5. *Independent Library Lifecycle:* Soft-deleting a conversation marks `deleted: true` on the conversation record and leaves all associated Library items untouched. Library items can only be deleted via explicit `DELETE /api/v1/drive/library/{id}` calls.
+  6. *Default-Off Sync Switch:* `google_drive_sync_enabled` defaults to `false`, toggleable via `POST /api/v1/drive/config` or configuration.
+  7. *Safe Logout Semantics:* Calling `POST /api/v1/drive/logout` clears in-memory state and dirty caches for the caller, but strictly leaves remote Google Drive data untouched.
+  8. *Path Traversal Protection:* `sanitize_filename` enforces strict basename sanitization and strips directory separators.
+- **Consequences:** All 397 automated tests pass across 24 test targets (120 unit tests + 277 integration tests across 23 integration/benchmark suites) with 0 failures, 0 Clippy warnings, 0 cargo audit vulnerabilities, and 0 secret leaks. Phase 15 is fully verified.
+
 
 

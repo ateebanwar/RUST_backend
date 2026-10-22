@@ -6,7 +6,7 @@ pub mod rate_limiter;
 pub mod secret;
 pub mod ssrf;
 
-pub use encryption::{AesGcmCipher, EncryptionError};
+pub use encryption::{AES_256_KEY_LEN, AesGcmCipher, EncryptionError};
 pub use rate_limiter::{
     RateLimitKey, RateLimitRejection, RateLimitRouteCategory, RateLimiter, RateLimiterConfig,
     RequestPermit, StreamPermit, TokenBucket,

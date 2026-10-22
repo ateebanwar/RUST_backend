@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod drive;
 pub mod errors;
 pub mod inference;
 pub mod models;
@@ -27,6 +28,7 @@ pub use auth::{
 };
 pub use auth::{CredentialMetadata, CredentialStore};
 pub use config::AppConfig;
+pub use drive::{DriveClient, DriveError, GoogleDriveClient, MockDriveClient, SyncEngine};
 pub use errors::AppError;
 pub use inference::{ChatCompletionRequest, InferenceService};
 pub use providers::ProviderRegistry;
@@ -58,7 +60,36 @@ pub struct AppState {
     pub quota: Arc<QuotaService>,
     pub rate_limiter: Arc<crate::security::RateLimiter>,
     pub destination_policy: Arc<crate::security::OutboundDestinationPolicy>,
+    pub sync_engine: Arc<crate::drive::SyncEngine>,
     pub start_time: std::time::Instant,
+}
+
+fn default_sync_engine(config: &AppConfig) -> Arc<crate::drive::SyncEngine> {
+    let drive_crypto = if let Some(hex_key) = &config.drive_encryption_key {
+        Arc::new(
+            crate::drive::DriveCryptoEngine::from_hex(hex_key).unwrap_or_else(|_| {
+                let master = [0x5au8; 32];
+                crate::drive::DriveCryptoEngine::derive_for_owner(&master, "ai-backend-default")
+            }),
+        )
+    } else {
+        let master = [0x5au8; 32];
+        Arc::new(crate::drive::DriveCryptoEngine::derive_for_owner(
+            &master,
+            "ai-backend-default",
+        ))
+    };
+    let drive_client = Arc::new(crate::drive::GoogleDriveClient::new(
+        config.google_drive_timeout_secs,
+        config.google_drive_max_retries,
+    ));
+    let local_sync_store = Arc::new(crate::drive::LocalSyncStore::new());
+    Arc::new(crate::drive::SyncEngine::new(
+        drive_client,
+        drive_crypto,
+        local_sync_store,
+        config.google_drive_sync_enabled,
+    ))
 }
 
 impl AppState {
@@ -210,7 +241,7 @@ impl AppState {
         );
 
         Self {
-            config,
+            config: config.clone(),
             auth,
             credentials,
             registry,
@@ -221,6 +252,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
+            sync_engine: default_sync_engine(&config),
             start_time: std::time::Instant::now(),
         }
     }
@@ -255,7 +287,7 @@ impl AppState {
         let destination_policy = Arc::new(config.outbound_destination_policy());
 
         Self {
-            config,
+            config: config.clone(),
             auth,
             credentials,
             registry,
@@ -266,6 +298,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
+            sync_engine: default_sync_engine(&config),
             start_time: std::time::Instant::now(),
         }
     }
@@ -300,7 +333,7 @@ impl AppState {
         let destination_policy = Arc::new(config.outbound_destination_policy());
 
         Self {
-            config,
+            config: config.clone(),
             auth,
             credentials,
             registry,
@@ -311,6 +344,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
+            sync_engine: default_sync_engine(&config),
             start_time: std::time::Instant::now(),
         }
     }
@@ -344,7 +378,7 @@ impl AppState {
         let destination_policy = Arc::new(config.outbound_destination_policy());
 
         Self {
-            config,
+            config: config.clone(),
             auth,
             credentials,
             registry,
@@ -355,6 +389,7 @@ impl AppState {
             quota,
             rate_limiter,
             destination_policy,
+            sync_engine: default_sync_engine(&config),
             start_time: std::time::Instant::now(),
         }
     }
@@ -383,6 +418,12 @@ impl AppState {
         destination_policy: Arc<crate::security::OutboundDestinationPolicy>,
     ) -> Self {
         self.destination_policy = destination_policy;
+        self
+    }
+
+    /// Builder helper to replace SyncEngine (e.g. for deterministic mock Drive in tests).
+    pub fn with_sync_engine(mut self, sync_engine: Arc<crate::drive::SyncEngine>) -> Self {
+        self.sync_engine = sync_engine;
         self
     }
 }

@@ -36,6 +36,16 @@ All endpoints (except public probes `/api/v1/health` and `/api/v1/ready`) requir
 | `/api/v1/usage/providers` | `GET` | **Authenticated** | Scope `usage:read` | Provider-level token and request metrics |
 | `/api/v1/usage/models` | `GET` | **Authenticated** | Scope `usage:read` | Model-level token and request metrics |
 | `/api/v1/quotas` | `GET` | **Authenticated** | Scope `usage:read` | Active rate-limit headroom and quota telemetry |
+| `/api/v1/drive/status` | `GET` | **Authenticated** | Scope `drive` | Current Google Drive synchronization status |
+| `/api/v1/drive/config` | `GET`, `POST` | **Authenticated** | Scope `drive` | Get or toggle Drive synchronization enabled status |
+| `/api/v1/drive/sync` | `POST` | **Authenticated** | Scope `drive` | Trigger bidirectional synchronization with Google Drive |
+| `/api/v1/drive/conversations` | `GET`, `POST` | **Authenticated** | Scope `drive` | List or create local conversations |
+| `/api/v1/drive/conversations/{id}` | `GET`, `PUT`, `DELETE` | **Authenticated** | Scope `drive` | Retrieve, update, or soft-delete conversation |
+| `/api/v1/drive/library` | `GET`, `POST` | **Authenticated** | Scope `drive` | List or upload Library items (files, documents, media) |
+| `/api/v1/drive/library/{id}` | `GET`, `DELETE` | **Authenticated** | Scope `drive` | Retrieve metadata or delete Library item |
+| `/api/v1/drive/library/{id}/content` | `GET` | **Authenticated** | Scope `drive` | Download Library item raw binary payload |
+| `/api/v1/drive/restore` | `POST` | **Authenticated** | Scope `drive` | Full restore/bootstrap from Google Drive appDataFolder |
+| `/api/v1/drive/logout` | `POST` | **Authenticated** | Scope `drive` | Teardown local session (preserves remote Drive data) |
 
 > [!IMPORTANT]
 > **Strict Precedence & Zero Fallback Rule:** If an incoming request provides credentials (e.g. an expired Google ID token or invalid API key), it is rejected with HTTP 401 Unauthorized immediately. Invalid credentials never fall back to another authentication mechanism or developer bypass.
@@ -543,3 +553,162 @@ Plaintext token is returned exactly ONCE upon creation. Secrets are never persis
 4. **Deprecation Headers:** When an endpoint is marked for deprecation:
    - `Deprecation: @<unix_timestamp>` (Date deprecation was announced).
    - `Sunset: <http_date>` (Date endpoint will be removed, minimum 90-day grace period).
+
+---
+
+## 10. Google Drive Synchronization & Library Endpoints (Phase 15 Implementation)
+
+All endpoints in this section require authentication with scope `drive`. Additionally, operations that communicate with remote Google Drive require the `X-Drive-Token` header containing a valid Google OAuth access token with scope `https://www.googleapis.com/auth/drive.appdata`.
+
+### 10.1 Drive Status & Configuration
+
+#### 10.1.1 Get Drive Status
+- **Method & Path:** `GET /api/v1/drive/status`
+- **Headers:** `Authorization: Bearer <token>`
+- **Response (200 OK):**
+```json
+{
+  "sync_enabled": false,
+  "last_synced_at": null,
+  "pending_conversations": 1,
+  "pending_library_items": 0,
+  "active_conversations": 1,
+  "active_library_items": 0,
+  "is_syncing": false,
+  "last_error": null
+}
+```
+
+#### 10.1.2 Update Drive Configuration
+- **Method & Path:** `POST /api/v1/drive/config`
+- **Request Body:**
+```json
+{
+  "sync_enabled": true
+}
+```
+- **Response (200 OK):** Same schema as `GET /api/v1/drive/status`.
+
+### 10.2 Bidirectional Synchronization & Restore
+
+#### 10.2.1 Trigger Synchronization
+- **Method & Path:** `POST /api/v1/drive/sync`
+- **Headers:** `Authorization: Bearer <token>`, `X-Drive-Token: <oauth_access_token>`
+- **Behavior:**
+  - If `sync_enabled` is `false`, returns HTTP 400 Bad Request (`DRIVE_SYNC_DISABLED`).
+  - Fetches or creates remote `manifest.json` in `appDataFolder`.
+  - Performs bidirectional sync with Last-Write-Wins (LWW) conflict resolution.
+  - Encrypts updated local conversations and library items with AES-256-GCM (AAD bound to `owner:resource_id`) and uploads to Google Drive.
+  - Marks local items as clean (`is_dirty: false`).
+- **Response (200 OK):**
+```json
+{
+  "synced_at": "2026-10-22T12:00:00Z",
+  "uploaded_conversations": 1,
+  "downloaded_conversations": 0,
+  "uploaded_library_items": 0,
+  "downloaded_library_items": 0,
+  "conflicts_resolved": 0
+}
+```
+
+#### 10.2.2 Restore / Bootstrap Account
+- **Method & Path:** `POST /api/v1/drive/restore`
+- **Headers:** `Authorization: Bearer <token>`, `X-Drive-Token: <oauth_access_token>`
+- **Behavior:** Restores all conversations and library index entries from Google Drive `appDataFolder` manifest.
+- **Response (200 OK):**
+```json
+{
+  "restored_at": "2026-10-22T12:00:00Z",
+  "restored_conversations": 2,
+  "restored_library_items": 1
+}
+```
+
+### 10.3 Conversations Management
+
+#### 10.3.1 List Conversations
+- **Method & Path:** `GET /api/v1/drive/conversations`
+- **Response (200 OK):** Array of conversation index entries:
+```json
+[
+  {
+    "id": "conv_01",
+    "title": "Rust Architecture Discussion",
+    "created_at": "2026-10-22T10:00:00Z",
+    "updated_at": "2026-10-22T11:00:00Z",
+    "message_count": 4,
+    "deleted": false
+  }
+]
+```
+
+#### 10.3.2 Create or Upsert Conversation
+- **Method & Path:** `POST /api/v1/drive/conversations`
+- **Request Body:**
+```json
+{
+  "id": "conv_01",
+  "title": "Rust Architecture Discussion",
+  "created_at": "2026-10-22T10:00:00Z",
+  "updated_at": "2026-10-22T11:00:00Z",
+  "messages": [
+    {
+      "id": "msg_01",
+      "role": "user",
+      "content": "Explain AES-256-GCM AAD binding.",
+      "timestamp": "2026-10-22T10:00:00Z",
+      "model": null,
+      "tokens": null,
+      "library_item_ids": ["lib_item_01"]
+    }
+  ],
+  "associated_library_item_ids": ["lib_item_01"]
+}
+```
+- **Response (200 OK):** Stored `SyncConversation` object.
+
+#### 10.3.3 Get Conversation
+- **Method & Path:** `GET /api/v1/drive/conversations/{id}`
+- **Response (200 OK):** Full `SyncConversation` object. Returns 404 if deleted or not found.
+
+#### 10.3.4 Delete Conversation
+- **Method & Path:** `DELETE /api/v1/drive/conversations/{id}`
+- **Critical Invariant:** Soft-deleting a conversation marks `deleted: true` on the conversation and sets dirty flag for sync. Associated Library items are **STRICTLY PRESERVED** and never deleted.
+- **Response (204 No Content)**
+
+### 10.4 Library Items Management
+
+#### 10.4.1 List Library Items
+- **Method & Path:** `GET /api/v1/drive/library`
+- **Response (200 OK):** Array of `LibraryItem` metadata entries.
+
+#### 10.4.2 Upload / Create Library Item
+- **Method & Path:** `POST /api/v1/drive/library`
+- **Request Body:**
+```json
+{
+  "filename": "benchmark_data.json",
+  "mime_type": "application/json",
+  "content_base64": "eyJyZXN1bHQiOiA0Mn0=",
+  "associated_conversation_id": "conv_01"
+}
+```
+- **Path Traversal Defense:** `filename` is sanitized via `sanitize_filename`, stripping directory traversal (`../`, `..\`) and paths.
+- **Integrity:** Automatically computes SHA-256 checksum and exact payload size.
+- **Response (200 OK):** Created `LibraryItem` metadata.
+
+#### 10.4.3 Download Library Item Content
+- **Method & Path:** `GET /api/v1/drive/library/{id}/content`
+- **Response (200 OK):** Raw binary octet-stream with `Content-Type: <mime_type>` and `Content-Disposition: attachment; filename="<sanitized_filename>"`.
+
+#### 10.4.4 Explicitly Delete Library Item
+- **Method & Path:** `DELETE /api/v1/drive/library/{id}`
+- **Semantics:** Library items are deleted **strictly** through this explicit deletion endpoint.
+- **Response (204 No Content)**
+
+### 10.5 Session Teardown & Logout
+- **Method & Path:** `POST /api/v1/drive/logout`
+- **Semantics:** Clears local in-memory session and dirty cache for the authenticated owner. Remote Google Drive data is strictly preserved and never deleted.
+- **Response (200 OK):** `{"status": "logged_out"}`
+

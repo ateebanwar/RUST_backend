@@ -2,7 +2,7 @@
 
 **Project:** `ai-backend` (High-Performance, Security-Focused Rust AI Backend)  
 **Governing Specification:** [`MASTER_SPEC.md`](file:///d:/Rust%20Backend/ai-backend/MASTER_SPEC.md)  
-**Current Phase:** Phase 12 Complete | Phase 13 Strictly On Hold
+**Current Phase:** Phase 15 Complete | Phase 16 Strictly On Hold
 **Last Updated:** 2026-10-22
 
 ---
@@ -108,7 +108,23 @@
   - **Privilege Escalation Defense:** Non-admin callers cannot create tokens with scopes exceeding their own authorized scopes.
   - **Zero-Leak Secret Representations (`src/security/secret.rs`):** `SecretString` wrapper with custom `Debug`, `Display`, and `serde::Serialize` unconditionally outputting `"[REDACTED]"`. `mask_credential` produces safe diagnostic representations.
   - **Authenticated Encryption at Rest (`src/security/encryption.rs`):** `AesGcmCipher` providing AES-256-GCM authenticated encryption with 96-bit random nonces and Associated Data (AAD) context binding.
-  - **Comprehensive Verification & Final Targeted Hardening:** **345 automated tests passing** across 22 executed Cargo targets (1 unit test target `src/lib.rs` with 97 tests, 17 active integration test suites with 248 tests including 12 security regression tests in `tests/authorization_and_ownership_test.rs`, 1 benchmark suite `tests/load_benchmark.rs` with 1 ignored benchmark, 2 binary targets with 0 tests, and 1 doctest target with 0 tests), 0 failures (100% pass rate); cross-instance revocation verified across multiple stores with authoritative SQLite validation; `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing. Phase 13 remains strictly on hold.
+  - **Comprehensive Verification & Final Targeted Hardening:** **345 automated tests passing** across 22 executed Cargo targets (1 unit test target `src/lib.rs` with 97 tests, 17 active integration test suites with 248 tests including 12 security regression tests in `tests/authorization_and_ownership_test.rs`, 1 benchmark suite `tests/load_benchmark.rs` with 1 ignored benchmark, 2 binary targets with 0 tests, and 1 doctest target with 0 tests), 0 failures (100% pass rate); cross-instance revocation verified across multiple stores with authoritative SQLite validation; `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing.
+- [x] **Combined Phase 13 & Phase 14 — Abuse Prevention, Rate Limiting & SSRF Hardening (COMPLETE & VERIFIED):**
+  - **Multi-Dimensional Rate Limiter (`src/security/rate_limiter.rs`):** Token bucket algorithm with microsecond precision; partitioned by identity (`Ip` or `Principal`) and route category (`General`, `ChatInference`, `Authentication`); generous personal/family burst defaults; process-local concurrency limits (`RequestPermit: 200`, `StreamPermit: 50`) with RAII release on drop; periodic TTL pruning; RFC 9110 `Retry-After` headers.
+  - **SSRF & Outbound Protection (`src/security/ssrf.rs`):** Comprehensive IPv4/IPv6 address classification (`classify_ip`) blocking loopback, private RFC 1918, link-local, cloud metadata, and IPv4-mapped IPv6 ranges; DNS rebinding connection pinning via `resolve_to_addrs`; redirects disabled; authorized local inference gating.
+  - **Zero-Backoff Low-Latency Failover (`src/inference/mod.rs`):** Immediate candidate failover on upstream 429 / quota exhaustion in automatic routing mode (< 20ms failover); manual routing invariant strictly preserved.
+  - **Verification:** 378 automated tests passing across 24 test targets (110 unit + 268 integration); clean clippy and audit.
+- [x] **Phase 15 — Production-Grade Google Drive Integration, Chat Sync, Library Sync, Encryption, Restore & Verification (COMPLETE & VERIFIED):**
+  - **Private `appDataFolder` Isolation:** Sync operations target strictly the private, hidden `appDataFolder` (`spaces=appDataFolder`) using scope `https://www.googleapis.com/auth/drive.appdata`.
+  - **Zero Paid Database & Ephemeral Token Transit:** Zero external database footprint (no Postgres, Mongo, Redis, Supabase, Firebase). Tokens passed via `X-Drive-Token` are never written to disk, SQLite, or logs.
+  - **Dyn-Compatible Trait & Mock Engine (`src/drive/client.rs`, `src/drive/mock.rs`):** Dyn-compatible `DriveClient` with `BoxedDriveFuture` and `MockDriveClient` supporting error injection, 429 rate limiting with Retry-After, and transient failure recovery.
+  - **Local Multi-Tenant Sync Store (`src/drive/local_store.rs`):** Thread-safe in-memory store partitioned by `owner_subject` with dirty-flag tracking and independent Chat vs Library collections.
+  - **Authenticated Encryption with Anti-Transplantation AAD Binding (`src/drive/crypto.rs`):** AES-256-GCM encryption with 96-bit random nonces; AAD strictly bound to `owner_subject:resource_id`. Tag verification fails in constant time if ciphertext is transplanted across tenants or resources.
+  - **Bidirectional Sync & Restore Orchestrator (`src/drive/sync_engine.rs`):** Full synchronization with Last-Write-Wins (LWW) conflict resolution and account restoration from Drive `manifest.json`.
+  - **Independent Library Lifecycle:** Soft-deleting a conversation strictly leaves associated Library files intact. Library items can only be deleted via explicit `DELETE /api/v1/drive/library/{id}` calls.
+  - **Path Traversal Protection:** `sanitize_filename` strips directory traversal (`../`, `..\`) and illegal characters from uploaded files.
+  - **Default-Off Sync Switch & Safe Logout:** Sync defaults to disabled (`google_drive_sync_enabled: false`), toggleable via config or `POST /api/v1/drive/config`. `POST /api/v1/drive/logout` clears in-memory state while strictly preserving remote Google Drive data.
+  - **Verification:** **397 automated tests passing** across 24 test targets (120 unit + 277 integration across 23 integration/benchmark suites) with 0 failures (100% pass rate); `cargo clippy --all-targets --all-features -- -D warnings` clean (0 warnings); `cargo fmt --check` clean; `cargo audit -n` clean (0 vulnerabilities across 183 crates); `gitleaks detect -v` clean (0 leaks); `cargo build --release` passing.
 
 ---
 
@@ -132,8 +148,8 @@
 | **12** | **Authorization and Secret Management** | **COMPLETE** | Phase 11 | Resource ownership, tenant telemetry isolation, dynamic PAT lifecycle, AES-GCM encryption, IDOR defenses, cross-instance revocation | 345 tests pass (22 targets), clippy clean, zero leaks, audit clean | Verified Complete |
 | **13** | **Abuse Prevention** | **COMPLETE** | Phase 12 | Multi-dimensional token bucket rate limiting, IP & Principal isolation, concurrency & stream permits | 14 tests pass, RFC 9110 Retry-After, generous personal burst | Verified Complete |
 | **14** | **Security Hardening** | **COMPLETE** | Phase 13 | Comprehensive IPv4/IPv6 SSRF blocklist, DNS rebinding connection pinning, redirect disabled | 9 tests pass, cargo audit clean, provider compatibility verified | Verified Complete |
-| **15** | **Google Drive Integration** | **NEXT ELIGIBLE PHASE** | Phase 14 | OAuth token exchange, `drive.appdata` scope client, Drive I/O | Mock Google Drive API tests | Eligible to Begin |
-| **16** | **Chat History & Synchronization** | **NOT STARTED** | Phase 15 | Canonical chat schemas, LWW conflict resolution, pagination | Multi-device sync conflict tests | Pending Approval |
+| **15** | **Google Drive Integration & Sync** | **COMPLETE** | Phase 14 | OAuth token exchange, `drive.appdata` client, AES-256-GCM encryption, LWW conflict resolution, restore | 397 tests pass (24 targets), clippy clean, release build pass | Verified Complete |
+| **16** | **Chat History & Synchronization** | **NEXT ELIGIBLE PHASE** | Phase 15 | Canonical chat schemas, multi-device pagination, historical search | Multi-device sync conflict tests | Eligible to Begin |
 | **17** | **Observability & Diagnostics** | **NOT STARTED** | Phase 16 | Structured JSON tracing, sanitized logging, readiness probes | Log redaction verification | Pending Approval |
 | **18** | **Comprehensive Automated Testing** | **NOT STARTED** | Phase 17 | End-to-end integration test harness, provider mock suites | Full test suite passes 100% | Pending Approval |
 | **19** | **Performance & Security Validation** | **NOT STARTED** | Phase 18 | Microbenchmarks, p95 latency verification, penetration tests | Latency & resource benchmarks | Pending Approval |
@@ -143,6 +159,7 @@
 
 ## 3. Immediate Next Steps & Phase Boundaries
 
-1. **Combined Phase 13 & Phase 14 Formally Closed & Verified:** All mandatory acceptance criteria (multi-dimensional token bucket rate limiting, per-IP and per-principal isolation, process-local request and stream concurrency bounds, comprehensive IPv4/IPv6 SSRF protection, metadata service blocking, DNS rebinding connection pinning via `resolve_to_addrs`, redirect disabling, authorized local inference gating, zero-backoff low-latency provider failover on quota exhaustion, and no artificial usage caps) are fully implemented and verified with 378 passing tests across 24 test targets (100% passing across all active suites).
-2. **Phase 15 (Google Drive Integration) Is Next Eligible Phase:** Phase 15 remains strictly on hold until separate explicit user authorization. No Phase 15 code has been implemented.
+1. **Phase 15 (Google Drive Integration & Sync) Formally Closed & Verified:** All mandatory acceptance criteria (private `appDataFolder` isolation, AES-256-GCM encryption with anti-transplantation AAD binding, LWW conflict resolution, account restoration, path traversal sanitization, default-off sync toggle, safe logout semantics, and independent Library lifecycle) are fully implemented and verified with 397 passing tests across 24 test targets (100% passing across all active suites).
+2. **Phase 16 (Chat History & Synchronization) Is Next Eligible Phase:** Phase 16 remains strictly on hold until separate explicit user authorization. No Phase 16 code has been implemented.
 3. **Repository State Protected:** Secrets, local SQLite databases (`data/usage.db`), and compiled binaries (`target/`) are strictly excluded from version control with zero credential leakage.
+

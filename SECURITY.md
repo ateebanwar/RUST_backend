@@ -86,16 +86,26 @@ To prevent Server-Side Request Forgery (SSRF), cloud metadata exfiltration, and 
 
 ---
 
-## 5. Google Drive Least Privilege & Token Security
+## 5. Google Drive Least Privilege, Encryption & Token Security
 
 1. **Restricted OAuth Scope:**
    - The backend strictly requires the narrowest possible Drive scope: `https://www.googleapis.com/auth/drive.appdata`.
-   - This scope restricts the application to its own private, hidden Application Data folder. It CANNOT view, list, modify, or delete any of the user's personal files, photos, or documents.
-2. **Ephemeral Transit Only:**
+   - This scope restricts the application to its own private, hidden Application Data folder (`spaces=appDataFolder`). It CANNOT view, list, modify, or delete any of the user's personal files, photos, or documents.
+2. **Ephemeral Transit & Zero Disk Token Storage:**
    - Google Drive access tokens are passed in request headers (`X-Drive-Token`) and processed entirely in ephemeral memory.
-   - The backend NEVER stores Google OAuth refresh tokens or access tokens on disk or in a permanent database.
-3. **Safe Logout Semantics:**
-   - Logging out of a client application terminates the local session only. Remote Google Drive chat backups must NEVER be deleted automatically upon logout.
+   - The backend NEVER stores Google OAuth refresh tokens or access tokens on disk, in SQLite, or in a permanent database.
+   - All structured logging automatically redacts `X-Drive-Token` headers.
+3. **Authenticated Encryption with AAD Context Binding (`src/drive/crypto.rs`):**
+   - Prior to uploading to Google Drive, all conversation JSON and binary library payloads are encrypted using AES-256-GCM via `ring::aead`.
+   - Associated Data (AAD) is strictly bound to `owner_subject:resource_id`. If ciphertext is copied or transplanted to a different user account or resource ID, decryption and tag verification fail in constant time.
+4. **Independent Chat & Library Lifecycles:**
+   - Soft-deleting a conversation marks the conversation deleted, but NEVER deletes associated Library items (uploaded files, media, generated documents).
+   - Library items can only be deleted via explicit `DELETE /api/v1/drive/library/{id}` calls.
+5. **Path Traversal Protection (`src/drive/models.rs`):**
+   - Uploaded library filenames are sanitized via `sanitize_filename`, which rejects directory traversal sequences (`../`, `..\`) and replaces illegal characters, preventing directory escape during download.
+6. **Safe Logout & Disconnect Semantics:**
+   - Calling `POST /api/v1/drive/logout` terminates the local in-memory session only. Remote Google Drive backups and library items must NEVER be deleted upon logout.
+
 
 ---
 

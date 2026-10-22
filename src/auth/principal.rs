@@ -152,6 +152,7 @@ impl AuthPrincipal {
                 "routing:read".to_string(),
                 "usage:read".to_string(),
                 "auth:tokens".to_string(),
+                "drive".to_string(),
             ],
         }
     }

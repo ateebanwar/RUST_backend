@@ -156,7 +156,41 @@
 - **Residual Risk:** Low.
 - **Verification Method:** Execution of `cargo audit` and `cargo deny check` in automated test pipelines.
 
+### T-11: Google Drive Token Exfiltration & In-Transit Leakage
+- **STRIDE Category:** Information Disclosure
+- **Attack Scenario:** An attacker intercepts or extracts Google OAuth access tokens passed for Drive synchronization, enabling unauthorized Drive operations.
+- **Likelihood:** Low | **Impact:** High | **Risk:** Medium
+- **Mitigations:**
+  1. Restrict scope strictly to `https://www.googleapis.com/auth/drive.appdata` (cannot access user personal files).
+  2. Process `X-Drive-Token` entirely in ephemeral memory; never write tokens to disk, SQLite, or logs.
+  3. Mandatory TLS 1.3 across all client-to-backend and backend-to-Google communication.
+- **Residual Risk:** Very Low.
+- **Verification Method:** Log redaction tests; memory dump verification; network transit inspection.
+
+### T-12: Cross-Tenant Ciphertext Transplantation & Anti-Tampering
+- **STRIDE Category:** Tampering / Elevation of Privilege
+- **Attack Scenario:** A malicious user obtains another user's encrypted conversation or library file from Google Drive and attempts to restore it into their own account, or tampers with ciphertext bytes in transit.
+- **Likelihood:** Low | **Impact:** High | **Risk:** Medium
+- **Mitigations:**
+  1. AES-256-GCM authenticated encryption with 96-bit random nonces.
+  2. Cryptographic Associated Data (AAD) strictly bound to `owner_subject:resource_id`.
+  3. Tag verification fails in constant time if ciphertext is moved across users or resources.
+- **Residual Risk:** Very Low.
+- **Verification Method:** Automated unit tests in `drive::crypto::tests::test_aad_binding_prevents_ciphertext_transplantation` and `test_tampered_ciphertext_fails`.
+
+### T-13: Path Traversal & Arbitrary File Overwrite in Library Sync
+- **STRIDE Category:** Tampering / Elevation of Privilege
+- **Attack Scenario:** An attacker crafts a library upload with a malicious filename (e.g. `../../etc/passwd` or `..\system32\calc.exe`) attempting directory escape or filesystem tampering upon download.
+- **Likelihood:** Medium | **Impact:** High | **Risk:** High
+- **Mitigations:**
+  1. Strict filename sanitization (`sanitize_filename` in `src/drive/models.rs`).
+  2. Strips all directory separators (`/`, `\`), resolves `..`, and restricts characters to safe alphanumeric and permitted punctuation.
+  3. Safe default fallback (`unnamed_file`) for empty or invalid names.
+- **Residual Risk:** Negligible.
+- **Verification Method:** Automated integration tests in `tests/library_sync_test.rs::test_path_traversal_sanitization`.
+
 ---
+
 
 ## 3. Residual Risk & Limitations
 

@@ -530,3 +530,53 @@ graph TD
 5. **Fail-Closed Production & Non-Loopback Network Boundary (`src/config.rs`, `src/auth/service.rs`):**
    - In production (`APP_ENV=production`), application startup strictly requires at least one configured credential (`API_KEY`, `API_KEYS`, or `GOOGLE_CLIENT_ID`), preventing accidental unauthenticated production deployments. Production mode strictly mandates HTTPS for `GOOGLE_JWKS_URL`.
    - Whenever the backend binds to a non-loopback network interface (e.g., `0.0.0.0` or a public IP), authentication is automatically and unconditionally enforced for all protected routes, guaranteeing that development bypass can never expose endpoints across external network interfaces.
+
+---
+
+## 11. Google Drive Synchronization & Persistence Subsystem (Phase 15 Implementation)
+
+### 11.1 Subsystem Architecture & Component Topology
+
+The Google Drive synchronization subsystem enables secure, zero-cost, user-controlled remote persistence without requiring paid external databases (PostgreSQL, Redis, MongoDB, Firebase):
+
+```mermaid
+graph TD
+    Client[Client App: Flutter / IDE / VS Code] -->|X-Drive-Token + Bearer Auth| API[Axum Drive Route Handlers]
+    
+    subgraph Drive Engine Subsystem
+        API --> LocalStore[LocalSyncStore: In-Memory Multi-Tenant Store]
+        API --> SyncEngine[SyncEngine: Bidirectional Orchestrator]
+        SyncEngine --> LocalStore
+        SyncEngine --> Crypto[DriveCryptoEngine: AES-256-GCM + AAD Binding]
+        SyncEngine --> DriveClient[DriveClient Trait Dyn-Compatible Object]
+    end
+
+    subgraph Remote Google Cloud
+        DriveClient -->|Google REST v3 HTTPS| AppData[Google Drive appDataFolder: Private Hidden Sandbox]
+        AppData --> Manifest[manifest.json: Authoritative Index]
+        AppData --> EncryptedFiles[Encrypted Conversation & Library Blobs]
+    end
+```
+
+### 11.2 Architectural Invariants & Guarantees
+
+1. **Private `appDataFolder` Isolation:**
+   - Persistence is strictly confined to Google Drive's hidden `appDataFolder` (`spaces=appDataFolder`) using least-privilege scope `https://www.googleapis.com/auth/drive.appdata`.
+   - Files stored here are invisible in standard Google Drive UI, preventing accidental user tampering or deletion.
+2. **Ephemeral Transit & Zero Disk Token Storage:**
+   - Google Drive access tokens (`X-Drive-Token`) are passed ephemerally in HTTP headers and never written to disk, SQLite, or structured logs.
+3. **Authenticated Encryption at Rest with AAD Binding (`src/drive/crypto.rs`):**
+   - Prior to uploading to Google Drive, all conversation JSON and binary library payloads are encrypted using AES-256-GCM via `ring::aead`.
+   - Associated Data (AAD) is strictly bound to `owner_subject:resource_id`. If ciphertext is copied or moved across tenants or resources, tag verification fails in constant time, defeating ciphertext transplantation attacks.
+4. **Independent Chat & Library Lifecycles:**
+   - Conversations and Library items are tracked as distinct top-level entities in `SyncManifest`.
+   - Soft-deleting a conversation (`DELETE /api/v1/drive/conversations/{id}`) marks the conversation deleted but **NEVER** deletes associated Library items.
+   - Library items are removed exclusively via explicit `DELETE /api/v1/drive/library/{id}` calls.
+5. **Bidirectional Sync with Last-Write-Wins (LWW) Conflict Resolution (`src/drive/sync_engine.rs`):**
+   - Remote `manifest.json` tracks timestamps (`updated_at`).
+   - If local timestamp is newer, local payload is encrypted and uploaded; if remote timestamp is newer, authoritative remote payload is downloaded, decrypted, and applied locally.
+6. **Path Traversal Sanitization (`src/drive/models.rs`):**
+   - `sanitize_filename` strips directory traversal sequences (`../`, `..\`) and replaces invalid characters, ensuring safe Content-Disposition downloads.
+7. **Transient Failure Resilience & Rate-Limit Handling:**
+   - Remote Google Drive calls are wrapped in `retry_drive_op` supporting bounded exponential backoff with jitter and RFC 9110 `Retry-After` parsing on HTTP 429.
+

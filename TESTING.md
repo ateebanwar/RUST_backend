@@ -61,12 +61,28 @@ Using `wiremock::MockServer`:
 - **Reporting Fallback:** Verify response metadata indicates `is_fallback: true` and names the initial requested model versus actual executing model.
 - **Exhausted Options:** Simulate failure of all compatible models; verify response returns HTTP 502 with `UPSTREAM_FAILURE` without panicking.
 
-### 2.5 Google Drive Synchronization Tests (`tests/drive_sync_tests.rs`)
-- **Conflict Resolution:** Submit updates with conflicting timestamps; verify Last-Write-Wins (LWW) resolution is applied accurately.
-- **Isolation:** Verify user cannot read or write another user's conversation ID.
-- **Corrupted Payload Handling:** Submit malformed chat JSON; verify backend rejects with HTTP 400 without corrupting remote state.
+### 2.5 Google Drive & Library Synchronization Tests (`tests/drive_sync_test.rs` & `tests/library_sync_test.rs`)
+- **`tests/drive_sync_test.rs` (7 passing tests):**
+  - `test_drive_switch_default_off_and_toggle`: Verifies sync is default disabled (`google_drive_sync_enabled: false`) and toggleable via `POST /api/v1/drive/config`.
+  - `test_empty_account_initial_sync_and_local_conversation_upload`: Verifies first-time sync bootstrapping on an empty Drive account and local conversation upload.
+  - `test_lww_conflict_resolution`: Verifies Last-Write-Wins (LWW) conflict resolution logic using remote vs local UTC timestamps.
+  - `test_tenant_isolation_between_accounts`: Proves strict tenant isolation; Account A cannot view, restore, or decrypt Account B's conversation data.
+  - `test_logout_preserves_remote_data_and_restore_recovers_it`: Proves logout clears local session but leaves remote Google Drive data untouched, and subsequent restore fully recovers history.
+  - `test_http_429_rate_limiting_with_retry_after`: Verifies bounded retries, rate limiting handling, and RFC 9110 `Retry-After` delay honoring.
+  - `test_transient_failure_retries_and_recovery`: Verifies automatic exponential backoff retries when Google Drive returns transient network errors.
+- **`tests/library_sync_test.rs` (4 passing tests):**
+  - `test_upload_and_download_library_item`: Verifies binary upload, SHA-256 checksumming, AES-256-GCM encryption, and raw octet-stream download.
+  - `test_chat_deletion_leaves_library_items_intact`: Proves the critical lifecycle separation: soft-deleting a chat conversation NEVER deletes associated library files.
+  - `test_path_traversal_sanitization`: Verifies directory traversal attacks (`../../etc/shadow`) are strictly sanitized to safe base filenames.
+  - `test_library_sync_to_google_drive`: Verifies bidirectional sync of library metadata and content blobs to Google Drive `appDataFolder`.
+- **Unit Tests in `src/drive/` (10 passing tests):**
+  - Models: filename sanitization, RFC 3339 timestamps.
+  - Crypto: AAD context binding, tampering detection, base64 roundtrip, AES-256-GCM roundtrip.
+  - Local store: owner isolation, chat deletion independent lifecycle.
+  - Mock client: file CRUD, error/transient failure injection.
 
 ---
+
 
 ## 3. Standard Verification Commands
 

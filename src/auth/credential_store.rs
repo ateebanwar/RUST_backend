@@ -247,7 +247,14 @@ impl CredentialStore {
 
         let expires_at = req.expires_in_secs.map(|secs| now.saturating_add(secs));
 
-        let cred_id = format!("cred_{:016x}", now ^ (token_hash[0] as u64));
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&token_hash[0..8]);
+        let rand_val = u64::from_le_bytes(id_bytes);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let cred_id = format!("cred_{:016x}", nanos ^ rand_val);
 
         // Subject ownership & IDOR resolution
         let owner_subject = match req.owner_subject {

@@ -219,6 +219,57 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+impl From<crate::drive::DriveError> for AppError {
+    fn from(err: crate::drive::DriveError) -> Self {
+        match err {
+            crate::drive::DriveError::SyncDisabled => {
+                AppError::InvalidRequest("Google Drive synchronization is disabled".to_string())
+            }
+            crate::drive::DriveError::MissingDriveToken => AppError::Unauthorized(
+                "Missing required Google Drive access token (X-Drive-Token header)".to_string(),
+            ),
+            crate::drive::DriveError::InvalidDriveToken(msg) => AppError::Unauthorized(format!(
+                "Invalid or expired Google Drive access token: {msg}"
+            )),
+            crate::drive::DriveError::PermissionDenied(msg) => {
+                AppError::Forbidden(format!("Google Drive permission denied: {msg}"))
+            }
+            crate::drive::DriveError::QuotaExceeded(msg) => AppError::RateLimited {
+                message: format!("Google Drive quota exceeded: {msg}"),
+                retry_after_secs: None,
+            },
+            crate::drive::DriveError::RateLimited {
+                message,
+                retry_after_secs,
+            } => AppError::RateLimited {
+                message,
+                retry_after_secs,
+            },
+            crate::drive::DriveError::NotFound(msg) => AppError::NotFound(msg),
+            crate::drive::DriveError::NetworkError(msg) => {
+                AppError::UpstreamFailure(format!("Google Drive network failure: {msg}"))
+            }
+            crate::drive::DriveError::CryptoError(msg) => {
+                AppError::InternalError(format!("Cryptographic operation failed: {msg}"))
+            }
+            crate::drive::DriveError::CorruptData(msg) => {
+                AppError::InternalError(format!("Corrupt remote Drive data: {msg}"))
+            }
+            crate::drive::DriveError::SchemaMismatch { expected, actual } => {
+                AppError::InvalidRequest(format!(
+                    "Schema mismatch: expected version {expected}, found {actual}"
+                ))
+            }
+            crate::drive::DriveError::ChecksumMismatch { expected, actual } => {
+                AppError::InvalidRequest(format!(
+                    "Checksum mismatch: expected {expected}, calculated {actual}"
+                ))
+            }
+            crate::drive::DriveError::Internal(msg) => AppError::InternalError(msg),
+        }
+    }
+}
+
 /// Sanitize user-visible message by removing any potential secret patterns.
 fn sanitize_message(msg: &str) -> String {
     let lower = msg.to_ascii_lowercase();

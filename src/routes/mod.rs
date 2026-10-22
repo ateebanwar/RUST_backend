@@ -2,6 +2,7 @@
 
 pub mod chat;
 pub mod credentials;
+pub mod drive;
 pub mod health;
 pub mod models;
 pub mod routing;
@@ -11,7 +12,7 @@ use crate::AppState;
 use axum::Router;
 use axum::routing::{get, post};
 
-/// Register all foundational, model discovery, chat completion, usage/quota, and credential routes on the Axum Router.
+/// Register all foundational, model discovery, chat completion, usage/quota, credential, and Drive sync routes on the Axum Router.
 pub fn create_routes() -> Router<AppState> {
     Router::new()
         // Health & System Discovery (API_SPEC.md §2)
@@ -44,4 +45,30 @@ pub fn create_routes() -> Router<AppState> {
             "/api/v1/auth/tokens/{id}/rotate",
             post(credentials::rotate_token),
         )
+        // Google Drive Synchronization & Library Management (Phase 15)
+        .route("/api/v1/drive/status", get(drive::get_sync_status))
+        .route("/api/v1/drive/config", post(drive::update_sync_config))
+        .route("/api/v1/drive/sync", post(drive::trigger_sync))
+        .route(
+            "/api/v1/drive/conversations",
+            get(drive::list_conversations).post(drive::create_conversation),
+        )
+        .route(
+            "/api/v1/drive/conversations/{id}",
+            get(drive::get_conversation).delete(drive::delete_conversation),
+        )
+        .route(
+            "/api/v1/drive/library",
+            get(drive::list_library_items).post(drive::create_library_item),
+        )
+        .route(
+            "/api/v1/drive/library/{id}",
+            get(drive::get_library_item).delete(drive::delete_library_item),
+        )
+        .route(
+            "/api/v1/drive/library/{id}/content",
+            get(drive::get_library_item_content),
+        )
+        .route("/api/v1/drive/restore", post(drive::restore_data))
+        .route("/api/v1/drive/logout", post(drive::logout_user))
 }
