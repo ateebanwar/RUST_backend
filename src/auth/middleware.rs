@@ -56,6 +56,37 @@ pub async fn auth_middleware(
     req.extensions_mut()
         .insert(RequestId(request_id_str.clone()));
 
+    // 1b. CORS Preflight Handling (OPTIONS)
+    if req.method() == axum::http::Method::OPTIONS {
+        let mut response = Response::builder()
+            .status(axum::http::StatusCode::NO_CONTENT)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let headers = response.headers_mut();
+        headers.insert(
+            HeaderName::from_static("access-control-allow-origin"),
+            HeaderValue::from_static("*"),
+        );
+        headers.insert(
+            HeaderName::from_static("access-control-allow-methods"),
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+        );
+        headers.insert(
+            HeaderName::from_static("access-control-allow-headers"),
+            HeaderValue::from_static(
+                "authorization, content-type, x-api-key, x-drive-token, x-client-type, x-request-id, accept",
+            ),
+        );
+        headers.insert(
+            HeaderName::from_static("access-control-max-age"),
+            HeaderValue::from_static("86400"),
+        );
+        if let Ok(hdr_val) = HeaderValue::from_str(&request_id_str) {
+            headers.insert(HeaderName::from_static("x-request-id"), hdr_val);
+        }
+        return response;
+    }
+
     // 2. Host Header Validation
     if !state.config.allowed_hosts.is_empty() {
         let host_val = req
@@ -157,6 +188,16 @@ pub async fn auth_middleware(
             .headers_mut()
             .insert(HeaderName::from_static("x-request-id"), hdr_val);
     }
+
+    // Attach CORS headers for client compatibility
+    response.headers_mut().insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_static("*"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("access-control-expose-headers"),
+        HeaderValue::from_static("x-request-id, content-type"),
+    );
 
     response
 }

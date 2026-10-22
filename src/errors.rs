@@ -168,6 +168,15 @@ impl AppError {
                 .insert(header::HeaderName::from_static("x-request-id"), hval);
         }
 
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("access-control-allow-origin"),
+            header::HeaderValue::from_static("*"),
+        );
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("access-control-expose-headers"),
+            header::HeaderValue::from_static("x-request-id, content-type"),
+        );
+
         if let Self::RateLimited {
             retry_after_secs: Some(secs),
             ..
@@ -191,6 +200,15 @@ impl IntoResponse for AppError {
             Json(envelope),
         )
             .into_response();
+
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("access-control-allow-origin"),
+            header::HeaderValue::from_static("*"),
+        );
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("access-control-expose-headers"),
+            header::HeaderValue::from_static("x-request-id, content-type"),
+        );
 
         if let Self::RateLimited {
             retry_after_secs: Some(secs),

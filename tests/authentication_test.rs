@@ -1578,3 +1578,90 @@ async fn test_concurrent_oidc_authentication_and_jwks_concurrency() {
     assert_eq!(unknown_kid_count, 10);
     assert_eq!(api_key_count, 10);
 }
+
+#[tokio::test]
+async fn test_cors_preflight_and_response_headers() {
+    let mut config = AppConfig::default_local();
+    config.api_key = Some("test_api_key_cors".to_string());
+    config.auth_required = Some(true);
+    let state = AppState::new(Arc::new(config));
+    let (base_url, _server) = spawn_auth_test_backend(state).await;
+    let client = reqwest::Client::new();
+
+    // 1. CORS Preflight OPTIONS request on protected route
+    let options_resp = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base_url}/api/v1/chat/completions"),
+        )
+        .header("Origin", "http://localhost:3000")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization, content-type, x-drive-token, x-client-type",
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(options_resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        options_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "*"
+    );
+    let allowed_methods = options_resp
+        .headers()
+        .get("access-control-allow-methods")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(allowed_methods.contains("POST"));
+    assert!(allowed_methods.contains("OPTIONS"));
+    let allowed_headers = options_resp
+        .headers()
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(allowed_headers.contains("authorization"));
+    assert!(allowed_headers.contains("x-drive-token"));
+
+    // 2. Normal GET request contains CORS headers
+    let get_resp = client
+        .get(format!("{base_url}/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        get_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "*"
+    );
+
+    // 3. Unauthorized error response contains CORS headers
+    let unauth_resp = client
+        .get(format!("{base_url}/api/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauth_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "*"
+    );
+}
