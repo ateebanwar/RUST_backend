@@ -1,0 +1,50 @@
+# Multi-stage Dockerfile for Vercel Fluid Compute Container Deployment
+# Ref: https://vercel.com/docs/frameworks/dockerfiles
+# -------------------------------------------------------------------
+# Stage 1: Build the Rust release binary
+FROM rust:1-slim-bookworm AS builder
+WORKDIR /app
+
+# Copy dependency manifests first to maximize Docker layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy source files to compile and cache dependencies
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs && \
+    touch src/lib.rs && \
+    cargo build --release --bin ai-backend && \
+    rm -rf src target/release/deps/ai_backend* target/release/ai-backend*
+
+# Copy the actual source tree
+COPY src ./src
+
+# Build the production release binary
+RUN cargo build --release --bin ai-backend
+
+# -------------------------------------------------------------------
+# Stage 2: Minimal, hardened runtime container
+FROM debian:bookworm-slim AS runner
+WORKDIR /app
+
+# Install CA certificates for TLS connections to AI providers and Google Drive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /app/target/release/ai-backend /usr/local/bin/ai-backend
+
+# Run as non-privileged user (uid 10001) for container security hardening
+USER 10001:10001
+
+# Production defaults (Vercel assigns PORT dynamically at runtime)
+ENV HOST=0.0.0.0
+ENV PORT=8080
+ENV APP_ENV=production
+ENV DEPLOYMENT_MODE=daemon
+ENV LOG_FORMAT=json
+
+EXPOSE 8080
+
+# Execute the native Axum HTTP daemon
+ENTRYPOINT ["/usr/local/bin/ai-backend"]

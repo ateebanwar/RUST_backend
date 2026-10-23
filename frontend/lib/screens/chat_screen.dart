@@ -117,6 +117,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final syncStatus = widget.appState.driveSyncStatus;
     final isSyncing = widget.appState.isSyncingDrive;
     final syncError = widget.appState.driveSyncError;
+    final user = widget.appState.currentUser;
 
     return Scaffold(
       key: _scaffoldKey,
@@ -196,6 +197,40 @@ class _ChatScreenState extends State<ChatScreen> {
                             minimumSize: Size.zero,
                           ),
                           child: const Text('Connect', style: TextStyle(fontSize: 12, color: AppTheme.accentGreen, fontWeight: FontWeight.bold)),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                // Drive sync error banner if sync or conversation persistence fails
+                if (syncError != null && user != null && user.hasDriveToken)
+                  Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: AppTheme.statusError.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: AppTheme.statusError.withOpacity(0.3)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.error_outline, size: 16, color: AppTheme.statusError),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            syncError,
+                            style: const TextStyle(fontSize: 12, color: AppTheme.statusError),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => widget.appState.triggerDriveSync(),
+                          style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            minimumSize: Size.zero,
+                          ),
+                          child: const Text('Retry', style: TextStyle(fontSize: 12, color: AppTheme.statusError, fontWeight: FontWeight.bold)),
                         ),
                       ],
                     ),

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:ai_assistant_frontend/config/app_config.dart';
 import 'package:ai_assistant_frontend/main.dart';
 import 'package:ai_assistant_frontend/models/conversation.dart';
 import 'package:ai_assistant_frontend/screens/chat_screen.dart';
@@ -220,5 +221,48 @@ void main() {
 
     expect(find.text('Search your conversations'), findsOneWidget);
     expect(find.byType(TextField), findsOneWidget);
+  });
+
+  testWidgets('Clicking Continue with Google with unconfigured Client ID shows actionable error', (tester) async {
+    final originalClientId = AppConfig.googleClientId;
+    AppConfig.googleClientId = '';
+    try {
+      await tester.pumpWidget(
+        AIAssistantApp(
+          authService: authService,
+          appState: appState,
+          speechService: speechService,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Click Continue with Google
+      await tester.tap(find.text('Continue with Google'));
+      await tester.pumpAndSettle();
+
+      expect(authService.isAuthenticated, false);
+      expect(find.textContaining('Google OAuth Web Client ID is not configured'), findsOneWidget);
+    } finally {
+      AppConfig.googleClientId = originalClientId;
+    }
+  });
+
+  testWidgets('Sign in with custom token sets genuine non-mock AuthUser', (tester) async {
+    await authService.signInWithCustomTokens(
+      idToken: 'test_pat_token_value',
+      driveToken: 'test_drive_token_value',
+      name: 'Custom Tester',
+      email: 'tester@example.com',
+    );
+
+    expect(authService.isAuthenticated, true);
+    expect(authService.isMockSession, false);
+    expect(authService.currentUser?.name, 'Custom Tester');
+    expect(authService.currentUser?.email, 'tester@example.com');
+    expect(authService.currentUser?.hasDriveToken, true);
+
+    await authService.signOut();
+    expect(authService.isAuthenticated, false);
+    expect(authService.currentUser, isNull);
   });
 }

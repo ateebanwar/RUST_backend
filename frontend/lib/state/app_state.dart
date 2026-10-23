@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import '../models/auth_user.dart';
@@ -134,6 +135,9 @@ class AppState extends ChangeNotifier {
     try {
       _recentConversations = await driveService.listConversations(user);
       _recentConversations.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      if (kDebugMode) {
+        print('[RUNTIME-TRACE][FRONTEND] loadConversations: Successfully loaded ${_recentConversations.length} conversations into sidebar: ${_recentConversations.map((c) => c.title).toList()}');
+      }
     } catch (e) {
       _historyError = 'Could not load conversation history from Drive: $e';
     } finally {
@@ -162,6 +166,25 @@ class AppState extends ChangeNotifier {
     final success = await authService.authorizeDrive();
     if (success) {
       _driveSyncError = null;
+      final currentUser = authService.currentUser;
+      if (currentUser != null &&
+          currentUser.hasDriveToken &&
+          _currentConversation != null &&
+          _messages.isNotEmpty) {
+        try {
+          final convToSave = _currentConversation!.copyWith(
+            ownerSubject: currentUser.id,
+            messages: _messages.map((m) => m.copyWith(isSaved: true, saveError: null)).toList(),
+          );
+          final saved = await driveService.saveConversation(currentUser, convToSave);
+          _currentConversation = saved;
+          _messages = _messages.map((m) => m.copyWith(isSaved: true, saveError: null)).toList();
+          notifyListeners();
+        } catch (e) {
+          _driveSyncError = 'Connected to Drive, but could not save active conversation: $e';
+          notifyListeners();
+        }
+      }
       await checkDriveStatus();
       await loadConversations();
     }
@@ -182,7 +205,21 @@ class AppState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await driveService.triggerSync(authService.currentUser ?? user);
+      final currentUser = authService.currentUser ?? user;
+      if (currentUser.hasDriveToken && _currentConversation != null && _messages.isNotEmpty) {
+        try {
+          final convToSave = _currentConversation!.copyWith(
+            ownerSubject: currentUser.id,
+            messages: _messages.map((m) => m.copyWith(isSaved: true, saveError: null)).toList(),
+          );
+          final saved = await driveService.saveConversation(currentUser, convToSave);
+          _currentConversation = saved;
+          _messages = _messages.map((m) => m.copyWith(isSaved: true, saveError: null)).toList();
+        } catch (_) {
+          // Best-effort pre-sync active conversation persistence
+        }
+      }
+      await driveService.triggerSync(currentUser);
       await checkDriveStatus();
       await loadConversations();
     } catch (e) {
@@ -313,7 +350,7 @@ class AppState extends ChangeNotifier {
       role: 'user',
       content: text.trim(),
       timestamp: nowIso,
-      isSaved: true,
+      isSaved: user.hasDriveToken,
     );
 
     _messages.add(userMessage);
@@ -335,7 +372,7 @@ class AppState extends ChangeNotifier {
       content: '',
       timestamp: DateTime.now().toUtc().toIso8601String(),
       isStreaming: true,
-      isSaved: true, // Optimistically true until terminal save status received
+      isSaved: user.hasDriveToken, // Optimistically true only if Drive token is present
     );
 
     _messages.add(assistantMessage);
@@ -390,7 +427,7 @@ class AppState extends ChangeNotifier {
           _messages[asstIndex] = _messages[asstIndex].copyWith(
             content: accumulated,
             isStreaming: false,
-            isSaved: !isSaveFailed,
+            isSaved: user.hasDriveToken ? !isSaveFailed : false,
             saveError: isSaveFailed
                 ? (event.errorMessage ?? 'Saving to Google Drive failed')
                 : null,
@@ -400,7 +437,7 @@ class AppState extends ChangeNotifier {
           notifyListeners();
 
           // Refresh recent conversations from Drive if successfully saved
-          if (!isSaveFailed) {
+          if (!isSaveFailed && user.hasDriveToken) {
             loadConversations();
             checkDriveStatus();
           }

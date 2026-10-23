@@ -17,7 +17,8 @@ use crate::AppState;
 use crate::auth::principal::AuthPrincipal;
 use crate::drive::{
     CreateConversationRequest, CreateLibraryItemRequest, DriveConfigUpdate, LibraryItem,
-    SyncConversation, SyncResult, SyncStatus, compute_sha256, decode_base64, sanitize_filename,
+    SyncConversation, SyncResult, SyncStatus, UpdateConversationRequest, compute_sha256,
+    decode_base64, sanitize_filename,
 };
 use crate::errors::AppError;
 use axum::Json;
@@ -25,6 +26,30 @@ use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+
+/// Validate resource ID format to prevent path traversal or injection attacks.
+fn validate_resource_id(id: &str, resource_type: &str) -> Result<(), AppError> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidRequest(format!(
+            "{resource_type} ID cannot be empty"
+        )));
+    }
+    if trimmed.len() > 128 {
+        return Err(AppError::InvalidRequest(format!(
+            "{resource_type} ID exceeds maximum length of 128 characters"
+        )));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AppError::InvalidRequest(format!(
+            "Invalid {resource_type} ID: must contain only alphanumeric, underscore, or hyphen characters"
+        )));
+    }
+    Ok(())
+}
 
 /// Extract authenticated owner subject from request extension.
 ///
@@ -102,8 +127,33 @@ pub async fn trigger_sync(
     let owner = get_owner_subject(&principal)?;
     let token = require_drive_token(&headers)?;
 
-    let result = state.sync_engine.sync(&owner, token).await?;
+    let result = state.sync_engine.sync(&owner, token).await.map_err(|e| {
+        tracing::error!(owner = %owner, error = %e, "Google Drive trigger_sync failed");
+        AppError::from(e)
+    })?;
     Ok((StatusCode::OK, Json(result)))
+}
+
+/// Safely redact owner subject identifier for logs without exposing full OAuth IDs.
+fn redact_owner(owner: &str) -> String {
+    if let Some((prefix, id)) = owner.split_once(':') {
+        if id.len() > 6 {
+            let start = &id[..3];
+            let end = &id[id.len() - 3..];
+            format!("{prefix}:{start}***{end} (len: {})", id.len())
+        } else {
+            format!("{prefix}:***")
+        }
+    } else if owner.len() > 6 {
+        format!(
+            "{}***{} (len: {})",
+            &owner[..3],
+            &owner[owner.len() - 3..],
+            owner.len()
+        )
+    } else {
+        "***".to_string()
+    }
 }
 
 /// GET /api/v1/drive/conversations — List all active conversations for the authenticated user.
@@ -116,11 +166,29 @@ pub async fn list_conversations(
 ) -> Result<(StatusCode, Json<Vec<SyncConversation>>), AppError> {
     let owner = get_owner_subject(&principal)?;
     let token = get_drive_token(&headers);
+    let has_drive_token = token.is_some();
+    let drive_token_len = token.map(|t| t.len()).unwrap_or(0);
+    tracing::debug!(
+        owner = %redact_owner(&owner),
+        has_drive_token,
+        drive_token_len,
+        "GET /api/v1/drive/conversations received"
+    );
 
     let list = state
         .sync_engine
         .list_conversations_with_drive(&owner, token)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(owner = %owner, error = %e, "Google Drive list_conversations failed");
+            AppError::from(e)
+        })?;
+
+    tracing::debug!(
+        owner = %redact_owner(&owner),
+        count = list.len(),
+        "list_conversations returning conversations"
+    );
 
     Ok((StatusCode::OK, Json(list)))
 }
@@ -137,18 +205,44 @@ pub async fn create_conversation(
     let owner = get_owner_subject(&principal)?;
     let token = require_drive_token(&headers)?;
 
+    let title = payload.title.trim();
+    if title.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "Conversation title cannot be empty".to_string(),
+        ));
+    }
+    if title.len() > 500 {
+        return Err(AppError::InvalidRequest(
+            "Conversation title exceeds maximum length of 500 characters".to_string(),
+        ));
+    }
+
+    if let Some(ref custom_id) = payload.id {
+        validate_resource_id(custom_id, "conversation")?;
+    }
+
+    if payload.messages.len() > 1000 {
+        return Err(AppError::InvalidRequest(
+            "Initial messages array exceeds maximum limit of 1000 messages".to_string(),
+        ));
+    }
+
     let id = payload
         .id
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("conv_{}", ring::rand::SystemRandom::new().generate_sub_id()));
 
-    let mut conv = SyncConversation::new(id, owner.clone(), payload.title);
+    let mut conv = SyncConversation::new(id, owner.clone(), title.to_string());
     conv.messages = payload.messages;
 
     let saved = state
         .sync_engine
         .persist_conversation_to_drive(&owner, conv, token)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(owner = %owner, error = %e, "Google Drive persist_conversation failed");
+            AppError::from(e)
+        })?;
 
     Ok((StatusCode::CREATED, Json(saved)))
 }
@@ -165,13 +259,119 @@ pub async fn get_conversation(
     let owner = get_owner_subject(&principal)?;
     let token = get_drive_token(&headers);
 
+    validate_resource_id(&id, "conversation")?;
+
     let conv = state
         .sync_engine
         .get_or_hydrate_conversation(&owner, &id, token)
-        .await?
+        .await
+        .map_err(|e| {
+            tracing::error!(owner = %owner, conversation_id = %id, error = %e, "Google Drive get_conversation failed");
+            AppError::from(e)
+        })?
         .ok_or_else(|| AppError::NotFound(format!("Conversation '{id}' not found")))?;
 
+    if conv.owner_subject != owner {
+        return Err(AppError::Forbidden(
+            "Access denied to conversation".to_string(),
+        ));
+    }
+
     Ok((StatusCode::OK, Json(conv)))
+}
+
+/// PUT / PATCH /api/v1/drive/conversations/{id} — Update an existing conversation (rename or update messages).
+///
+/// Confirms save only after Drive file write and manifest commit succeed.
+pub async fn update_conversation(
+    State(state): State<AppState>,
+    principal: Option<Extension<AuthPrincipal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateConversationRequest>,
+) -> Result<(StatusCode, Json<SyncConversation>), AppError> {
+    let owner = get_owner_subject(&principal)?;
+    let token = require_drive_token(&headers)?;
+
+    validate_resource_id(&id, "conversation")?;
+
+    if payload.title.is_none() && payload.messages.is_none() {
+        return Err(AppError::InvalidRequest(
+            "At least one field ('title' or 'messages') must be provided to update".to_string(),
+        ));
+    }
+
+    if let Some(ref t) = payload.title {
+        let trimmed = t.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::InvalidRequest(
+                "Conversation title cannot be empty".to_string(),
+            ));
+        }
+        if trimmed.len() > 500 {
+            return Err(AppError::InvalidRequest(
+                "Conversation title exceeds maximum length of 500 characters".to_string(),
+            ));
+        }
+    }
+
+    if let Some(ref msgs) = payload.messages
+        && msgs.len() > 1000
+    {
+        return Err(AppError::InvalidRequest(
+            "Conversation messages array exceeds maximum limit of 1000 messages".to_string(),
+        ));
+    }
+
+    let mut conv = state
+        .sync_engine
+        .get_or_hydrate_conversation(&owner, &id, Some(token))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                owner = %owner,
+                conversation_id = %id,
+                error = %e,
+                "Google Drive get_conversation failed during update"
+            );
+            AppError::from(e)
+        })?
+        .ok_or_else(|| AppError::NotFound(format!("Conversation '{id}' not found")))?;
+
+    if conv.deleted {
+        return Err(AppError::NotFound(format!("Conversation '{id}' not found")));
+    }
+
+    if conv.owner_subject != owner {
+        return Err(AppError::Forbidden(
+            "Access denied to conversation".to_string(),
+        ));
+    }
+
+    if let Some(t) = payload.title {
+        conv.title = t.trim().to_string();
+    }
+    if let Some(msgs) = payload.messages {
+        conv.messages = msgs;
+    }
+    conv.revision += 1;
+    conv.updated_at = crate::drive::chrono_like_now();
+
+    let saved = state
+        .sync_engine
+        .persist_conversation_to_drive(&owner, conv, token)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                owner = %owner,
+                conversation_id = %id,
+                error = %e,
+                "Google Drive persist_conversation failed during update"
+            );
+            AppError::from(e)
+        })?;
+
+    Ok((StatusCode::OK, Json(saved)))
 }
 
 /// DELETE /api/v1/drive/conversations/{id} — Soft-delete a conversation on Google Drive.
@@ -186,10 +386,16 @@ pub async fn delete_conversation(
     let owner = get_owner_subject(&principal)?;
     let token = require_drive_token(&headers)?;
 
+    validate_resource_id(&id, "conversation")?;
+
     let deleted = state
         .sync_engine
         .delete_conversation_on_drive(&owner, &id, token)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(owner = %owner, conversation_id = %id, error = %e, "Google Drive delete_conversation failed");
+            AppError::from(e)
+        })?;
 
     if deleted {
         Ok((
@@ -235,6 +441,23 @@ pub async fn create_library_item(
     let token = require_drive_token(&headers)?;
 
     let clean_filename = sanitize_filename(&payload.filename);
+    if clean_filename.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "Library item filename cannot be empty or contain only invalid characters".to_string(),
+        ));
+    }
+    if payload.mime_type.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "Library item mime_type cannot be empty".to_string(),
+        ));
+    }
+    if let Some(ref custom_id) = payload.id {
+        validate_resource_id(custom_id, "library_item")?;
+    }
+    if let Some(ref conv_id) = payload.conversation_id {
+        validate_resource_id(conv_id, "conversation")?;
+    }
+
     let raw_bytes = decode_base64(&payload.content_base64)
         .map_err(|e| AppError::InvalidRequest(format!("Invalid base64 payload: {e}")))?;
 
@@ -276,11 +499,19 @@ pub async fn get_library_item(
     let owner = get_owner_subject(&principal)?;
     let token = get_drive_token(&headers);
 
+    validate_resource_id(&id, "library_item")?;
+
     let item = state
         .sync_engine
         .get_or_hydrate_library_item(&owner, &id, token)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Library item '{id}' not found")))?;
+
+    if item.owner_subject != owner {
+        return Err(AppError::Forbidden(
+            "Access denied to library item".to_string(),
+        ));
+    }
 
     Ok((StatusCode::OK, Json(item)))
 }
@@ -295,11 +526,19 @@ pub async fn get_library_item_content(
     let owner = get_owner_subject(&principal)?;
     let token = get_drive_token(&headers);
 
+    validate_resource_id(&id, "library_item")?;
+
     let meta = state
         .sync_engine
         .get_or_hydrate_library_item(&owner, &id, token)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Library item '{id}' not found")))?;
+
+    if meta.owner_subject != owner {
+        return Err(AppError::Forbidden(
+            "Access denied to library item".to_string(),
+        ));
+    }
 
     let bytes = state
         .sync_engine
@@ -329,6 +568,8 @@ pub async fn delete_library_item(
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let owner = get_owner_subject(&principal)?;
     let token = require_drive_token(&headers)?;
+
+    validate_resource_id(&id, "library_item")?;
 
     let deleted = state
         .sync_engine

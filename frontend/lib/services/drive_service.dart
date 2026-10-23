@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../config/app_config.dart';
 import '../models/auth_user.dart';
@@ -63,13 +64,21 @@ class DriveService {
 
   /// GET /api/v1/drive/conversations
   Future<List<SyncConversation>> listConversations(AuthUser user) async {
+    final headers = _headers(user, includeDriveToken: true);
+    final hasDriveHeader = headers.containsKey('X-Drive-Token');
+    if (kDebugMode) {
+      print('[RUNTIME-TRACE][FRONTEND] listConversations: Sending GET /api/v1/drive/conversations. user.hasDriveToken: ${user.hasDriveToken}, X-Drive-Token header included: $hasDriveHeader (token len: ${headers['X-Drive-Token']?.length ?? 0})');
+    }
     final uri = Uri.parse('$_baseUrl/api/v1/drive/conversations');
     final response = await _client
-        .get(uri, headers: _headers(user, includeDriveToken: true))
+        .get(uri, headers: headers)
         .timeout(AppConfig.requestTimeout);
 
     if (response.statusCode == 200) {
       final list = jsonDecode(response.body) as List<dynamic>;
+      if (kDebugMode) {
+        print('[RUNTIME-TRACE][FRONTEND] listConversations: Received HTTP 200 with ${list.length} conversations');
+      }
       return list
           .map((item) => SyncConversation.fromJson(item as Map<String, dynamic>))
           .where((conv) => !conv.deleted)

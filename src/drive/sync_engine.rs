@@ -370,8 +370,33 @@ impl SyncEngine {
         })
     }
 
+    fn redact_owner(owner: &str) -> String {
+        if let Some((prefix, id)) = owner.split_once(':') {
+            if id.len() > 6 {
+                let start = &id[..3];
+                let end = &id[id.len() - 3..];
+                format!("{prefix}:{start}***{end} (len: {})", id.len())
+            } else {
+                format!("{prefix}:***")
+            }
+        } else if owner.len() > 6 {
+            format!(
+                "{}***{} (len: {})",
+                &owner[..3],
+                &owner[owner.len() - 3..],
+                owner.len()
+            )
+        } else {
+            "***".to_string()
+        }
+    }
+
     /// Restore all data from Google Drive (bootstrap on clean device or reinstall).
     pub async fn restore(&self, owner: &str, drive_token: &str) -> Result<SyncResult, DriveError> {
+        tracing::info!(
+            owner = %Self::redact_owner(owner),
+            "SyncEngine::restore: Starting restoration from Google Drive AppData space"
+        );
         if !self.crypto.is_configured() {
             return Err(DriveError::CryptoError(
                 "Cannot restore: encryption key is not configured. The original 32-byte key (DRIVE_ENCRYPTION_KEY) is required.".to_string(),
@@ -384,6 +409,11 @@ impl SyncEngine {
                     .find_file(drive_token, REMOTE_MANIFEST_FILENAME, DRIVE_APPDATA_SPACE)
             })
             .await?;
+
+        tracing::debug!(
+            manifest_found = manifest_meta.is_some(),
+            "SyncEngine::restore: Remote manifest probe finished"
+        );
 
         let Some(meta) = manifest_meta else {
             return Ok(SyncResult {
@@ -399,11 +429,20 @@ impl SyncEngine {
         let enc_bytes = self
             .retry_drive_op(|| self.client.download_file(drive_token, &meta.id))
             .await?;
+        tracing::debug!(
+            bytes_len = enc_bytes.len(),
+            "SyncEngine::restore: Downloaded encrypted manifest. Decrypting..."
+        );
         let plain_bytes = self
             .crypto
             .decrypt(owner, REMOTE_MANIFEST_FILENAME, &enc_bytes)?;
         let manifest: SyncManifest = serde_json::from_slice(&plain_bytes)
             .map_err(|e| DriveError::CorruptData(format!("Corrupt manifest: {e}")))?;
+
+        tracing::info!(
+            conversations_count = manifest.conversations.len(),
+            "SyncEngine::restore: Manifest successfully decrypted"
+        );
 
         let mut restored_convs = 0;
         let mut restored_libs = 0;
@@ -412,6 +451,11 @@ impl SyncEngine {
             if !entry.deleted
                 && let Some(file_id) = &entry.drive_file_id
             {
+                tracing::debug!(
+                    title = %entry.title,
+                    id = %id,
+                    "SyncEngine::restore: Downloading conversation from Google Drive"
+                );
                 let conv_enc = self
                     .retry_drive_op(|| self.client.download_file(drive_token, file_id))
                     .await?;
@@ -425,6 +469,12 @@ impl SyncEngine {
                     .apply_remote_conversation(owner, conv, file_id.clone())
                     .await?;
                 restored_convs += 1;
+                tracing::info!(
+                    title = %entry.title,
+                    restored = restored_convs,
+                    total = manifest.conversations.len(),
+                    "SyncEngine::restore: Conversation successfully restored into RAM"
+                );
             }
         }
 
@@ -704,6 +754,10 @@ impl SyncEngine {
                 .map_err(Into::into);
         };
 
+        if entry.deleted {
+            return Ok(false);
+        }
+
         let now = chrono_like_now();
         entry.deleted = true;
         entry.deleted_at = Some(now.clone());
@@ -852,6 +906,10 @@ impl SyncEngine {
                 .map_err(Into::into);
         };
 
+        if entry.deleted {
+            return Ok(false);
+        }
+
         let now = chrono_like_now();
         entry.deleted = true;
         entry.deleted_at = Some(now);
@@ -920,17 +978,38 @@ impl SyncEngine {
         drive_token: Option<&str>,
     ) -> Result<Vec<SyncConversation>, DriveError> {
         let cached = self.local_store.list_conversations(owner).await;
+        tracing::debug!(
+            cached_in_ram = cached.len(),
+            has_drive_token = drive_token.is_some(),
+            crypto_configured = self.crypto.is_configured(),
+            "list_conversations_with_drive state"
+        );
         if !cached.is_empty() {
+            tracing::debug!(
+                count = cached.len(),
+                "list_conversations_with_drive: Returning conversations directly from RAM cache"
+            );
             return Ok(cached);
         }
 
         if let Some(token) = drive_token
             && self.crypto.is_configured()
         {
+            tracing::info!(
+                "list_conversations_with_drive: RAM cache empty, invoking self.restore() to download from Google Drive"
+            );
             let _ = self.restore(owner, token).await;
-            return Ok(self.local_store.list_conversations(owner).await);
+            let restored = self.local_store.list_conversations(owner).await;
+            tracing::info!(
+                count = restored.len(),
+                "list_conversations_with_drive: restore finished, returning conversations from local_store"
+            );
+            return Ok(restored);
         }
 
+        tracing::debug!(
+            "list_conversations_with_drive: No drive token or crypto unconfigured, returning 0 cached conversations"
+        );
         Ok(cached)
     }
 

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../config/app_config.dart';
 import '../services/auth_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/google_sign_in_button.dart';
 
 /// Clean Google Sign-In screen for ChatGPT-inspired mobile interface.
 class LoginScreen extends StatefulWidget {
@@ -20,6 +21,12 @@ class _LoginScreenState extends State<LoginScreen> {
   final TextEditingController _customTokenController = TextEditingController();
   final TextEditingController _customDriveTokenController = TextEditingController();
   bool _showAdvanced = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.authService.ensureInitialized();
+  }
 
   @override
   void dispose() {
@@ -150,37 +157,9 @@ class _LoginScreenState extends State<LoginScreen> {
                   ],
 
                   // Primary Google Sign-In Button
-                  SizedBox(
-                    width: double.infinity,
-                    height: 50,
-                    child: ElevatedButton(
-                      onPressed: isLoading ? null : _handleGoogleSignIn,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.white,
-                        foregroundColor: Colors.black,
-                        elevation: 0,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(25),
-                        ),
-                      ),
-                      child: isLoading
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
-                            )
-                          : const Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(Icons.g_mobiledata, size: 28, color: Colors.blue),
-                                SizedBox(width: 6),
-                                Text(
-                                  'Continue with Google',
-                                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-                                ),
-                              ],
-                            ),
-                    ),
+                  buildGoogleSignInButton(
+                    onPressed: _handleGoogleSignIn,
+                    isLoading: isLoading,
                   ),
                   const SizedBox(height: 16),
 

@@ -84,7 +84,7 @@ class ChatService {
                 'content': m.content,
               })
           .toList(),
-      'conversation_id': conversationId,
+      if (user.hasDriveToken) 'conversation_id': conversationId,
       'routing_mode': routingMode,
       if (requestedModelId != null) 'requested_model_id': requestedModelId,
       'temperature': temperature,
@@ -208,7 +208,7 @@ class ChatService {
                 'content': m.content,
               })
           .toList(),
-      'conversation_id': conversationId,
+      if (user.hasDriveToken) 'conversation_id': conversationId,
       'routing_mode': routingMode,
       if (requestedModelId != null) 'requested_model_id': requestedModelId,
       'temperature': temperature,

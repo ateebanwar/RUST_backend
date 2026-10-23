@@ -17,7 +17,7 @@ class AppConfig {
   /// Configure this with your actual Web Client ID from Google Cloud Console.
   static String googleClientId = const String.fromEnvironment(
     'GOOGLE_CLIENT_ID',
-    defaultValue: '',
+    defaultValue: '164223517067-s37obp9gkjdp0lnjpifpdv6239belrjq.apps.googleusercontent.com',
   );
 
   /// Check if Google Client ID is configured.

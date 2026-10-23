@@ -391,3 +391,68 @@ async fn test_tenant_isolation_between_accounts() {
         0
     );
 }
+
+#[tokio::test]
+async fn test_runtime_trace_evidence_cold_start_hydration_of_5_chats() {
+    let mut config = AppConfig::default_local();
+    config.google_drive_sync_enabled = true;
+    let state = AppState::new(Arc::new(config));
+
+    let (_base_url, _handle, mock_client, sync_engine) = spawn_drive_test_backend(state).await;
+    let owner = "google:user_runtime_trace";
+    let token = "valid_oauth_drive_token";
+
+    // 1. Create and persist 5 conversations to simulated Google Drive
+    for i in 1..=5 {
+        let conv = SyncConversation::new(
+            format!("conv_trace_{i}"),
+            owner.to_string(),
+            format!("Previous Chat {i}"),
+        );
+        sync_engine
+            .persist_conversation_to_drive(owner, conv, token)
+            .await
+            .unwrap();
+    }
+
+    // Verify remote Google Drive files exist (1 manifest + 5 conversations = 6 files)
+    assert_eq!(mock_client.file_count().await, 6);
+
+    // 2. Simulate restarting the backend / dropping memory cache:
+    sync_engine
+        .local_store()
+        .clear_user_session(owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        sync_engine
+            .local_store()
+            .list_conversations(owner)
+            .await
+            .len(),
+        0,
+        "RAM must be empty after restart"
+    );
+
+    // 3. Call list_conversations_with_drive WITHOUT drive token -> must return 0
+    let empty_convs = sync_engine
+        .list_conversations_with_drive(owner, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        empty_convs.len(),
+        0,
+        "Without X-Drive-Token, cold backend must return 0 chats"
+    );
+
+    // 4. Call list_conversations_with_drive WITH drive token -> triggers self.restore() and returns 5 chats
+    let restored_convs = sync_engine
+        .list_conversations_with_drive(owner, Some(token))
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_convs.len(),
+        5,
+        "With X-Drive-Token, cold backend must restore all 5 chats"
+    );
+}

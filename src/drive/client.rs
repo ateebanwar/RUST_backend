@@ -14,6 +14,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use tracing::warn;
 
 /// Standard Google Drive API base endpoints.
 pub const GOOGLE_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
@@ -218,6 +219,11 @@ impl GoogleDriveClient {
             .and_then(|s| s.parse::<u64>().ok());
 
         let error_body = resp.text().await.unwrap_or_default();
+        warn!(
+            status = status.as_u16(),
+            body = %error_body,
+            "Google Drive API returned HTTP error"
+        );
 
         match status.as_u16() {
             401 => DriveError::InvalidDriveToken("Token expired or revoked by Google".to_string()),

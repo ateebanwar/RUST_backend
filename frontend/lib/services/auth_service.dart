@@ -18,37 +18,137 @@ class AuthService extends ChangeNotifier {
   bool _isLoading = false;
   String? _lastError;
   bool _isInitialized = false;
+  bool _isInitializing = false;
+  Future<void>? _initFuture;
+  StreamSubscription<GoogleSignInAuthenticationEvent>? _authEventsSub;
 
   AuthUser? get currentUser => _currentUser;
   bool get isAuthenticated => _currentUser != null;
   bool get isLoading => _isLoading;
   String? get lastError => _lastError;
   bool get isMockSession => _currentUser?.isMock ?? false;
+  bool get isInitialized => _isInitialized;
+  bool get isInitializing => _isInitializing;
 
   /// Ensure GoogleSignIn plugin is initialized with current Web Client ID.
-  Future<void> ensureInitialized() async {
-    if (_isInitialized) return;
+  Future<void> ensureInitialized() {
+    if (_isInitialized) return Future.value();
+    if (_initFuture != null) return _initFuture!;
+
+    _isInitializing = true;
+    _initFuture = _doInitialize();
+    return _initFuture!;
+  }
+
+  Future<void> _doInitialize() async {
     try {
       final clientId = AppConfig.googleClientId.trim();
+
+      // On Web, Google Identity Services requires serverClientId to be null.
       await GoogleSignIn.instance.initialize(
         clientId: clientId.isNotEmpty ? clientId : null,
-        serverClientId: clientId.isNotEmpty ? clientId : null,
+        serverClientId: kIsWeb ? null : (clientId.isNotEmpty ? clientId : null),
+      ).timeout(
+        const Duration(seconds: 8),
+        onTimeout: () {
+          throw TimeoutException('Google Sign-In initialization timed out.');
+        },
       );
+
+      _authEventsSub ??= GoogleSignIn.instance.authenticationEvents.listen(
+        _handleAuthenticationEvent,
+        onError: (e) {
+          _lastError = 'Authentication error: $e';
+          _isLoading = false;
+          notifyListeners();
+        },
+      );
+
       _isInitialized = true;
+
+      // On Web, attempt lightweight authentication (One Tap / silent session) if user previously signed in
+      if (kIsWeb) {
+        GoogleSignIn.instance.attemptLightweightAuthentication();
+      }
     } catch (e) {
       if (kDebugMode) {
         print('GoogleSignIn initialize notice: $e');
       }
+      _lastError = 'Google Sign-In setup failed: $e';
+    } finally {
+      _isInitializing = false;
+      notifyListeners();
     }
+  }
+
+  Future<void> _handleAuthenticationEvent(GoogleSignInAuthenticationEvent event) async {
+    switch (event) {
+      case GoogleSignInAuthenticationEventSignIn():
+        await _processAccount(event.user);
+      case GoogleSignInAuthenticationEventSignOut():
+        _currentUser = null;
+        _googleAccount = null;
+        _isLoading = false;
+        notifyListeners();
+    }
+  }
+
+  Future<bool> _processAccount(GoogleSignInAccount account) async {
+    final GoogleSignInAuthentication auth = account.authentication;
+    final String? idToken = auth.idToken;
+
+    if (idToken == null || idToken.trim().isEmpty) {
+      _lastError = 'Google Sign-In succeeded, but no ID token was returned. '
+          'Verify that GOOGLE_CLIENT_ID is a Web application client ID in Google Cloud Console '
+          'and that your browser origin is added to Authorized JavaScript origins.';
+      _isLoading = false;
+      notifyListeners();
+      return false;
+    }
+
+    _googleAccount = account;
+    _currentUser = AuthUser(
+      id: 'google:${account.id}',
+      name: account.displayName ?? (account.email.isNotEmpty ? account.email.split('@').first : 'Google User'),
+      email: account.email,
+      photoUrl: account.photoUrl,
+      idToken: idToken.trim(),
+      driveAccessToken: null, // Drive authorization is requested explicitly
+      isMock: false,
+    );
+
+    _isLoading = false;
+    _lastError = null;
+    notifyListeners();
+
+    if (kDebugMode) {
+      final email = account.email;
+      final redactedEmail = email.contains('@')
+          ? '${email.split('@').first.substring(0, email.split('@').first.length > 2 ? 2 : 1)}***@${email.split('@').last}'
+          : '***';
+      final accId = account.id;
+      final redactedId = accId.length > 6
+          ? '${accId.substring(0, 3)}***${accId.substring(accId.length - 3)}'
+          : '***';
+      print('[RUNTIME-TRACE][FRONTEND] _processAccount: Google account authenticated: id=google:$redactedId, email=$redactedEmail. ID token len: ${idToken.trim().length}. Now calling authorizeDrive(silent: true)...');
+    }
+
+    // Attempt immediate Drive authorization for seamless experience if client supports it
+    final silentSuccess = await authorizeDrive(silent: true);
+    if (kDebugMode) {
+      print('[RUNTIME-TRACE][FRONTEND] authorizeDrive(silent: true) returned: $silentSuccess. currentUser.hasDriveToken: ${_currentUser?.hasDriveToken}');
+    }
+
+    return true;
   }
 
   /// Initiate genuine Google Sign-In.
   /// 
-  /// In browser (Edge/Web), opens Google's OAuth 2.0 account chooser / consent popup.
-  /// Extracts genuine Google OIDC ID token for backend validation (`Authorization: Bearer <idToken>`).
-  /// Drive authorization is decoupled and requested via [authorizeDrive] to conform to OAuth 2.0 best practices.
+  /// On Web (Edge), Google Identity Services requires user interaction via the rendered
+  /// button (`renderButton`) and explicitly forbids `authenticate()`.
+  /// On mobile/desktop, native `authenticate()` is called.
   /// 
-  /// Returns `true` if genuine authentication succeeds, `false` otherwise.
+  /// Returns `true` if immediate authentication succeeds, `false` otherwise.
   Future<bool> signInWithGoogle() async {
     _isLoading = true;
     _lastError = null;
@@ -67,40 +167,19 @@ class AuthService extends ChangeNotifier {
       // 2. Initialize GoogleSignIn instance
       await ensureInitialized();
 
-      // 3. Initiate interactive Google Sign-In
-      final GoogleSignInAccount account = await GoogleSignIn.instance.authenticate();
-
-      // 4. Extract genuine Google OIDC ID token
-      final GoogleSignInAuthentication auth = account.authentication;
-      final String? idToken = auth.idToken;
-
-      if (idToken == null || idToken.trim().isEmpty) {
-        _lastError = 'Google Sign-In succeeded, but no ID token was returned. '
-            'Verify that GOOGLE_CLIENT_ID is a Web application client ID in Google Cloud Console '
-            'and that your browser origin is added to Authorized JavaScript origins.';
+      // 3. Initiate authentication according to platform capabilities
+      if (!kIsWeb) {
+        // Native mobile/desktop platforms support authenticate()
+        final GoogleSignInAccount account = await GoogleSignIn.instance.authenticate();
+        return await _processAccount(account);
+      } else {
+        // Web: Google Identity Services prohibits imperative authenticate() calls.
+        // Sign-in is handled through the rendered GSI button (renderButton) or One Tap.
+        GoogleSignIn.instance.attemptLightweightAuthentication();
         _isLoading = false;
         notifyListeners();
         return false;
       }
-
-      _googleAccount = account;
-      _currentUser = AuthUser(
-        id: 'google:${account.id}',
-        name: account.displayName ?? (account.email.isNotEmpty ? account.email.split('@').first : 'Google User'),
-        email: account.email,
-        photoUrl: account.photoUrl,
-        idToken: idToken.trim(),
-        driveAccessToken: null, // Drive authorization is requested explicitly
-        isMock: false,
-      );
-
-      _isLoading = false;
-      notifyListeners();
-
-      // Attempt immediate Drive authorization for seamless experience if client supports it
-      await authorizeDrive(silent: true);
-
-      return true;
     } catch (e) {
       final msg = e.toString().toLowerCase();
       if (msg.contains('popup_closed') || msg.contains('cancel') || msg.contains('abort')) {
@@ -145,26 +224,32 @@ class AuthService extends ChangeNotifier {
       final client = account.authorizationClient;
       final scopes = [AppConfig.googleDriveScope];
 
-      // Check if user has already granted Drive scope
-      final existingAuth = await client.authorizationForScopes(scopes);
-      String? accessToken = existingAuth?.accessToken;
-
-      // If not granted yet, request Drive scope interactively
-      if (accessToken == null || accessToken.trim().isEmpty) {
-        if (silent) {
-          // If silent attempt fails, do not pop up unexpected prompt
-          return false;
+      String? accessToken;
+      if (silent) {
+        // Check if user has already granted Drive scope in this session
+        final existingAuth = await client.authorizationForScopes(scopes);
+        accessToken = existingAuth?.accessToken;
+        if (kDebugMode) {
+          print('[RUNTIME-TRACE][FRONTEND] authorizeDrive(silent: true): client.authorizationForScopes returned accessToken present: ${accessToken != null && accessToken.trim().isNotEmpty} (len: ${accessToken?.trim().length ?? 0})');
         }
+      } else {
+        // Interactively request Drive scope from Google Identity Services token client
         final newAuth = await client.authorizeScopes(scopes);
         accessToken = newAuth.accessToken;
+        if (kDebugMode) {
+          print('[RUNTIME-TRACE][FRONTEND] authorizeDrive(interactive): client.authorizeScopes returned accessToken present: ${accessToken.trim().isNotEmpty} (len: ${accessToken.trim().length})');
+        }
       }
 
-      if (accessToken.trim().isNotEmpty) {
+      if (accessToken != null && accessToken.trim().isNotEmpty) {
         _currentUser = _currentUser!.copyWith(driveAccessToken: accessToken.trim());
         _lastError = null;
         notifyListeners();
         return true;
       } else {
+        if (kDebugMode) {
+          print('[RUNTIME-TRACE][FRONTEND] authorizeDrive(silent: $silent): No Drive access token obtained');
+        }
         if (!silent) {
           _lastError = 'Google Drive authorization was denied. Conversations cannot be synced to Drive.';
           notifyListeners();
@@ -271,5 +356,11 @@ class AuthService extends ChangeNotifier {
   /// Switch account: cleans current session state to allow logging in as another Google account.
   Future<void> switchAccount() async {
     await signOut();
+  }
+
+  @override
+  void dispose() {
+    _authEventsSub?.cancel();
+    super.dispose();
   }
 }

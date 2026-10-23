@@ -98,10 +98,40 @@ async fn setup_benchmark_backend(upstream_url: &str) -> (String, tokio::task::Jo
     config.api_key = Some("test_load_api_key_secure_99".to_string());
     config.groq_api_key = Some("mock_groq_key_val".to_string());
     config.groq_base_url = Some(upstream_url.to_string());
+    config.allow_local_inference = true;
+    config.local_inference_base_url = Some(upstream_url.to_string());
+
+    // In load benchmark, allocate ample rate limit and concurrency headroom so the test measures raw pipeline performance
+    config.rate_limit_ip_burst = 5000;
+    config.rate_limit_ip_rate = 10000.0;
+    config.rate_limit_principal_burst = 5000;
+    config.rate_limit_principal_rate = 10000.0;
+    config.rate_limit_chat_burst = 5000;
+    config.rate_limit_chat_rate = 10000.0;
+    config.max_concurrent_requests = 1000;
+    config.max_concurrent_streams = 500;
+
     let config = Arc::new(config);
 
     let registry = Arc::new(ModelRegistry::new());
     let providers = Arc::new(ProviderRegistry::new());
+
+    let model = ModelMetadata {
+        model_id: "fast-chat-v1".to_string(),
+        display_name: "Llama 3.3 70B Instruct (Groq)".to_string(),
+        provider_id: "groq-api".to_string(),
+        supported_modalities: vec!["text".to_string(), "code".to_string()],
+        context_window: 131072,
+        max_output_tokens: 8192,
+        streaming_supported: true,
+        tool_calling_supported: true,
+        speed_tier: "fast".to_string(),
+        cost_tier: "free-tier".to_string(),
+        available: true,
+        capabilities: vec!["simple_chat".to_string(), "coding".to_string()],
+        last_health_check: "2026-10-20T00:00:00Z".to_string(),
+    };
+    registry.register_model(model.clone()).unwrap();
 
     let adapter = Arc::new(
         OpenAiCompatibleAdapter::new(
@@ -110,21 +140,7 @@ async fn setup_benchmark_backend(upstream_url: &str) -> (String, tokio::task::Jo
             upstream_url,
             Some("mock_groq_key_val".to_string()),
         )
-        .with_models(vec![ModelMetadata {
-            model_id: "fast-chat-v1".to_string(),
-            display_name: "Llama 3.3 70B Instruct (Groq)".to_string(),
-            provider_id: "groq-api".to_string(),
-            supported_modalities: vec!["text".to_string(), "code".to_string()],
-            context_window: 131072,
-            max_output_tokens: 8192,
-            streaming_supported: true,
-            tool_calling_supported: true,
-            speed_tier: "fast".to_string(),
-            cost_tier: "free-tier".to_string(),
-            available: true,
-            capabilities: vec!["simple_chat".to_string(), "coding".to_string()],
-            last_health_check: "2026-10-20T00:00:00Z".to_string(),
-        }]),
+        .with_models(vec![model]),
     );
     providers.register(adapter).unwrap();
 
@@ -136,7 +152,11 @@ async fn setup_benchmark_backend(upstream_url: &str) -> (String, tokio::task::Jo
     let app = create_app(state);
 
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
 
     (format!("http://{}", addr), handle)

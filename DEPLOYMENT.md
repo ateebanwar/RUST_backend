@@ -10,65 +10,87 @@
 
 ## 1. Technical Evaluation of Vercel for Rust Backends
 
-### 1.1 Vercel Execution Architecture
-Vercel executes backend code as serverless functions running on AWS Lambda microVMs (Amazon Linux 2023 / `provided.al2023`).
+### 1.1 Vercel Execution Architecture: Fluid Compute Containers vs Serverless Functions
+Vercel supports running backend applications under two distinct execution paradigms:
 
-To run a Rust Axum application on Vercel:
-1. **Compilation Bridge:** The Rust code is compiled using `cargo-lambda` or the official `vercel-rust` community builder into a standalone Linux binary named `bootstrap`.
-2. **Framework Adapter:** Axum's `axum::Router` is wrapped by the `lambda_http` crate using `lambda_http::run(router)`. Incoming API Gateway / Vercel HTTP events are seamlessly converted into standard Tower/Hyper HTTP requests and dispatched to Axum handlers.
-3. **Local Emulation:** `cargo run` executes the standard Axum HTTP server locally on `http://127.0.0.1:3000`, while `vercel dev` emulates the serverless microVM lifecycle.
+1. **Fluid Compute Containers (`Dockerfile.vercel` - Approved Primary Target):**
+   - Vercel automatically detects `Dockerfile.vercel` at repository root, compiles the OCI-compliant container image via multi-stage Docker build, and deploys it on Vercel Functions powered by **Fluid compute**.
+   - **Zero Code Changes:** Runs the unmodified native Axum HTTP daemon (`src/main.rs`) listening on the port provided by `$PORT` (which `src/config.rs` natively reads).
+   - **Active CPU Billing:** Billed only for CPU cycles while actively processing HTTP requests (idle I/O waiting is not billed).
+   - **Lifecycle:** Scales up on demand and scales to zero when idle. Handles `SIGTERM` gracefully via Axum's built-in graceful shutdown.
 
-### 1.2 Platform Constraints & Operational Implications
+2. **Native Serverless Functions (`vercel_runtime` / `lambda_http` Adapter):**
+   - Requires adding `vercel_runtime` or `lambda_http` to `Cargo.toml` and maintaining an `api/index.rs` entry point.
+   - Converts AWS Lambda JSON RPC events into Tower/Hyper requests.
+   - Suffers from cold start latency (~150ms–350ms) and requires maintaining dual entry points.
 
-| Constraint Dimension | Vercel Serverless Limit | Operational Impact on `ai-backend` | Architectural Mitigation |
+### 1.2 Platform Constraints & Operational Implications (Fluid Compute)
+
+| Constraint Dimension | Vercel Fluid Compute Limit | Operational Impact on `ai-backend` | Architectural Mitigation |
 |---|---|---|---|
-| **Execution Duration** | 15s (Hobby) / 60s (Pro) | Upstream AI queries exceeding 15s get killed with 504 Gateway Timeout. | Enforce strict 10s upstream HTTP client timeouts; select fast inference models. |
-| **Max Payload Size** | 4.5 MB request/response | Large file uploads (e.g., big PDFs or videos) will fail at gateway. | Enforce 4.5 MB body limit; advise client-direct Drive uploads for large media. |
-| **Instance Memory** | Ephemeral microVM | Memory is wiped when instances spin down; no shared memory between parallel requests. | Stateless design: circuit breakers use fast-decay heuristics; chat history in Google Drive. |
-| **Cold Starts** | ~150 ms – 350 ms | Initial request after idle period incurs slight startup delay. | Minimize binary size, disable unused default crate features, strip symbols (`opt-level = "z"` / `lto = true`). |
-| **Streaming / SSE** | Supported via chunked transfer | Client can stream tokens, but total stream time must complete within 15s. | Limit completion token length on serverless deployments to fit within 15s window. |
+| **Execution Duration** | 300s (Hobby & Pro default) / up to 800s (Pro max) | Requests exceeding timeout get terminated with `504 Gateway Timeout`. | Fast inference (Groq) takes 1–4s; deep reasoning (DeepSeek-R1) takes 20–60s; both finish well under 300s limit. |
+| **Max Payload Size** | 4.5 MB request/response | Payloads exceeding 4.5 MB are rejected at the edge gateway. | Enforced by Axum `DefaultBodyLimit::max(4_500_000)` in `src/lib.rs`. |
+| **Instance Memory** | Ephemeral microVM (scales to zero) | Memory is wiped when instances scale to zero; no shared memory between parallel container instances. | Stateless architecture: Chat history and recovery blobs persist directly to Google Drive via AES-256-GCM. |
+| **Cold Starts** | ~200 ms – 500 ms (microVM boot) | Initial request after idle period incurs minor startup latency. | Multi-stage slim Docker image (`debian:bookworm-slim`), stripped binary, zero heavy native dynamic libs. |
+| **SSE Streaming** | Supported via HTTP chunked transfer | Client receives streaming tokens in real time. | Native Axum `Sse` response stream with `KeepAlive` heartbeat and atomic drop-guard usage finalization. |
+| **Background Tasks** | Frozen when container scales to zero | Scheduled hourly maintenance (`start_retention_maintenance`) cannot tick when idle. | Invariant cleanup executes on startup in `AppState::new`. For continuous 24/7 workers, use persistent container. |
 
 ---
 
 ## 2. Hosting Architecture Comparison & Recommendation
 
-| Dimension | Option 1: Vercel Serverless Function (Approved Target) | Option 2: Dedicated Rust Container (e.g., Fly.io / Render / VPS) | Option 3: Split Architecture |
-|---|---|---|---|
-| **Recurring Cost** | **$0.00 / month** (Leverages user's existing Vercel tier) | $0.00 (limited free tiers) or $3–$7 / month | Mixed |
-| **Timeout Limits** | 15s hard limit (Hobby) | Unlimited / Fully configurable | 15s on API, unlimited on worker |
-| **In-Memory State** | Ephemeral only | Persistent (in-memory connection pools, live circuit breakers) | Complex distributed state |
-| **Operational Effort** | Zero server management (git push to deploy) | Requires Dockerfile, monitoring, and restart recovery | High (two independent deployment pipelines) |
+| Dimension | Option 1: Vercel Container via `Dockerfile.vercel` (Primary Target) | Option 2: Dedicated Rust Container (Fly.io / Render / Hetzner VPS) | Option 3: Serverless Function (`vercel_runtime`) |
+|---|---|---|---|---|
+| **Recurring Cost** | **$0.00 / month** (Leverages user's existing Vercel tier) | $0.00 (limited free tiers) or $3–$7 / month | $0.00 / month |
+| **Timeout Limits** | 300s (Hobby) / up to 800s (Pro) | Unlimited / Fully configurable | 15s (legacy Hobby) / 300s (Fluid) |
+| **In-Memory State** | Ephemeral (resets on scale-to-zero) | Persistent 24/7 (in-memory rate limiter & token buckets) | Ephemeral per invocation |
+| **Background Maintenance** | Runs during active traffic; frozen when idle | Runs 24/7 uninterrupted on hourly ticker | Severely constrained (frozen on idle) |
+| **Code Modifications** | **0 lines changed** (native Axum server) | **0 lines changed** (native Axum server) | Requires `vercel_runtime` & `api/index.rs` adapter |
 
-### Approved Recommendation: Dual-Target Deployment Model
-To achieve **zero recurring cost** while preserving maximum flexibility:
-1. **Core Decoupling:** Implement all routing, adapters, and business logic in a shared library crate (`src/lib.rs`).
-2. **Dual Entrypoints:**
-   - `src/main.rs`: Compiles a standard, persistent Axum HTTP daemon for local development, automated integration testing, and optional future container deployment.
-   - `api/index.rs` (or serverless bootstrap): Compiles a lightweight binary linking `lib.rs` to `lambda_http::run` for deployment to Vercel Serverless Functions.
-3. **Stateless Gracefulness:** Operate circuit breakers, usage counters, and rate limiters with heuristic decay, relying on Google Drive for user persistence.
-4. **Upgrade Path:** If deep reasoning or long multimodal video generation workflows consistently exceed 15 seconds, migrate the existing `src/main.rs` binary to a low-cost container service without modifying application logic.
+### Approved Recommendation: Container-First Dual Target Model
+1. **Primary Target (Vercel):** Deploy via `Dockerfile.vercel`. Provides zero-cost hosting on Vercel Fluid Compute with zero Rust code changes, preserving all frontend contracts, SSE streaming, authentication, and encrypted Google Drive persistence.
+2. **Upgrade Path (Fly.io / Render / VPS):** The exact same Docker container can be deployed to any container host with zero modifications if 24/7 uninterrupted background maintenance loops or persistent in-memory rate-limiter buckets are needed.
 
 ---
 
 ## 3. Environment & Secret Configuration
 
-The following environment variables must be configured in the Vercel project settings:
+Configure the following environment variables in the Vercel Project Settings (or `.env.production`):
 
 ```bash
-# Server Configuration
-ENVIRONMENT="production"
-LOG_LEVEL="info"
-APP_URL="https://your-vercel-domain.vercel.app"
+# Server & Runtime Configuration
+HOST="0.0.0.0"
+PORT="8080"
+APP_ENV="production"
+DEPLOYMENT_MODE="daemon"
+LOG_FORMAT="json"
+ALLOWED_HOSTS="your-project.vercel.app,api.yourdomain.com"
+TRUSTED_PROXIES="127.0.0.1,::1"
 
-# Multi-Client Authentication
-GOOGLE_CLIENT_ID="<your-google-oauth-client-id>.apps.googleusercontent.com"
-DEVELOPER_API_KEYS="hash1,hash2" # Comma-separated constant-time hashes for IDEs
+# Client Authentication & Multi-Client Security
+API_KEY="your_production_backend_api_key_here"
+GOOGLE_CLIENT_ID="your_google_client_id.apps.googleusercontent.com"
+AUTH_REQUIRED="true"
 
-# AI Provider API Keys (Server-Side Only - Never Exposed)
+# Google Drive Encrypted Sync & Persistence
+GOOGLE_DRIVE_SYNC_ENABLED="true"
+DRIVE_ENCRYPTION_KEY="your_64_hex_char_master_key_here"
+GOOGLE_DRIVE_FOLDER_NAME="ai_backend_app_data"
+GOOGLE_DRIVE_TIMEOUT_SECS="30"
+GOOGLE_DRIVE_MAX_RETRIES="3"
+
+# Upstream AI Provider API Keys (Server-Side Only - Never Exposed)
 GROQ_API_KEY="gsk_..."
-OPENROUTER_API_KEY="sk-or-..."
-ANTHROPIC_API_KEY="sk-ant-..."
-OPENAI_API_KEY="sk-..."
+OPENROUTER_API_KEY="sk-or-v1-..."
+UPSTREAM_TIMEOUT_SECS="10"
+
+# Abuse Prevention & Rate Limiting
+RATE_LIMIT_ENABLED="true"
+RATE_LIMIT_IP_BURST="100"
+RATE_LIMIT_IP_RATE="20.0"
+MAX_CONCURRENT_REQUESTS="200"
+MAX_CONCURRENT_STREAMS="50"
+SSRF_PROTECTION_ENABLED="true"
 ```
 
 ---

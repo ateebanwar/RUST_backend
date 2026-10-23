@@ -19,10 +19,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // 2. Initialize structured tracing subscriber
+    let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
+    let default_filter = match config.environment {
+        ai_backend::config::Environment::Production => "info,ai_backend=info",
+        _ => "info,ai_backend=debug",
+    };
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+
+    if log_format.eq_ignore_ascii_case("json") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+    }
+
     let bind_addr = format!("{}:{}", config.host, config.port);
     let app_state = AppState::new(Arc::new(config.clone()));
 
-    // 2. Start autonomous retention and retry maintenance worker
+    // 3. Start autonomous retention and retry maintenance worker
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let maintenance_handle =
         ai_backend::start_retention_maintenance(Arc::new(app_state.clone()), shutdown_rx);
@@ -34,23 +54,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_body_size_bytes = config.max_body_size_bytes,
         "ai-backend starting"
     );
-    println!(
-        "[INFO] ai-backend starting (version: {}, env: {}, mode: {})",
-        env!("CARGO_PKG_VERSION"),
-        config.environment.as_str(),
-        config.deployment_mode.as_str()
-    );
 
-    // 3. Build the Axum application
+    // 4. Build the Axum application
     let app = ai_backend::create_app(app_state);
 
-    // 4. Bind TCP listener asynchronously
+    // 5. Bind TCP listener asynchronously
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => {
-            info!(addr = %bind_addr, "Server bound successfully");
-            println!("[INFO] Server listening on http://{bind_addr}");
-            println!("[INFO] Health probe available at http://{bind_addr}/api/v1/health");
-            println!("[INFO] Readiness probe available at http://{bind_addr}/api/v1/ready");
+            info!(
+                addr = %bind_addr,
+                health_probe = %format!("http://{bind_addr}/api/v1/health"),
+                readiness_probe = %format!("http://{bind_addr}/api/v1/ready"),
+                "Server bound and listening"
+            );
             l
         }
         Err(err) => {

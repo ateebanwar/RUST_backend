@@ -46,9 +46,23 @@ async fn hydrate_conversation_context(
     )>,
     Response,
 > {
-    let Some(ref conv_id) = payload.conversation_id else {
+    let Some(ref raw_conv_id) = payload.conversation_id else {
         return Ok(None);
     };
+
+    let conv_id = raw_conv_id.trim();
+    if conv_id.is_empty()
+        || conv_id.len() > 128
+        || !conv_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AppError::InvalidRequest(
+            "Invalid conversation_id: must be 1-128 alphanumeric, underscore, or hyphen characters"
+                .to_string(),
+        )
+        .to_response_with_id(req_id));
+    }
 
     let owner = match principal {
         Some(Extension(p)) if !p.subject.trim().is_empty() => p.subject.clone(),
@@ -92,16 +106,20 @@ async fn hydrate_conversation_context(
         Ok(None) => {
             // Initialize new conversation record for this tenant
             crate::drive::SyncConversation::new(
-                conv_id.clone(),
+                conv_id.to_string(),
                 owner.clone(),
                 "New Conversation".to_string(),
             )
         }
         Err(e) => {
-            return Err(
-                AppError::InternalError(format!("Failed to retrieve conversation: {e}"))
-                    .to_response_with_id(req_id),
+            tracing::error!(
+                request_id = %req_id,
+                owner = %owner,
+                conversation_id = %conv_id,
+                error = %e,
+                "Failed to retrieve/hydrate conversation from Google Drive"
             );
+            return Err(AppError::from(e).to_response_with_id(req_id));
         }
     };
 
@@ -420,10 +438,17 @@ async fn execute_persistence(mut stream_ctx: StreamContext) -> PersistResult {
                 conversation_id: saved_conv.id,
                 revision: saved_conv.revision,
             },
-            Err(e) => PersistResult::SaveFailed {
-                conversation_id: conv_id,
-                error: e.to_string(),
-            },
+            Err(e) => {
+                tracing::error!(
+                    conversation_id = %conv_id,
+                    error = %e,
+                    "Failed to persist conversation to Google Drive during stream completion"
+                );
+                PersistResult::SaveFailed {
+                    conversation_id: conv_id,
+                    error: e.to_string(),
+                }
+            }
         }
     } else {
         PersistResult::NotRequested

@@ -55,7 +55,10 @@ pub fn create_routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/drive/conversations/{id}",
-            get(drive::get_conversation).delete(drive::delete_conversation),
+            get(drive::get_conversation)
+                .put(drive::update_conversation)
+                .patch(drive::update_conversation)
+                .delete(drive::delete_conversation),
         )
         .route(
             "/api/v1/drive/library",

@@ -34,6 +34,7 @@
 | **DEC-021** | Phase 12: Resource Ownership, Dynamic PAT Lifecycle, and Authenticated Secret Management | **APPROVED** | 2026-10-22 | Authorization & Secret Management |
 | **DEC-022** | Combined Phase 13 + Phase 14: Multi-Dimensional Rate Limiting, SSRF Protection, Connection Pinning, and Zero-Backoff Failover | **APPROVED** | 2026-10-22 | Abuse Prevention & Network Security |
 | **DEC-023** | Phase 15: Production-Grade Google Drive Integration, Chat Sync, Library Sync, Encryption, Restore & Verification | **APPROVED** | 2026-10-22 | Drive Persistence, Encryption & Sync |
+| **DEC-024** | Chat Management Production Readiness, Resource Hardening, and Operational Observability Pipeline | **APPROVED** | 2026-10-23 | Chat Management, Security & Observability |
 
 ---
 
@@ -393,6 +394,60 @@
   7. *Safe Logout Semantics:* Calling `POST /api/v1/drive/logout` clears in-memory state and dirty caches for the caller, but strictly leaves remote Google Drive data untouched.
   8. *Path Traversal Protection:* `sanitize_filename` enforces strict basename sanitization and strips directory separators.
 - **Consequences:** All 397 automated tests pass across 24 test targets (120 unit tests + 277 integration tests across 23 integration/benchmark suites) with 0 failures, 0 Clippy warnings, 0 cargo audit vulnerabilities, and 0 secret leaks. Phase 15 is fully verified.
+
+---
+
+### DEC-024: Chat Management Production Readiness, Resource Hardening, and Operational Observability Pipeline
+- **Status:** APPROVED
+- **Date:** 2026-10-23
+- **Context:** Prior to this decision, conversation update and renaming endpoints (`PUT`/`PATCH /api/v1/drive/conversations/{id}`) specified in `API_SPEC.md` §1.1 were unimplemented, input validation lacked strict character bounds, path traversal vulnerabilities could potentially exist on non-validated resource IDs, and structured tracing events instrumented throughout the codebase were silently dropped because `tracing-subscriber` was never initialized in `main.rs`.
+- **Decisions Made:**
+  1. *Complete Conversation Update and Renaming Handlers (`src/routes/drive.rs`, `src/routes/mod.rs`):*
+     - Implemented `update_conversation` mounted on both `PUT` and `PATCH /api/v1/drive/conversations/{id}`.
+     - Supports title renaming, message array replacement, atomic monotonic revision incrementing, RFC 3339 timestamp updating, and Google Drive AES-256-GCM remote persistence.
+     - Enforces strict validation: rejects empty or whitespace-only titles, titles exceeding 500 characters, message arrays exceeding 1000 messages, and missing payloads with HTTP 400 `INVALID_REQUEST`.
+     - Validates resource existence and deletion status: returns HTTP 404 `NOT_FOUND` if the conversation does not exist or has already been soft-deleted.
+     - Enforces tenant isolation: callers can only update conversations matching their authenticated `owner_subject`.
+  2. *Strict Resource ID Validation & Path Traversal Guards (`src/routes/drive.rs`, `src/routes/chat.rs`):*
+     - Implemented `validate_resource_id` enforcing 1–128 character bounds and an alphanumeric, underscore (`_`), and hyphen (`-`) whitelist.
+     - Applied unconditionally to conversation IDs and Library item IDs across all create, retrieve, update, delete, content download, and chat completion context hydration paths.
+     - Immediately rejects directory traversal patterns (`../`, `..\\`) and invalid characters with HTTP 400 `INVALID_REQUEST`.
+  3. *Operational Observability & Logging Pipeline (`Cargo.toml`, `src/main.rs`, `src/auth/middleware.rs`):*
+     - Added `tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "json"] }` per DEC-008.
+     - Initialized structured tracing subscriber in `main.rs` supporting dual formats: human-readable ANSI colored text (`LOG_FORMAT=text`, default) and structured JSON (`LOG_FORMAT=json`) for cloud log ingestion.
+     - Integrated `EnvFilter` defaulting to `info,ai_backend=debug` configurable via `RUST_LOG`.
+     - Added non-leaking HTTP request lifecycle tracing middleware logging HTTP method, path, status, latency in milliseconds, and request ID. All credentials, authorization headers, and PII remain strictly unlogged.
+  4. *Idempotent Soft-Delete & Resource Lifecycle Decoupling (`src/drive/sync_engine.rs`):*
+     - Handled double-delete idempotency in `delete_conversation_on_drive` and `delete_library_item_on_drive`, returning `Ok(false)` which maps to HTTP 404 `NOT_FOUND` on repeated delete calls.
+     - Verified that soft-deleting a conversation strictly preserves associated Library files and binary contents in Drive AppData.
+  5. *CORS PATCH Method Support (`src/auth/middleware.rs`):*
+     - Added `Method::PATCH` to CORS `allow_methods` policy alongside `GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`.
+- **Consequences:** All 438 automated tests pass across 28 test targets (118 unit tests + 320 integration tests across 27 integration/benchmark suites) with 0 failures, 0 Clippy warnings, 0 format diffs, and clean release compilation. Fully verified.
+
+---
+
+### DEC-025: Production Deployment Architecture: Vercel Fluid Compute Containerization and Dual-Target Hosting Model
+- **Status:** APPROVED
+- **Date:** 2026-10-23
+- **Context:** In accordance with user request (PROMPT 3), evaluated Vercel compatibility for the Rust/Axum backend without breaking architecture, weakening security, or modifying existing API contracts. Investigated native serverless functions (`vercel_runtime` / `lambda_http`) versus containerized execution (`Dockerfile.vercel` on Vercel Fluid Compute) and persistent container hosting (Fly.io / Render / VPS).
+- **Decisions Made:**
+  1. *Primary Deployment Target (Vercel Fluid Compute via `Dockerfile.vercel`):*
+     - Discovered and verified authoritative Vercel documentation confirming first-class support for `Dockerfile.vercel` on Fluid Compute.
+     - Runs the unmodified native Axum HTTP server (`src/main.rs`) binding to dynamically assigned `$PORT` and `HOST=0.0.0.0`.
+     - Requires **0 lines of Rust code changes**, zero crate dependencies added, and zero API contract alterations.
+     - Fluid compute default and maximum duration limit is 300 seconds (5 minutes) on Hobby tier, easily accommodating fast chat completions (Groq: 1–4s) and deep reasoning completions (DeepSeek-R1: 20–60s).
+     - Handles Axum SSE chunked streaming with keepalive heartbeat, client cancellation via drop guards, and graceful shutdown on SIGTERM cleanly.
+  2. *Zero Database & Serverless-Safe Persistence:*
+     - Google Drive encrypted sync (`src/drive/`) stores conversations and library assets directly in the user's Google Drive `appDataFolder` using AES-256-GCM.
+     - Because the backend does not rely on a server-side stateful database, scaling down to zero when idle does not compromise conversation persistence or multi-session recovery.
+  3. *Documented Operational Trade-offs & Mitigations:*
+     - *Scale-to-zero ephemeral rate limits:* MicroVM resets wipe in-memory token buckets, but IP burst guards protect against immediate bursts.
+     - *Background retention worker:* Tokio worker loop (`start_retention_maintenance`) pauses when idle; startup cleanup invariant in `AppState::new` runs immediately upon spin-up.
+  4. *Upgrade Path (Fly.io / Render / Hetzner VPS):*
+     - The identical multi-stage Docker container (`Dockerfile.vercel`) can be deployed to any persistent container host without modification if 24/7 continuous background maintenance or non-ephemeral in-memory token buckets are required.
+- **Consequences:** Created `Dockerfile.vercel` and `.env.production.example`. Updated `DEPLOYMENT.md`. Retained 100% test compatibility (438 passing tests), zero secrets leaked, and zero changes to core Rust code.
+
+
 
 
 

@@ -2,6 +2,7 @@
 name = "ai-backend"
 version = "0.1.0"
 edition = "2024"
+default-run = "ai-backend"
 
 [dependencies]
 axum = "0.8.9"
@@ -15,6 +16,7 @@ tiktoken-rs = { version = "0.12", default-features = false }
 jsonwebtoken = "9.3.0"
 subtle = "2.6.1"
 ring = "0.17"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "json"] }
 
 [profile.dev]
 codegen-units = 1

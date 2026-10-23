@@ -69,7 +69,7 @@ pub async fn auth_middleware(
         );
         headers.insert(
             HeaderName::from_static("access-control-allow-methods"),
-            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+            HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
         );
         headers.insert(
             HeaderName::from_static("access-control-allow-headers"),
@@ -180,7 +180,43 @@ pub async fn auth_middleware(
         }
     }
 
+    let start_instant = std::time::Instant::now();
+    let method = req.method().clone();
+    let path_clone = path.clone();
+
     let mut response = next.run(req).await;
+
+    let latency_ms = start_instant.elapsed().as_millis();
+    let status_code = response.status().as_u16();
+
+    if status_code >= 500 {
+        tracing::error!(
+            request_id = %request_id_str,
+            method = %method,
+            path = %path_clone,
+            status = status_code,
+            latency_ms = latency_ms,
+            "HTTP request error"
+        );
+    } else if status_code >= 400 {
+        tracing::warn!(
+            request_id = %request_id_str,
+            method = %method,
+            path = %path_clone,
+            status = status_code,
+            latency_ms = latency_ms,
+            "HTTP client error"
+        );
+    } else {
+        tracing::info!(
+            request_id = %request_id_str,
+            method = %method,
+            path = %path_clone,
+            status = status_code,
+            latency_ms = latency_ms,
+            "HTTP request completed"
+        );
+    }
 
     // Attach X-Request-ID to response headers
     if let Ok(hdr_val) = HeaderValue::from_str(&request_id_str) {
