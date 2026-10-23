@@ -17,7 +17,8 @@ All notable project changes, architectural decisions, and document synchronizati
 
 ### 2. Deployment Artifacts Prepared
 - **`Dockerfile.vercel`:**
-  - Created high-performance multi-stage Docker build: `rust:1-slim-bookworm` builder with dependency caching layer and `debian:bookworm-slim` hardened runner.
+  - Multi-stage Docker build: `rust:1-slim-bookworm` builder and `debian:bookworm-slim` hardened runner.
+  - Eliminated fragile dummy source cache layer in `Dockerfile.vercel` which previously caused Cargo fingerprint stale artifact issues with library symbols during `buildah` execution on Vercel.
   - Hardened with non-root user (`USER 10001:10001`), installed CA certificates for TLS, exposed port 8080, and configured `ENTRYPOINT ["/usr/local/bin/ai-backend"]`.
   - Requires **0 lines of Rust code changes**, zero extra crate dependencies, and zero modifications to `Cargo.toml`.
 - **`.env.production.example`:**

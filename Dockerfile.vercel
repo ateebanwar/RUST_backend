@@ -5,20 +5,11 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 
-# Copy dependency manifests first to maximize Docker layer caching
+# Copy dependency manifests and source tree
 COPY Cargo.toml Cargo.lock ./
-
-# Create dummy source files to compile and cache dependencies
-RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs && \
-    touch src/lib.rs && \
-    cargo build --release --bin ai-backend && \
-    rm -rf src target/release/deps/ai_backend* target/release/ai-backend*
-
-# Copy the actual source tree
 COPY src ./src
 
-# Build the production release binary
+# Build the production release binary cleanly
 RUN cargo build --release --bin ai-backend
 
 # -------------------------------------------------------------------
