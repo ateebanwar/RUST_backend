@@ -32,6 +32,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default = "default_routing_mode")]
     pub routing_mode: String,
+    #[serde(alias = "model")]
     pub requested_model_id: Option<String>,
     #[serde(default = "default_modality")]
     pub requested_modality: String,
@@ -41,6 +42,8 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub allow_fallback: Option<bool>,
 }
 
 fn default_routing_mode() -> String {
@@ -62,6 +65,7 @@ impl Default for ChatCompletionRequest {
             max_tokens: None,
             stream: false,
             conversation_id: None,
+            allow_fallback: None,
         }
     }
 }
@@ -176,7 +180,7 @@ pub struct RoutingResolution {
 }
 
 /// Target candidate model and provider pair for execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateExecutionTarget {
     pub model_id: String,
     pub provider_id: String,
@@ -258,18 +262,47 @@ impl InferenceService {
             req.requested_model_id.as_deref(),
         );
 
-        if req.routing_mode.eq_ignore_ascii_case("manual") {
+        let is_auto_requested = match req.requested_model_id.as_deref() {
+            Some(id) => id.eq_ignore_ascii_case("auto") || id.starts_with("auto/"),
+            None => true,
+        };
+        let is_manual = req.routing_mode.eq_ignore_ascii_case("manual")
+            || (!is_auto_requested && req.requested_model_id.is_some());
+
+        if is_manual {
             let preferred_id = match req.requested_model_id.as_deref() {
-                Some(id) if !id.trim().is_empty() => id.trim(),
+                Some(id)
+                    if !id.trim().is_empty()
+                        && !id.eq_ignore_ascii_case("auto")
+                        && !id.starts_with("auto/") =>
+                {
+                    id.trim()
+                }
                 _ => {
-                    return Err(AppError::InvalidRequest(
-                        "requested_model_id is required when routing_mode is 'manual'".to_string(),
-                    ));
+                    if let Some(ref def) = self.config.default_model {
+                        def.as_str()
+                    } else {
+                        return Err(AppError::InvalidRequest(
+                            "requested_model_id is required when routing_mode is 'manual'"
+                                .to_string(),
+                        ));
+                    }
                 }
             };
-            let model = self.registry.get_model(preferred_id).ok_or_else(|| {
-                AppError::NotFound(format!("Model '{preferred_id}' not found in registry"))
-            })?;
+            let model = self
+                .registry
+                .get_model(preferred_id)
+                .or_else(|| {
+                    self.registry
+                        .get_model(&format!("freellmapi/{preferred_id}"))
+                })
+                .or_else(|| {
+                    self.registry
+                        .get_model(&format!("omniroute/{preferred_id}"))
+                })
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("Model '{preferred_id}' not found in registry"))
+                })?;
 
             if !model.available {
                 return Err(AppError::UpstreamFailure(format!(
@@ -326,13 +359,34 @@ impl InferenceService {
                 ),
             };
 
+            let mut ordered_candidates = vec![primary.clone()];
+            if req.allow_fallback == Some(true) {
+                let available_models = self
+                    .registry
+                    .query_models(&ModelFilter::new().with_available_only(true));
+                for m in available_models {
+                    if m.model_id != model.model_id
+                        && RoutingPolicy::supports_modality(&m, &parsed_modality)
+                    {
+                        ordered_candidates.push(CandidateExecutionTarget {
+                            model_id: m.model_id.clone(),
+                            provider_id: m.provider_id.clone(),
+                            reason: format!(
+                                "Configured fallback for user-selected model '{}'.",
+                                model.model_id
+                            ),
+                        });
+                    }
+                }
+            }
+
             Ok(RoutingResolution {
                 selected_model_id: primary.model_id.clone(),
                 provider_id: primary.provider_id.clone(),
                 detected_task,
                 estimated_complexity,
                 selection_reason: primary.reason.clone(),
-                ordered_candidates: vec![primary],
+                ordered_candidates,
                 estimated_prompt_tokens,
             })
         } else {
@@ -486,20 +540,71 @@ impl InferenceService {
 
         let policy = self.config.retry_policy();
         let deadline = Instant::now() + Duration::from_secs(policy.overall_request_timeout_secs);
-        let max_candidates = if req.routing_mode.eq_ignore_ascii_case("manual") {
-            1
+
+        let is_auto_requested = match req.requested_model_id.as_deref() {
+            Some(id) => id.eq_ignore_ascii_case("auto") || id.starts_with("auto/"),
+            None => true,
+        };
+        let is_manual = req.routing_mode.eq_ignore_ascii_case("manual")
+            || (!is_auto_requested && req.requested_model_id.is_some());
+        let allow_fallback = if is_manual {
+            req.allow_fallback.unwrap_or(false)
         } else {
+            req.allow_fallback.unwrap_or(true)
+        };
+
+        let candidates_to_try: Vec<&CandidateExecutionTarget> = if !allow_fallback {
+            resolution.ordered_candidates.iter().take(1).collect()
+        } else if is_manual {
             resolution
                 .ordered_candidates
-                .len()
-                .min(policy.max_failover_candidates)
+                .iter()
+                .take(policy.max_failover_candidates)
+                .collect()
+        } else {
+            let mut operational: Vec<&CandidateExecutionTarget> = Vec::new();
+            let mut seen_providers = HashSet::new();
+
+            // First pass: distinct providers to guarantee multi-provider failover resilience
+            for c in &resolution.ordered_candidates {
+                if self.providers.get(&c.provider_id).is_ok()
+                    && seen_providers.insert(&c.provider_id)
+                {
+                    operational.push(c);
+                    if operational.len() >= policy.max_failover_candidates {
+                        break;
+                    }
+                }
+            }
+
+            // Second pass: fill remaining slots with any other available models
+            if operational.len() < policy.max_failover_candidates {
+                for c in &resolution.ordered_candidates {
+                    if self.providers.get(&c.provider_id).is_ok() && !operational.contains(&c) {
+                        operational.push(c);
+                        if operational.len() >= policy.max_failover_candidates {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if operational.is_empty() {
+                resolution
+                    .ordered_candidates
+                    .iter()
+                    .take(policy.max_failover_candidates)
+                    .collect()
+            } else {
+                operational
+            }
         };
 
         let mut failed_model_ids: HashSet<String> = HashSet::new();
         let mut last_error: Option<ProviderError> = None;
         let mut candidate_attempt_count = 0;
 
-        for candidate in resolution.ordered_candidates.iter().take(max_candidates) {
+        for candidate in &candidates_to_try {
             if failed_model_ids.contains(&candidate.model_id) {
                 continue;
             }
@@ -572,17 +677,12 @@ impl InferenceService {
                         // Fast failover optimization: In automatic routing mode, if the upstream candidate
                         // hits confirmed rate limiting or quota exhaustion and an eligible alternative candidate with
                         // an operational registered provider remains, abandon this candidate immediately and switch candidates.
-                        let has_alternative_candidate =
-                            !req.routing_mode.eq_ignore_ascii_case("manual")
-                                && resolution
-                                    .ordered_candidates
-                                    .iter()
-                                    .take(max_candidates)
-                                    .any(|c| {
-                                        c.model_id != candidate.model_id
-                                            && !failed_model_ids.contains(&c.model_id)
-                                            && self.providers.get(&c.provider_id).is_ok()
-                                    });
+                        let has_alternative_candidate = allow_fallback
+                            && candidates_to_try.iter().any(|c| {
+                                c.model_id != candidate.model_id
+                                    && !failed_model_ids.contains(&c.model_id)
+                                    && self.providers.get(&c.provider_id).is_ok()
+                            });
 
                         let should_fast_failover = has_alternative_candidate
                             && match &provider_err {
@@ -645,7 +745,7 @@ impl InferenceService {
             failed_model_ids.insert(candidate.model_id.clone());
             candidate_attempt_count += 1;
 
-            if req.routing_mode.eq_ignore_ascii_case("manual") {
+            if !allow_fallback {
                 break;
             }
         }
@@ -688,20 +788,69 @@ impl InferenceService {
 
         let policy = self.config.retry_policy();
         let deadline = Instant::now() + Duration::from_secs(policy.overall_request_timeout_secs);
-        let max_candidates = if req.routing_mode.eq_ignore_ascii_case("manual") {
-            1
+
+        let is_auto_requested = match req.requested_model_id.as_deref() {
+            Some(id) => id.eq_ignore_ascii_case("auto") || id.starts_with("auto/"),
+            None => true,
+        };
+        let is_manual = req.routing_mode.eq_ignore_ascii_case("manual")
+            || (!is_auto_requested && req.requested_model_id.is_some());
+        let allow_fallback = if is_manual {
+            req.allow_fallback.unwrap_or(false)
         } else {
+            req.allow_fallback.unwrap_or(true)
+        };
+
+        let candidates_to_try: Vec<&CandidateExecutionTarget> = if !allow_fallback {
+            resolution.ordered_candidates.iter().take(1).collect()
+        } else if is_manual {
             resolution
                 .ordered_candidates
-                .len()
-                .min(policy.max_failover_candidates)
+                .iter()
+                .take(policy.max_failover_candidates)
+                .collect()
+        } else {
+            let mut operational: Vec<&CandidateExecutionTarget> = Vec::new();
+            let mut seen_providers = HashSet::new();
+
+            for c in &resolution.ordered_candidates {
+                if self.providers.get(&c.provider_id).is_ok()
+                    && seen_providers.insert(&c.provider_id)
+                {
+                    operational.push(c);
+                    if operational.len() >= policy.max_failover_candidates {
+                        break;
+                    }
+                }
+            }
+
+            if operational.len() < policy.max_failover_candidates {
+                for c in &resolution.ordered_candidates {
+                    if self.providers.get(&c.provider_id).is_ok() && !operational.contains(&c) {
+                        operational.push(c);
+                        if operational.len() >= policy.max_failover_candidates {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if operational.is_empty() {
+                resolution
+                    .ordered_candidates
+                    .iter()
+                    .take(policy.max_failover_candidates)
+                    .collect()
+            } else {
+                operational
+            }
         };
 
         let mut failed_model_ids: HashSet<String> = HashSet::new();
         let mut last_error: Option<ProviderError> = None;
         let mut candidate_attempt_count = 0;
 
-        for candidate in resolution.ordered_candidates.iter().take(max_candidates) {
+        for candidate in &candidates_to_try {
             if failed_model_ids.contains(&candidate.model_id) {
                 continue;
             }
@@ -773,17 +922,12 @@ impl InferenceService {
                         // Fast failover optimization: In automatic routing mode, if the upstream candidate
                         // hits confirmed rate limiting or quota exhaustion and an eligible alternative candidate with
                         // an operational registered provider remains, abandon this candidate immediately and switch candidates.
-                        let has_alternative_candidate =
-                            !req.routing_mode.eq_ignore_ascii_case("manual")
-                                && resolution
-                                    .ordered_candidates
-                                    .iter()
-                                    .take(max_candidates)
-                                    .any(|c| {
-                                        c.model_id != candidate.model_id
-                                            && !failed_model_ids.contains(&c.model_id)
-                                            && self.providers.get(&c.provider_id).is_ok()
-                                    });
+                        let has_alternative_candidate = allow_fallback
+                            && candidates_to_try.iter().any(|c| {
+                                c.model_id != candidate.model_id
+                                    && !failed_model_ids.contains(&c.model_id)
+                                    && self.providers.get(&c.provider_id).is_ok()
+                            });
 
                         let should_fast_failover = has_alternative_candidate
                             && match &provider_err {
@@ -846,7 +990,7 @@ impl InferenceService {
             failed_model_ids.insert(candidate.model_id.clone());
             candidate_attempt_count += 1;
 
-            if req.routing_mode.eq_ignore_ascii_case("manual") {
+            if !allow_fallback {
                 break;
             }
         }

@@ -336,6 +336,8 @@ pub struct OutboundDestinationPolicy {
     pub allow_local_inference: bool,
     /// Explicit base URL for authorized local inference (e.g. `http://127.0.0.1:11434`).
     pub local_inference_base_url: Option<String>,
+    /// Explicit authorized local gateway URLs (e.g. `http://127.0.0.1:3001/v1`, `http://127.0.0.1:20128/v1`).
+    pub authorized_local_urls: Vec<String>,
     /// Whether external destinations strictly require HTTPS (default: true).
     pub require_https: bool,
     /// Maximum allowed HTTP redirects (default: 0, redirects disabled).
@@ -363,6 +365,7 @@ impl OutboundDestinationPolicy {
             allowed_hosts: allowed,
             allow_local_inference: false,
             local_inference_base_url: None,
+            authorized_local_urls: Vec::new(),
             require_https: true,
             max_redirects: 0,
             connect_timeout: Duration::from_secs(5),
@@ -382,6 +385,18 @@ impl OutboundDestinationPolicy {
     pub fn with_local_inference(mut self, enabled: bool, base_url: Option<String>) -> Self {
         self.allow_local_inference = enabled;
         self.local_inference_base_url = base_url;
+        self
+    }
+
+    /// Builder to configure authorized local gateway URLs.
+    pub fn with_authorized_local_urls(mut self, urls: Vec<String>) -> Self {
+        self.authorized_local_urls = urls;
+        self
+    }
+
+    /// Builder to add an authorized local gateway URL.
+    pub fn with_authorized_local_url(mut self, url: impl Into<String>) -> Self {
+        self.authorized_local_urls.push(url.into());
         self
     }
 
@@ -411,21 +426,29 @@ impl OutboundDestinationPolicy {
             _ => 0,
         });
 
-        // 3. Check for authorized local inference destination
-        let is_authorized_local = if self.allow_local_inference {
-            if let Some(local_base) = &self.local_inference_base_url {
-                if let Ok(parsed_local) = Url::parse(local_base) {
-                    let local_host = parsed_local.host_str().unwrap_or("").to_ascii_lowercase();
-                    let local_port = parsed_local.port_or_known_default().unwrap_or(80);
-                    host == local_host && port == local_port
-                } else {
-                    false
-                }
+        // 3. Check for authorized local inference / gateway destination
+        let matches_base = |candidate: &str| -> bool {
+            if let Ok(parsed) = Url::parse(candidate) {
+                let p_host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+                let p_port = parsed
+                    .port_or_known_default()
+                    .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+                host == p_host && port == p_port
             } else {
                 false
             }
+        };
+
+        let is_authorized_local = if self.allow_local_inference
+            && self
+                .local_inference_base_url
+                .as_deref()
+                .map(matches_base)
+                .unwrap_or(false)
+        {
+            true
         } else {
-            false
+            self.authorized_local_urls.iter().any(|u| matches_base(u))
         };
 
         // 4. Scheme validation for external destinations

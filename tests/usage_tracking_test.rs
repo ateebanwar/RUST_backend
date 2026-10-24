@@ -587,6 +587,7 @@ async fn test_conservative_routing_deprioritizes_rate_limited_in_auto_mode() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let resolution_initial = inference.resolve_candidates(&req).unwrap();
@@ -643,6 +644,7 @@ async fn test_routing_strictly_preserves_manual_model_selection() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let resolution = inference.resolve_candidates(&req).unwrap();

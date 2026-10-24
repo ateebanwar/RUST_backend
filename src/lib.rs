@@ -212,6 +212,293 @@ impl AppState {
             let _ = providers.register(or_adapter);
         }
 
+        // Register FreeLLMAPI adapter if configured
+        if config.freellmapi_api_key.is_some() || config.freellmapi_base_url.is_some() {
+            let base_url = config
+                .freellmapi_base_url
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:3001/v1");
+            let api_key = config
+                .freellmapi_api_key
+                .clone()
+                .or_else(|| Some("sk-freellmapi-default".to_string()));
+
+            let adapter = Arc::new(
+                providers::OpenAiCompatibleAdapter::new(
+                    "freellmapi-api",
+                    "FreeLLMAPI Gateway",
+                    base_url,
+                    api_key,
+                )
+                .with_rate_limit_tier("free-tier")
+                .with_optional_api_key(true)
+                .with_quota_service(quota.clone())
+                .with_destination_policy(destination_policy.clone())
+                .with_model_wire_map({
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(
+                        "freellmapi-fast".to_string(),
+                        "gemini-2.5-flash".to_string(),
+                    );
+                    map.insert(
+                        "freellmapi-balanced".to_string(),
+                        "llama-3.3-70b".to_string(),
+                    );
+                    map.insert("freellmapi-reasoner".to_string(), "deepseek-r1".to_string());
+                    map.insert(
+                        "freellmapi/gemini-2.5-flash".to_string(),
+                        "gemini-2.5-flash".to_string(),
+                    );
+                    map.insert(
+                        "freellmapi/llama-3.3-70b".to_string(),
+                        "llama-3.3-70b".to_string(),
+                    );
+                    map.insert(
+                        "freellmapi/deepseek-r1".to_string(),
+                        "deepseek-r1".to_string(),
+                    );
+                    map.insert(
+                        "freellmapi/gpt-4o-mini".to_string(),
+                        "gpt-4o-mini".to_string(),
+                    );
+                    map
+                }),
+            );
+            let _ = providers.register(adapter);
+
+            registry.register_provider(crate::models::ProviderMetadata {
+                provider_id: "freellmapi-api".to_string(),
+                display_name: "FreeLLMAPI Gateway".to_string(),
+                base_url: base_url.to_string(),
+                status: "operational".to_string(),
+                enabled: true,
+                models_count: 4,
+                rate_limit_tier: "free-tier".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "freellmapi-fast".to_string(),
+                display_name: "Gemini 2.5 Flash (FreeLLMAPI)".to_string(),
+                provider_id: "freellmapi-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 131072,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: true,
+                speed_tier: "fast".to_string(),
+                cost_tier: "free-tier".to_string(),
+                available: true,
+                capabilities: vec![
+                    "simple_chat".to_string(),
+                    "fast_reasoning".to_string(),
+                    "coding".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "freellmapi-balanced".to_string(),
+                display_name: "LLaMA 3.3 70B Instruct (FreeLLMAPI)".to_string(),
+                provider_id: "freellmapi-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 131072,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: false,
+                speed_tier: "balanced".to_string(),
+                cost_tier: "free-tier".to_string(),
+                available: true,
+                capabilities: vec![
+                    "simple_chat".to_string(),
+                    "general_conversation".to_string(),
+                    "coding".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "freellmapi-reasoner".to_string(),
+                display_name: "DeepSeek R1 (FreeLLMAPI)".to_string(),
+                provider_id: "freellmapi-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 65536,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: true,
+                speed_tier: "advanced".to_string(),
+                cost_tier: "free-tier".to_string(),
+                available: true,
+                capabilities: vec![
+                    "complex_analysis".to_string(),
+                    "deep_reasoning".to_string(),
+                    "coding".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "freellmapi/gemini-2.5-flash".to_string(),
+                display_name: "Google Gemini 2.5 Flash (FreeLLMAPI)".to_string(),
+                provider_id: "freellmapi-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 131072,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: true,
+                speed_tier: "fast".to_string(),
+                cost_tier: "free-tier".to_string(),
+                available: true,
+                capabilities: vec![
+                    "simple_chat".to_string(),
+                    "fast_reasoning".to_string(),
+                    "coding".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+        }
+
+        // Register OmniRoute adapter if configured
+        if config.omniroute_api_key.is_some() || config.omniroute_base_url.is_some() {
+            let base_url = config
+                .omniroute_base_url
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:20128/v1");
+            let api_key = config
+                .omniroute_api_key
+                .clone()
+                .or_else(|| Some("sk-omniroute-default".to_string()));
+
+            let adapter = Arc::new(
+                providers::OpenAiCompatibleAdapter::new(
+                    "omniroute-api",
+                    "OmniRoute Gateway",
+                    base_url,
+                    api_key,
+                )
+                .with_rate_limit_tier("low-cost")
+                .with_optional_api_key(true)
+                .with_quota_service(quota.clone())
+                .with_destination_policy(destination_policy.clone())
+                .with_model_wire_map({
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("omniroute-fast".to_string(), "gpt-4o-mini".to_string());
+                    map.insert("omniroute-coding".to_string(), "deepseek-coder".to_string());
+                    map.insert(
+                        "omniroute-reasoner".to_string(),
+                        "claude-3-5-haiku".to_string(),
+                    );
+                    map.insert(
+                        "omniroute/gpt-4o-mini".to_string(),
+                        "gpt-4o-mini".to_string(),
+                    );
+                    map.insert(
+                        "omniroute/deepseek-coder".to_string(),
+                        "deepseek-coder".to_string(),
+                    );
+                    map.insert(
+                        "omniroute/claude-3-5-haiku".to_string(),
+                        "claude-3-5-haiku".to_string(),
+                    );
+                    map.insert(
+                        "omniroute/deepseek-chat".to_string(),
+                        "deepseek-chat".to_string(),
+                    );
+                    map
+                }),
+            );
+            let _ = providers.register(adapter);
+
+            registry.register_provider(crate::models::ProviderMetadata {
+                provider_id: "omniroute-api".to_string(),
+                display_name: "OmniRoute Gateway".to_string(),
+                base_url: base_url.to_string(),
+                status: "operational".to_string(),
+                enabled: true,
+                models_count: 4,
+                rate_limit_tier: "low-cost".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "omniroute-fast".to_string(),
+                display_name: "GPT-4o Mini (OmniRoute)".to_string(),
+                provider_id: "omniroute-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 128000,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: true,
+                speed_tier: "fast".to_string(),
+                cost_tier: "low-cost".to_string(),
+                available: true,
+                capabilities: vec![
+                    "simple_chat".to_string(),
+                    "fast_reasoning".to_string(),
+                    "coding".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "omniroute-coding".to_string(),
+                display_name: "DeepSeek Coder (OmniRoute)".to_string(),
+                provider_id: "omniroute-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 65536,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: true,
+                speed_tier: "balanced".to_string(),
+                cost_tier: "low-cost".to_string(),
+                available: true,
+                capabilities: vec![
+                    "coding".to_string(),
+                    "fast_reasoning".to_string(),
+                    "simple_chat".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "omniroute-reasoner".to_string(),
+                display_name: "Claude 3.5 Haiku (OmniRoute)".to_string(),
+                provider_id: "omniroute-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 200000,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: true,
+                speed_tier: "advanced".to_string(),
+                cost_tier: "low-cost".to_string(),
+                available: true,
+                capabilities: vec![
+                    "complex_analysis".to_string(),
+                    "deep_reasoning".to_string(),
+                    "coding".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+
+            let _ = registry.register_model(crate::models::ModelMetadata {
+                model_id: "omniroute/gpt-4o-mini".to_string(),
+                display_name: "OpenAI GPT-4o Mini (OmniRoute)".to_string(),
+                provider_id: "omniroute-api".to_string(),
+                supported_modalities: vec!["text".to_string(), "code".to_string()],
+                context_window: 128000,
+                max_output_tokens: 8192,
+                streaming_supported: true,
+                tool_calling_supported: true,
+                speed_tier: "fast".to_string(),
+                cost_tier: "low-cost".to_string(),
+                available: true,
+                capabilities: vec![
+                    "simple_chat".to_string(),
+                    "fast_reasoning".to_string(),
+                    "coding".to_string(),
+                ],
+                last_health_check: "2026-10-24T00:00:00Z".to_string(),
+            });
+        }
+
         let router = Arc::new(ModelRouter::new(registry.clone()));
         let inference = Arc::new(
             InferenceService::new(
@@ -519,9 +806,17 @@ pub fn dispatch_route(
                 }
             }
         }
-        let models = state.registry.query_models(&filter);
-        let json = serde_json::to_string(&routes::models::ListModelsResponse { models })
-            .unwrap_or_default();
+        let models: Vec<routes::models::ModelCatalogEntry> = state
+            .registry
+            .query_models(&filter)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let json = serde_json::to_string(&routes::models::ListModelsResponse {
+            models,
+            default_model: state.config.default_model.clone(),
+        })
+        .unwrap_or_default();
         return (200, [("content-type", "application/json")], json);
     }
 

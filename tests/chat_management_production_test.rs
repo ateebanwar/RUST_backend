@@ -620,6 +620,7 @@ async fn test_08_invalid_conversation_id_in_chat_completion_rejected() {
         max_tokens: None,
         stream: false,
         conversation_id: Some("../../../traversal_id".to_string()),
+        allow_fallback: None,
     };
 
     let resp = client
@@ -762,6 +763,7 @@ async fn test_10_chat_completion_turn_append_and_persistence() {
         max_tokens: None,
         stream: false,
         conversation_id: Some("conv_turn_append".to_string()),
+        allow_fallback: None,
     };
 
     let resp = client

@@ -19,10 +19,31 @@ pub struct ListModelsParams {
     pub available_only: Option<bool>,
 }
 
+/// Individual model entry in GET /api/v1/models response, enriching ModelMetadata with gateway info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCatalogEntry {
+    #[serde(flatten)]
+    pub metadata: ModelMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+}
+
+impl From<ModelMetadata> for ModelCatalogEntry {
+    fn from(m: ModelMetadata) -> Self {
+        let gateway = m.gateway().map(|s| s.to_string());
+        Self {
+            metadata: m,
+            gateway,
+        }
+    }
+}
+
 /// Outbound JSON response schema for GET /api/v1/models.
 #[derive(Debug, Serialize)]
 pub struct ListModelsResponse {
-    pub models: Vec<ModelMetadata>,
+    pub models: Vec<ModelCatalogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 /// Outbound JSON response schema for GET /api/v1/providers.
@@ -43,7 +64,14 @@ pub async fn list_models(
         available_only: params.available_only,
     };
     let models = state.registry.query_models(&filter);
-    (StatusCode::OK, Json(ListModelsResponse { models }))
+    let catalog_models: Vec<ModelCatalogEntry> = models.into_iter().map(Into::into).collect();
+    (
+        StatusCode::OK,
+        Json(ListModelsResponse {
+            models: catalog_models,
+            default_model: state.config.default_model.clone(),
+        }),
+    )
 }
 
 /// Handler for GET /api/v1/models/{model_id}

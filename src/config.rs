@@ -101,6 +101,16 @@ pub struct AppConfig {
     /// Note: Google Gemini adapter integration is planned for a future multimodal phase;
     /// this configuration field is loaded and isolated, but currently marked unsupported in v1 router.
     pub gemini_api_key: Option<String>,
+    /// Upstream FreeLLMAPI gateway API base URL (loaded from FREELLMAPI_BASE_URL).
+    pub freellmapi_base_url: Option<String>,
+    /// Upstream FreeLLMAPI gateway API key (loaded from FREELLMAPI_API_KEY).
+    pub freellmapi_api_key: Option<String>,
+    /// Upstream OmniRoute gateway API base URL (loaded from OMNIROUTE_BASE_URL).
+    pub omniroute_base_url: Option<String>,
+    /// Upstream OmniRoute gateway API key (loaded from OMNIROUTE_API_KEY).
+    pub omniroute_api_key: Option<String>,
+    /// Configured default model ID for inference (loaded from DEFAULT_MODEL).
+    pub default_model: Option<String>,
     /// Backend API key for authenticating protected routes (loaded from API_KEY).
     pub api_key: Option<String>,
     /// List of configured backend API keys (loaded from API_KEYS).
@@ -202,6 +212,11 @@ impl AppConfig {
             groq_base_url: None,
             openrouter_api_key: None,
             gemini_api_key: None,
+            freellmapi_base_url: None,
+            freellmapi_api_key: None,
+            omniroute_base_url: None,
+            omniroute_api_key: None,
+            default_model: None,
             api_key: None,
             api_keys: Vec::new(),
             google_client_id: None,
@@ -396,6 +411,26 @@ impl AppConfig {
 
         if let Some(key) = get_var("GEMINI_API_KEY") {
             config.gemini_api_key = Some(key);
+        }
+
+        if let Some(url) = get_var("FREELLMAPI_BASE_URL") {
+            config.freellmapi_base_url = Some(url);
+        }
+
+        if let Some(key) = get_var("FREELLMAPI_API_KEY") {
+            config.freellmapi_api_key = Some(key);
+        }
+
+        if let Some(url) = get_var("OMNIROUTE_BASE_URL") {
+            config.omniroute_base_url = Some(url);
+        }
+
+        if let Some(key) = get_var("OMNIROUTE_API_KEY") {
+            config.omniroute_api_key = Some(key);
+        }
+
+        if let Some(m) = get_var("DEFAULT_MODEL") {
+            config.default_model = Some(m);
         }
 
         if let Some(key) = get_var("API_KEY").or_else(|| get_var("BACKEND_API_KEY")) {
@@ -657,12 +692,47 @@ impl AppConfig {
 
     /// Create OutboundDestinationPolicy from application configuration.
     pub fn outbound_destination_policy(&self) -> crate::security::OutboundDestinationPolicy {
-        crate::security::OutboundDestinationPolicy::default_secure()
+        let mut policy = crate::security::OutboundDestinationPolicy::default_secure()
             .with_allowed_hosts(self.allowed_outbound_hosts.clone())
             .with_local_inference(
                 self.allow_local_inference,
                 self.local_inference_base_url.clone(),
-            )
+            );
+
+        let authorize_url = |pol: &mut crate::security::OutboundDestinationPolicy,
+                             url_str: &str| {
+            if let Ok(parsed) = reqwest::Url::parse(url_str) {
+                let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+                if host == "localhost"
+                    || host == "127.0.0.1"
+                    || host == "::1"
+                    || host.starts_with("127.")
+                {
+                    pol.authorized_local_urls.push(url_str.to_string());
+                } else if parsed.scheme() == "https"
+                    && !pol
+                        .allowed_hosts
+                        .iter()
+                        .any(|h| h.eq_ignore_ascii_case(&host))
+                {
+                    pol.allowed_hosts.push(host);
+                }
+            }
+        };
+
+        if let Some(ref url) = self.freellmapi_base_url {
+            authorize_url(&mut policy, url);
+        } else if self.freellmapi_api_key.is_some() {
+            authorize_url(&mut policy, "http://127.0.0.1:3001/v1");
+        }
+
+        if let Some(ref url) = self.omniroute_base_url {
+            authorize_url(&mut policy, url);
+        } else if self.omniroute_api_key.is_some() {
+            authorize_url(&mut policy, "http://127.0.0.1:20128/v1");
+        }
+
+        policy
     }
 
     /// Create RetryPolicy from current application configuration.
@@ -1080,6 +1150,16 @@ impl fmt::Debug for AppConfig {
             .field(
                 "gemini_api_key",
                 &self.gemini_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("freellmapi_base_url", &self.freellmapi_base_url)
+            .field(
+                "freellmapi_api_key",
+                &self.freellmapi_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("omniroute_base_url", &self.omniroute_base_url)
+            .field(
+                "omniroute_api_key",
+                &self.omniroute_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field(

@@ -36,6 +36,23 @@ pub struct ModelMetadata {
     pub last_health_check: String,
 }
 
+impl ModelMetadata {
+    /// Return the upstream gateway handling this model, if applicable.
+    pub fn gateway(&self) -> Option<&'static str> {
+        if self.provider_id.starts_with("freellmapi") {
+            Some("freellmapi")
+        } else if self.provider_id.starts_with("omniroute") {
+            Some("omniroute")
+        } else if self.provider_id.starts_with("groq") {
+            Some("groq")
+        } else if self.provider_id.starts_with("openrouter") {
+            Some("openrouter")
+        } else {
+            None
+        }
+    }
+}
+
 /// Individual chat message with role and content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {

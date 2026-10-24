@@ -106,6 +106,7 @@ pub struct OpenAiCompatibleAdapter {
     model_wire_map: HashMap<String, String>,
     quota_service: Option<std::sync::Arc<crate::quota::QuotaService>>,
     destination_policy: Option<std::sync::Arc<crate::security::OutboundDestinationPolicy>>,
+    optional_api_key: bool,
 }
 
 impl OpenAiCompatibleAdapter {
@@ -132,7 +133,14 @@ impl OpenAiCompatibleAdapter {
             model_wire_map: HashMap::new(),
             quota_service: None,
             destination_policy: None,
+            optional_api_key: false,
         }
+    }
+
+    /// Builder method to allow optional API key (e.g. for local open gateways).
+    pub fn with_optional_api_key(mut self, optional: bool) -> Self {
+        self.optional_api_key = optional;
+        self
     }
 
     /// Builder method to provide a custom HTTP client (useful for mock server testing).
@@ -181,6 +189,12 @@ impl OpenAiCompatibleAdapter {
     fn resolve_upstream_model<'a>(&'a self, model_id: &'a str) -> &'a str {
         if let Some(mapped) = self.model_wire_map.get(model_id) {
             mapped.as_str()
+        } else if let Some(stripped) =
+            model_id.strip_prefix(&format!("{}/", self.provider_id.trim_end_matches("-api")))
+        {
+            stripped
+        } else if let Some(stripped) = model_id.strip_prefix(&format!("{}/", self.provider_id)) {
+            stripped
         } else {
             model_id
         }
@@ -198,8 +212,9 @@ impl OpenAiCompatibleAdapter {
 
 impl ProviderAdapter for OpenAiCompatibleAdapter {
     fn provider_info(&self) -> ProviderMetadata {
-        let is_operational =
-            self.api_key.is_some() && !self.api_key.as_ref().unwrap().trim().is_empty();
+        let is_operational = (self.api_key.is_some()
+            && !self.api_key.as_ref().unwrap().trim().is_empty())
+            || self.optional_api_key;
 
         ProviderMetadata {
             provider_id: self.provider_id.clone(),
@@ -234,12 +249,16 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
 
     fn complete<'a>(&'a self, req: &'a CompletionRequest) -> BoxedCompletionFuture<'a> {
         Box::pin(async move {
-            let api_key = self.api_key.as_deref().ok_or_else(|| {
-                ProviderError::AuthenticationFailed(format!(
-                    "Provider '{}' API key is not configured",
-                    self.provider_id
-                ))
-            })?;
+            let api_key = match self.api_key.as_deref() {
+                Some(key) if !key.trim().is_empty() => Some(key),
+                _ if self.optional_api_key => None,
+                _ => {
+                    return Err(ProviderError::AuthenticationFailed(format!(
+                        "Provider '{}' API key is not configured",
+                        self.provider_id
+                    )));
+                }
+            };
 
             let upstream_model = self.resolve_upstream_model(&req.model_id);
             let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -279,10 +298,13 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
 
             let mut request_builder = client_to_use
                 .post(&url)
-                .bearer_auth(api_key)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .timeout(req.timeout)
                 .json(&body);
+
+            if let Some(key) = api_key {
+                request_builder = request_builder.bearer_auth(key);
+            }
 
             // OpenRouter specific attribution headers
             if self.provider_id == "openrouter-api" {
@@ -391,12 +413,16 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
 
     fn stream<'a>(&'a self, req: &'a CompletionRequest) -> BoxedStreamFuture<'a> {
         Box::pin(async move {
-            let api_key = self.api_key.as_deref().ok_or_else(|| {
-                ProviderError::AuthenticationFailed(format!(
-                    "Provider '{}' API key is not configured",
-                    self.provider_id
-                ))
-            })?;
+            let api_key = match self.api_key.as_deref() {
+                Some(key) if !key.trim().is_empty() => Some(key),
+                _ if self.optional_api_key => None,
+                _ => {
+                    return Err(ProviderError::AuthenticationFailed(format!(
+                        "Provider '{}' API key is not configured",
+                        self.provider_id
+                    )));
+                }
+            };
 
             let upstream_model = self.resolve_upstream_model(&req.model_id);
             let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -438,11 +464,14 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
 
             let mut request_builder = client_to_use
                 .post(&url)
-                .bearer_auth(api_key)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header(reqwest::header::ACCEPT, "text/event-stream")
                 .timeout(req.timeout)
                 .json(&body);
+
+            if let Some(key) = api_key {
+                request_builder = request_builder.bearer_auth(key);
+            }
 
             if self.provider_id == "openrouter-api" {
                 request_builder = request_builder

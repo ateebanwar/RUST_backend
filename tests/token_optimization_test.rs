@@ -238,6 +238,7 @@ async fn test_context_window_enforcement_in_manual_routing() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let result = state.inference.resolve_candidates(&req);
@@ -271,6 +272,7 @@ async fn test_capacity_aware_filtering_in_auto_routing() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let res_normal = state.inference.resolve_candidates(&req_normal).unwrap();
@@ -291,6 +293,7 @@ async fn test_capacity_aware_filtering_in_auto_routing() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let res_large = state.inference.resolve_candidates(&req_large).unwrap();
@@ -313,6 +316,7 @@ async fn test_capacity_aware_filtering_in_auto_routing() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let res_huge = state.inference.resolve_candidates(&req_huge);

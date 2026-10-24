@@ -359,6 +359,7 @@ fn test_category_11_context_window_boundary_exact_fit() {
         max_tokens: Some(20),
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let resolution = inference.resolve_candidates(&req);
@@ -406,6 +407,7 @@ fn test_category_12_context_window_one_token_over_limit_rejected() {
         max_tokens: Some(max_tokens),
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let result = inference.resolve_candidates(&req);
@@ -452,6 +454,7 @@ fn test_category_13_max_tokens_exceeding_max_output_limit_rejected() {
         max_tokens: Some(1000), // Exceeds 500 max_output_tokens!
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let result = inference.resolve_candidates(&req);
@@ -973,6 +976,7 @@ fn test_category_18_auto_routing_candidate_admission_and_output_limits() {
         max_tokens: Some(50),
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let res = inference.resolve_candidates(&req).unwrap();
@@ -994,6 +998,7 @@ fn test_category_18_auto_routing_candidate_admission_and_output_limits() {
         max_tokens: Some(4096), // Both models have max_output_tokens: 2048
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let excessive_err = inference.resolve_candidates(&excessive_req).unwrap_err();
@@ -1060,6 +1065,7 @@ fn test_category_19_effective_message_compaction_consistency() {
         max_tokens: Some(15),
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let resolution = inference.resolve_candidates(&req).unwrap();

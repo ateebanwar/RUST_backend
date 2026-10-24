@@ -84,6 +84,7 @@ async fn test_low_latency_failover_on_immediate_quota_exhausted() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let resp = state.inference.execute_completion(&req).await.unwrap();
@@ -152,6 +153,7 @@ async fn test_low_latency_failover_on_rate_limit_with_retry_after() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let resp = state.inference.execute_completion(&req).await.unwrap();
@@ -209,6 +211,7 @@ async fn test_manual_mode_never_fails_over_on_quota_exhausted() {
         max_tokens: None,
         stream: false,
         conversation_id: None,
+        allow_fallback: None,
     };
 
     let err = state.inference.execute_completion(&req).await.unwrap_err();
