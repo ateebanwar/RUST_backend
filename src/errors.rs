@@ -112,8 +112,12 @@ impl AppError {
             Self::PayloadTooLarge => "Inbound payload exceeds 4.5 MB body limit".to_string(),
             Self::UnsupportedModality(msg) => sanitize_message(msg),
             Self::RateLimited { message, .. } => sanitize_message(message),
-            Self::UpstreamFailure(_) => {
-                "Upstream AI provider encountered an error. Operation may be retried.".to_string()
+            Self::UpstreamFailure(msg) => {
+                if !msg.trim().is_empty() {
+                    sanitize_message(msg)
+                } else {
+                    "Upstream AI provider encountered an error. Operation may be retried.".to_string()
+                }
             }
             Self::GatewayTimeout(_) => {
                 "Upstream request exceeded execution deadline (10s).".to_string()
@@ -268,10 +272,10 @@ impl From<crate::drive::DriveError> for AppError {
                 AppError::UpstreamFailure(format!("Google Drive network failure: {msg}"))
             }
             crate::drive::DriveError::CryptoError(msg) => {
-                AppError::InternalError(format!("Cryptographic operation failed: {msg}"))
+                AppError::UpstreamFailure(format!("Google Drive cryptographic verification failed: {msg}"))
             }
             crate::drive::DriveError::CorruptData(msg) => {
-                AppError::InternalError(format!("Corrupt remote Drive data: {msg}"))
+                AppError::UpstreamFailure(format!("Corrupt remote Drive data: {msg}"))
             }
             crate::drive::DriveError::SchemaMismatch { expected, actual } => {
                 AppError::InvalidRequest(format!(
@@ -283,7 +287,9 @@ impl From<crate::drive::DriveError> for AppError {
                     "Checksum mismatch: expected {expected}, calculated {actual}"
                 ))
             }
-            crate::drive::DriveError::Internal(msg) => AppError::InternalError(msg),
+            crate::drive::DriveError::Internal(msg) => {
+                AppError::UpstreamFailure(format!("Google Drive operation failed: {msg}"))
+            }
         }
     }
 }

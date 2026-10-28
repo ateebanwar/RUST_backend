@@ -225,28 +225,67 @@ impl GoogleDriveClient {
             "Google Drive API returned HTTP error"
         );
 
+        let (extracted_msg, reason) = if let Ok(parsed) =
+            serde_json::from_str::<serde_json::Value>(&error_body)
+        {
+            let msg = parsed["error"]["message"].as_str().map(|s| s.to_string());
+            let r = parsed["error"]["errors"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|e| e["reason"].as_str())
+                .map(|s| s.to_string());
+            (msg, r)
+        } else {
+            (None, None)
+        };
+
+        let message = extracted_msg.unwrap_or_else(|| {
+            if error_body.is_empty() {
+                format!("HTTP {}", status.as_u16())
+            } else {
+                error_body.clone()
+            }
+        });
+
         match status.as_u16() {
-            401 => DriveError::InvalidDriveToken("Token expired or revoked by Google".to_string()),
+            401 => DriveError::InvalidDriveToken(format!("Token expired or revoked by Google: {message}")),
             403 => {
-                if error_body.contains("quotaExceeded") || error_body.contains("rateLimitExceeded")
+                if message.contains("quotaExceeded")
+                    || message.contains("rateLimitExceeded")
+                    || reason.as_deref() == Some("quotaExceeded")
+                    || reason.as_deref() == Some("rateLimitExceeded")
+                    || reason.as_deref() == Some("userRateLimitExceeded")
                 {
-                    DriveError::QuotaExceeded(error_body)
+                    DriveError::QuotaExceeded(message)
                 } else {
                     DriveError::PermissionDenied(format!(
-                        "Drive scope insufficient or consent revoked: {error_body}"
+                        "Drive scope insufficient or consent revoked: {message}"
                     ))
                 }
             }
-            404 => DriveError::NotFound("Drive file not found".to_string()),
+            404 => DriveError::NotFound(format!("Drive file not found: {message}")),
             429 => DriveError::RateLimited {
-                message: "Google Drive API rate limit reached".to_string(),
+                message: format!("Google Drive API rate limit reached: {message}"),
                 retry_after_secs: retry_after,
             },
+            400 => {
+                if error_body.contains("invalidGrant")
+                    || error_body.contains("invalid_token")
+                    || error_body.contains("authError")
+                    || reason.as_deref() == Some("invalid_grant")
+                {
+                    DriveError::InvalidDriveToken(format!("Invalid Google Drive token: {message}"))
+                } else if error_body.contains("insufficientPermissions") {
+                    DriveError::PermissionDenied(format!("Drive permission denied: {message}"))
+                } else {
+                    DriveError::Internal(format!("Google Drive API error: {message}"))
+                }
+            }
             500..=599 => {
-                DriveError::NetworkError(format!("Google Drive server returned status {status}"))
+                DriveError::NetworkError(format!("Google Drive server returned status {status}: {message}"))
             }
             other => DriveError::Internal(format!(
-                "Unexpected Drive HTTP status {other}: {error_body}"
+                "Unexpected Drive HTTP status {other}: {message}"
             )),
         }
     }
@@ -281,11 +320,17 @@ impl DriveClient for GoogleDriveClient {
 
             let (url, method) = match file_id {
                 Some(id) => (
-                    format!("{}/files/{}?uploadType=media", self.upload_base_url, id),
+                    format!(
+                        "{}/files/{}?uploadType=media&fields=id,name,mimeType,modifiedTime,size",
+                        self.upload_base_url, id
+                    ),
                     reqwest::Method::PATCH,
                 ),
                 None => (
-                    format!("{}/files?uploadType=multipart", self.upload_base_url),
+                    format!(
+                        "{}/files?uploadType=multipart&fields=id,name,mimeType,modifiedTime,size",
+                        self.upload_base_url
+                    ),
                     reqwest::Method::POST,
                 ),
             };
@@ -307,7 +352,7 @@ impl DriveClient for GoogleDriveClient {
                         "parents": [spaces],
                     });
 
-                    let boundary = "-------ai_backend_boundary_987654";
+                    let boundary = "ai_backend_boundary_9876543210";
                     let mut body = Vec::new();
                     body.extend_from_slice(
                         format!(
