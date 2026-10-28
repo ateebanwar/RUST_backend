@@ -50,7 +50,7 @@ impl From<LocalStoreError> for crate::drive::DriveError {
 
 impl From<LocalStoreError> for crate::errors::AppError {
     fn from(e: LocalStoreError) -> Self {
-        crate::errors::AppError::InternalError(e.to_string())
+        crate::errors::AppError::UpstreamFailure(format!("Local store cache error: {e}"))
     }
 }
 

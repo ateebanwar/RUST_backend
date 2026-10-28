@@ -4,10 +4,11 @@
 /// and client headers conforming to the backend API specification.
 class AppConfig {
   /// Base URL of the Rust backend.
-  /// Verified backend default port is 8080 (HOST=127.0.0.1, PORT=8080 in .env.example).
+  /// Configured to the verified deployed production HTTPS backend on Vercel.
+  /// Can be overridden via `--dart-define=BACKEND_URL=<url>` for local dev or staging.
   static String backendBaseUrl = const String.fromEnvironment(
     'BACKEND_URL',
-    defaultValue: 'http://127.0.0.1:8080',
+    defaultValue: 'https://rust-backend-fawn.vercel.app',
   );
 
   /// Client identification header value for audit and routing

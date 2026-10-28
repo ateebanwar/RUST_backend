@@ -596,12 +596,31 @@ impl SyncEngine {
                 let enc_bytes = self
                     .retry_drive_op(|| self.client.download_file(drive_token, &meta.id))
                     .await?;
-                let plain_bytes =
-                    self.crypto
-                        .decrypt(owner, REMOTE_MANIFEST_FILENAME, &enc_bytes)?;
-                let parsed: SyncManifest = serde_json::from_slice(&plain_bytes).map_err(|e| {
-                    DriveError::CorruptData(format!("Failed to parse remote sync manifest: {e}"))
-                })?;
+                let plain_bytes = match self
+                    .crypto
+                    .decrypt(owner, REMOTE_MANIFEST_FILENAME, &enc_bytes)
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            owner = %owner,
+                            error = %e,
+                            "Remote sync manifest decryption failed (key mismatch or corrupted data); initializing clean manifest"
+                        );
+                        return Ok((SyncManifest::new(owner.to_string()), Some(meta.id)));
+                    }
+                };
+                let parsed: SyncManifest = match serde_json::from_slice(&plain_bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            owner = %owner,
+                            error = %e,
+                            "Remote sync manifest JSON corrupted; initializing clean manifest"
+                        );
+                        SyncManifest::new(owner.to_string())
+                    }
+                };
 
                 if parsed.schema_version > CURRENT_SCHEMA_VERSION {
                     return Err(DriveError::SchemaMismatch {
@@ -954,9 +973,21 @@ impl SyncEngine {
                 let enc_bytes = self
                     .retry_drive_op(|| self.client.download_file(token, drive_file_id))
                     .await?;
-                let plain_bytes =
-                    self.crypto
-                        .decrypt(owner, &format!("conv_{conv_id}"), &enc_bytes)?;
+                let plain_bytes = match self
+                    .crypto
+                    .decrypt(owner, &format!("conv_{conv_id}"), &enc_bytes)
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            owner = %owner,
+                            conv_id = %conv_id,
+                            error = %e,
+                            "Conversation payload decryption failed; cannot hydrate history"
+                        );
+                        return Ok(None);
+                    }
+                };
                 let conv: SyncConversation = serde_json::from_slice(&plain_bytes).map_err(|e| {
                     DriveError::CorruptData(format!("Corrupt conversation {conv_id}: {e}"))
                 })?;

@@ -112,14 +112,18 @@ async fn hydrate_conversation_context(
             )
         }
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 request_id = %req_id,
                 owner = %owner,
                 conversation_id = %conv_id,
                 error = %e,
-                "Failed to retrieve/hydrate conversation from Google Drive"
+                "Failed to retrieve/hydrate conversation from Google Drive; continuing with fresh conversation context"
             );
-            return Err(AppError::from(e).to_response_with_id(req_id));
+            crate::drive::SyncConversation::new(
+                conv_id.to_string(),
+                owner.clone(),
+                "New Conversation".to_string(),
+            )
         }
     };
 
